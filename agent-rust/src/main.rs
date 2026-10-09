@@ -205,6 +205,22 @@ fn read_password(data: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// One agent per data directory: a second instance would report with its own id and the
+/// relay would keep closing the first one's terminals ("the computer restarted"). The lock
+/// file is held for the process lifetime; the Python agent takes the same lock.
+fn acquire_singleton(data: &Path) -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let lock = std::fs::OpenOptions::new().create(true).write(true).truncate(false).mode(0o600)
+        .open(data.join("agent.lock")).ok()?;
+    let fd = lock.as_raw_fd();
+    let ok = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == 0 };
+    if ok {
+        Some(lock)
+    } else {
+        None
+    }
+}
+
 fn random_hex(len: usize) -> String {
     // bytes from the OS, the way secrets.token_hex does it
     let mut out = String::with_capacity(len);
@@ -1173,6 +1189,13 @@ fn main() -> std::process::ExitCode {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700));
     }
+    let _singleton = match acquire_singleton(&data) {
+        Some(file) => file,
+        None => {
+            say("此数据目录已有 agent 在运行（agent.lock 被占用），退出");
+            return std::process::ExitCode::from(3);
+        }
+    };
     let password = read_password(&data);
     if password.is_empty() {
         say(&format!(
