@@ -5,6 +5,8 @@ agent-rust/target/release/remote-cli-agent. Build it first:
     cargo build --release --manifest-path ../agent-rust/Cargo.toml
 """
 import os
+import subprocess
+import tempfile
 import unittest
 
 import test_agent
@@ -20,6 +22,23 @@ class RustAgentContract(test_agent.EndToEnd):
     @classmethod
     def agent_command(cls, agent_data):
         return [BINARY, "--data", agent_data]
+
+
+class RustSingletonLock(unittest.TestCase):
+    """The Rust binary holds the same agent.lock as the Python agent."""
+
+    def test_second_instance_exits_3(self):
+        import fcntl
+        data = tempfile.mkdtemp()
+        lock = open(os.path.join(data, "agent.lock"), "w")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            proc = subprocess.run([BINARY, "--data", data], capture_output=True, timeout=30)
+            self.assertEqual(proc.returncode, 3)
+            self.assertIn("agent.lock", proc.stderr.decode("utf-8"))
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: compile with the in-box .NET Framework compiler
+        run: powershell -ExecutionPolicy Bypass -File agent-windows\build.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: agent-windows/bin/*.exe
+          if-no-files-found: error
+
+  android:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: accept licenses and install the SDK pieces the build needs
+        shell: pwsh
+        run: |
+          "y`r`n" * 50 | & "$env:ANDROID_HOME\cmdline-tools\latest\bin\sdkmanager.bat" --licenses *> $null
+          & "$env:ANDROID_HOME\cmdline-tools\latest\bin\sdkmanager.bat" "build-tools;36.0.0" "platforms;android-36" | Out-Null
+      - name: keep the signing key across builds
+        uses: actions/cache@v4
+        with:
+          path: ~\.remote-cli-signing
+          key: remote-cli-signing
+      - name: build the APK
+        run: powershell -ExecutionPolicy Bypass -File android\build.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+  release:
+    needs: [windows, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: collect files and write checksums
+        run: |
+          mkdir release
+          find artifacts -type f -exec cp {} release/ \;
+          cd release && sha256sum * > SHA256SUMS.txt
+      - name: create a draft release for the tag
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: release/*
