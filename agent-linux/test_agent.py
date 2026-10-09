@@ -182,10 +182,9 @@ class EndToEnd(unittest.TestCase):
         with open(os.path.join(agent_data, "config.json"), "w", encoding="utf-8") as stream:
             json.dump({"Server": cls.base, "RemoteEnabled": True, "Name": "e2e-ubuntu",
                        "RemoteDirs": ["项目=" + cls.project]}, stream)
-        cls.agent = subprocess.Popen(
-            [sys.executable, os.path.join(HERE, "agent.py"), "--data", agent_data],
-            env={**os.environ, "RCLI_PASSWORD": PASSWORD},
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cls.agent = subprocess.Popen(cls.agent_command(agent_data),
+                                     env={**os.environ, "RCLI_PASSWORD": PASSWORD},
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         cls.token = request("POST", cls.base + "/api/login", {"password": PASSWORD})[1]["token"]
         view = None
         deadline = time.time() + 30
@@ -196,6 +195,11 @@ class EndToEnd(unittest.TestCase):
                 return
             time.sleep(0.3)
         raise AssertionError("agent did not come online: %r" % view)
+
+    @classmethod
+    def agent_command(cls, agent_data):
+        """What spawns the agent under test; overridden by the Rust contract test."""
+        return [sys.executable, os.path.join(HERE, "agent.py"), "--data", agent_data]
 
     @classmethod
     def wait_tcp(cls, port):
