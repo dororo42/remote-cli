@@ -3,9 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
-    paths: ["relay/**", "agent-linux/**", ".github/workflows/ci.yml"]
+    paths: ["relay/**", "agent-linux/**", "agent-rust/**", ".github/workflows/ci.yml"]
   pull_request:
-    paths: ["relay/**", "agent-linux/**", ".github/workflows/ci.yml"]
+    paths: ["relay/**", "agent-linux/**", "agent-rust/**", ".github/workflows/ci.yml"]
   workflow_dispatch:
 
 jobs:
