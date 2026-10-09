@@ -348,6 +348,7 @@ struct Chunk {
 
 struct LiveInner {
     fd: i32,
+    project: String, // the project's name, which a rename follows
     dir: String,
     cols: u16,
     rows: u16,
@@ -423,6 +424,7 @@ fn spawn_pre(cwd: &str, shell: &str) -> Result<SpawnPre, String> {
 impl Live {
     fn spawn(
         id: &str,
+        project: &str,
         cwd: &str,
         cols: u16,
         rows: u16,
@@ -449,6 +451,11 @@ impl Live {
             {
                 return Err("终端创建失败".into());
             }
+            // a master left without CLOEXEC leaks into every later child; non-blocking
+            // keeps one program that stopped reading from holding the whole write
+            libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK);
             match libc::fork() {
                 0 => {
                     // child: new session, controlling terminal, exec — pointers only
@@ -472,6 +479,7 @@ impl Live {
                         pid,
                         inner: Mutex::new(LiveInner {
                             fd: master,
+                            project: project.to_string(),
                             dir: cwd.to_string(),
                             cols,
                             rows,
@@ -511,8 +519,25 @@ impl Live {
         let mut buf = [0u8; 8192];
         loop {
             let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n <= 0 {
-                break; // EOF or EIO: the terminal was closed or the program left
+            if n < 0 {
+                let e = unsafe { *libc::__errno_location() };
+                if e == libc::EAGAIN || e == libc::EWOULDBLOCK || e == libc::EINTR {
+                    // the master is non-blocking (CLOEXEC keeps it out of later children):
+                    // wait for data instead of mistaking this for EOF
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    unsafe {
+                        libc::poll(&mut pfd, 1, 500);
+                    }
+                    continue;
+                }
+                break; // EIO: the terminal was closed or the program left
+            }
+            if n == 0 {
+                break; // EOF
             }
             leftover.extend_from_slice(&buf[..n as usize]);
             {
@@ -580,26 +605,53 @@ impl Live {
     }
 
     fn write(&self, text: &str) -> Result<(), String> {
-        // the lock is held for the whole write: closing the terminal between the fd check
-        // and the write could otherwise hand the reused fd number to a new terminal
+        // non-blocking with a one-second budget: a program that stopped reading must not
+        // hold this (and with it every other terminal) for as long as it likes. Each
+        // piece is written under the lock, so the fd cannot be closed and reused between
+        // the check and the write.
         let bytes = text.as_bytes();
         let mut done = 0usize;
-        let inner = self.inner.lock().unwrap();
-        if inner.fd < 0 {
-            return Err("终端已结束".into());
-        }
+        let deadline = Instant::now() + Duration::from_secs(1);
         while done < bytes.len() {
-            let n = unsafe {
-                libc::write(
-                    inner.fd,
-                    bytes[done..].as_ptr() as *const libc::c_void,
-                    bytes.len() - done,
-                )
-            };
-            if n < 0 {
+            let fd;
+            let n;
+            {
+                let inner = self.inner.lock().unwrap();
+                if inner.fd < 0 {
+                    return Err("终端已结束".into());
+                }
+                n = unsafe {
+                    libc::write(
+                        inner.fd,
+                        bytes[done..].as_ptr() as *const libc::c_void,
+                        bytes.len() - done,
+                    )
+                };
+                fd = inner.fd;
+            }
+            if n >= 0 {
+                done += n as usize;
+                if done == bytes.len() {
+                    return Ok(());
+                }
+                continue;
+            }
+            let e = unsafe { *libc::__errno_location() };
+            if e != libc::EAGAIN && e != libc::EWOULDBLOCK && e != libc::EINTR {
                 return Err("终端已结束".into());
             }
-            done += n as usize;
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err("终端里的程序暂时没有读取输入，请稍后再试".into());
+            }
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            unsafe {
+                libc::poll(&mut pfd, 1, left.as_millis() as i32);
+            }
         }
         Ok(())
     }
@@ -898,7 +950,7 @@ impl Projects {
             if action == "project_remove" {
                 let busy = terminals.iter().any(|(_, live)| {
                     let inner = live.inner.lock().unwrap();
-                    inner.dir == name && !inner.closed
+                    inner.project == name && !inner.closed
                 });
                 if busy {
                     return Err("这个项目还有终端在运行，请先结束".into());
@@ -916,8 +968,8 @@ impl Projects {
                 self.own[at].0 = to.clone();
                 for live in terminals.values() {
                     let mut inner = live.inner.lock().unwrap();
-                    if inner.dir == name {
-                        inner.dir = to.clone();
+                    if inner.project == name {
+                        inner.project = to.clone(); // the folder itself is unchanged
                     }
                 }
             }
@@ -1070,7 +1122,11 @@ impl Agent {
                     state.paired = true;
                     let name = tidy(cfg_str(&cfg, "Name"), 60);
                     let name = if name.is_empty() { hostname() } else { name };
-                    print_pairing(&state.server, &self.password, &name);
+                    if unsafe { libc::isatty(2) } == 1 {
+                        print_pairing(&state.server, &self.password, &name);
+                    } else {
+                        say("配对信息不写入日志；在终端运行本程序 --pair 查看地址、密码和二维码");
+                    }
                 }
                 let enabled = cfg.get("RemoteEnabled").and_then(|v| v.as_bool()) == Some(true);
                 if !enabled {
@@ -1253,15 +1309,23 @@ impl Agent {
             match existing {
                 None => error = "终端已结束".into(),
                 Some(live) => {
-                    error = match action.as_str() {
-                        "input" => self.do_input(&live, op, state),
-                        "resize" => self.do_resize(&live, op),
-                        "close" => {
-                            live.begin_close();
-                            String::new()
-                        }
-                        _ => "操作无效".into(),
-                    };
+                    // a terminal can always be ended; typing into it needs its folder
+                    // still allowed (a removed project must not keep taking input)
+                    if action != "close"
+                        && !dirs.values().any(|p| *p == live.inner.lock().unwrap().dir)
+                    {
+                        error = "目录不再获允许".into();
+                    } else {
+                        error = match action.as_str() {
+                            "input" => self.do_input(&live, op, state),
+                            "resize" => self.do_resize(&live, op),
+                            "close" => {
+                                live.begin_close();
+                                String::new()
+                            }
+                            _ => "操作无效".into(),
+                        };
+                    }
                 }
             }
         }
@@ -1328,7 +1392,7 @@ impl Agent {
             return Err(format!("最多同时运行 {MAX_TERMINALS} 个终端，请先结束一个"));
         }
         let shell = self.shell(cfg);
-        let live = Live::spawn(terminal, &cwd, 80, 24, &shell, self.parker.clone())?;
+        let live = Live::spawn(terminal, name, &cwd, 80, 24, &shell, self.parker.clone())?;
         state.terminals.insert(terminal.to_string(), live);
         Ok(())
     }
@@ -1451,6 +1515,24 @@ fn print_pairing(server: &str, password: &str, name: &str) {
     }
 }
 
+/// --pair: what the phone needs to add this computer, for the person at the console.
+fn show_pairing(data: &Path) -> u8 {
+    let cfg = read_config(data);
+    let server = cfg_str(&cfg, "Server")
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    let password = read_password(data);
+    if !valid_server(&server) || password.is_empty() {
+        say("缺少中转地址或密码：先在 config.json 填写 Server，并用 --set-password 存入密码");
+        return 2;
+    }
+    let name = tidy(cfg_str(&cfg, "Name"), 60);
+    let name = if name.is_empty() { hostname() } else { name };
+    print_pairing(&server, &password, &name);
+    0
+}
+
 fn set_password(folder: &Path) -> u8 {
     let mut secret = String::new();
     if std::io::stdin().read_line(&mut secret).is_err() {
@@ -1489,6 +1571,9 @@ fn main() -> std::process::ExitCode {
         if at + 1 < argv.len() {
             data = argv[at + 1].clone();
         }
+    }
+    if argv.len() > 1 && argv[1] == "--pair" {
+        return std::process::ExitCode::from(show_pairing(Path::new(&data)));
     }
     if argv.len() > 1 && argv[1] == "--set-password" {
         let folder = argv.get(2).cloned().unwrap_or(data);
