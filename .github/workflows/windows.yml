@@ -1,0 +1,22 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+    paths: ["agent-windows/**", ".github/workflows/windows.yml"]
+  pull_request:
+    paths: ["agent-windows/**", ".github/workflows/windows.yml"]
+  workflow_dispatch:
+
+jobs:
+  agent:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: compile with the in-box .NET Framework compiler
+        run: powershell -ExecutionPolicy Bypass -File agent-windows\build.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RemoteCli-windows
+          path: agent-windows/bin/*.exe
+          if-no-files-found: error
