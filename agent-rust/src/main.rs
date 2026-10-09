@@ -313,29 +313,39 @@ struct Live {
 struct SpawnPre {
     cwd: std::ffi::CString,
     file: std::ffi::CString,
-    argv: Vec<*const libc::c_char>, // null-terminated pointer arrays, built before the fork:
-    envp: Vec<*const libc::c_char>, // the child only touches pointers afterwards
+    argv: Vec<*const libc::c_char>, // [file, null]; the buffer is owned by `file` above
+    envp: Vec<*const libc::c_char>, // points into _envp_strings, which moves along inside
+    _envp_strings: Vec<std::ffi::CString>, // owns every buffer envp points into
 }
 
 fn spawn_pre(cwd: &str, shell: &str) -> Result<SpawnPre, String> {
     use std::ffi::CString;
-    let cwd = CString::new(cwd).map_err(|_| "路径无效".to_string())?;
     let file = CString::new(shell).map_err(|_| "路径无效".to_string())?;
+    let cwd = CString::new(cwd).map_err(|_| "路径无效".to_string())?;
+    let has_utf8_locale = std::env::vars().any(|(k, v)| {
+        (k == "LANG" || k == "LC_ALL") && v.to_lowercase().contains("utf-8")
+    });
     let mut envs: Vec<String> = std::env::vars()
         .filter(|(k, _)| !STRIP_ENV.contains(&k.as_str())) // never hand a parent coding session down
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
     envs.push("TERM=xterm-256color".into());
     envs.push("COLORTERM=truecolor".into());
-    let argv: Vec<*const libc::c_char> =
-        vec![file.as_ptr() as *const libc::c_char, std::ptr::null()];
-    let mut envp_c = Vec::new();
-    for e in &envs {
-        envp_c.push(CString::new(e.as_str()).map_err(|_| "环境无效".to_string())?);
+    if !has_utf8_locale {
+        // a systemd user manager often has no LANG at all; without a UTF-8 locale the
+        // shell's readline treats every byte of Chinese input as one character
+        envs.push("LANG=C.UTF-8".into());
     }
-    let mut envp: Vec<*const libc::c_char> = envp_c.iter().map(|c| c.as_ptr() as *const libc::c_char).collect();
+    let mut strings: Vec<CString> = Vec::with_capacity(envs.len());
+    for e in &envs {
+        strings.push(CString::new(e.as_str()).map_err(|_| "环境无效".to_string())?);
+    }
+    let mut envp: Vec<*const libc::c_char> = strings.iter().map(|c| c.as_ptr() as *const libc::c_char).collect();
     envp.push(std::ptr::null());
-    Ok(SpawnPre { cwd, file, argv, envp })
+    // every pointer above stays valid: file and _envp_strings move into the struct and
+    // keep the buffers alive until execvpe has run
+    let argv = vec![file.as_ptr() as *const libc::c_char, std::ptr::null()];
+    Ok(SpawnPre { cwd, file, argv, envp, _envp_strings: strings })
 }
 
 impl Live {
