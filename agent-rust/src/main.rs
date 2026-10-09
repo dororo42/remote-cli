@@ -29,14 +29,22 @@ const OP_TTL: f64 = 150.0; // seconds an operation may travel before it is refus
 const CHUNK_CHARS: usize = 12000; // one numbered piece of output
 const BATCH_BYTES: usize = 512 * 1024;
 const BATCH_CHUNKS: usize = 150;
-const STRIP_ENV: [&str; 3] = ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT"];
+const OUTPUT_FLOOR_BYTES: usize = 2 * 1024 * 1024; // unsent output is dropped past this; the relay dedups by seq
+const STRIP_ENV: [&str; 3] = [
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SSE_PORT",
+];
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
 // ---------- small helpers ----------
 
 fn now() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 fn say(message: &str) {
@@ -75,13 +83,17 @@ fn hostname() -> String {
 }
 
 fn is_lower_hex(s: &str, min: usize, max: usize) -> bool {
-    s.len() >= min && s.len() <= max && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() >= min
+        && s.len() <= max
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn valid_server(s: &str) -> bool {
-    s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")).map(|rest| {
-        !rest.is_empty() && !rest.contains('/') && !rest.contains(char::is_whitespace)
-    }) == Some(true)
+    s.strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .map(|rest| !rest.is_empty() && !rest.contains('/') && !rest.contains(char::is_whitespace))
+        == Some(true)
 }
 
 fn tidy(text: &str, limit: usize) -> String {
@@ -107,7 +119,11 @@ fn tidy(text: &str, limit: usize) -> String {
                 _ => {}
             }
         }
-        if c.is_control() || c == '\u{7f}' || ('\u{80}'..='\u{9f}').contains(&c) || c.is_whitespace() {
+        if c.is_control()
+            || c == '\u{7f}'
+            || ('\u{80}'..='\u{9f}').contains(&c)
+            || c.is_whitespace()
+        {
             if !space {
                 out.push(' ');
                 space = true;
@@ -129,8 +145,13 @@ fn tidy(text: &str, limit: usize) -> String {
 
 fn normal_folder(path: &str) -> Result<String, String> {
     let path = path.trim();
-    if path.len() < 2 || path.len() > 240 || path.contains('*') || path.contains('?')
-        || path.contains('\0') || path.chars().any(|c| c.is_control()) || !path.starts_with('/')
+    if path.len() < 2
+        || path.len() > 240
+        || path.contains('*')
+        || path.contains('?')
+        || path.contains('\0')
+        || path.chars().any(|c| c.is_control())
+        || !path.starts_with('/')
     {
         return Err("请填写电脑上的完整文件夹路径，例如 /home/you/demo".into());
     }
@@ -150,8 +171,13 @@ fn normal_folder(path: &str) -> Result<String, String> {
 
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
-    std::fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600)
-        .open(&tmp)?.write_all(text.as_bytes())?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?
+        .write_all(text.as_bytes())?;
     std::fs::rename(&tmp, path)
 }
 
@@ -172,16 +198,30 @@ fn parse_dirs(cfg: &Value) -> BTreeMap<String, String> {
         for item in items.iter().take(60) {
             let (name, path) = match item {
                 Value::String(s) => match s.find('=') {
-                    Some(at) if at > 0 => (s[..at].trim().to_string(), s[at + 1..].trim().to_string()),
+                    Some(at) if at > 0 => {
+                        (s[..at].trim().to_string(), s[at + 1..].trim().to_string())
+                    }
                     _ => continue,
                 },
                 Value::Object(_) => (
-                    item.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string(),
-                    item.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string(),
+                    item.get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string(),
+                    item.get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string(),
                 ),
                 _ => continue,
             };
-            if name.is_empty() || name.chars().count() > 60 || path.chars().count() > 260 || !path.starts_with('/') {
+            if name.is_empty()
+                || name.chars().count() > 60
+                || path.chars().count() > 260
+                || !path.starts_with('/')
+            {
                 continue;
             }
             let path = normal_folder(&path).unwrap_or_default();
@@ -210,8 +250,13 @@ fn read_password(data: &Path) -> String {
 /// file is held for the process lifetime; the Python agent takes the same lock.
 fn acquire_singleton(data: &Path) -> Option<std::fs::File> {
     use std::os::unix::io::AsRawFd;
-    let lock = std::fs::OpenOptions::new().create(true).write(true).truncate(false).mode(0o600)
-        .open(data.join("agent.lock")).ok()?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(data.join("agent.lock"))
+        .ok()?;
     let fd = lock.as_raw_fd();
     let ok = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == 0 };
     if ok {
@@ -243,7 +288,10 @@ fn random_hex(len: usize) -> String {
     }
     if out.len() < len {
         // /dev/urandom unavailable: pad from the clock so the id still differs per start
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
         out.push_str(&format!("{:08x}{:08x}", nanos, std::process::id()));
     }
     out.truncate(len);
@@ -258,12 +306,20 @@ struct Http {
 
 impl Http {
     fn new() -> Http {
-        Http { agent: ureq::AgentBuilder::new().redirects(0).build() }
+        Http {
+            agent: ureq::AgentBuilder::new().redirects(0).build(),
+        }
     }
 
     /// POST JSON; returns (status, body). Transport failures are Err; HTTP errors carry
     /// their status and body back, so 401 and 429 can be told apart by the callers.
-    fn post(&self, url: &str, payload: &Value, token: &str, timeout: Duration) -> Result<(u16, String), String> {
+    fn post(
+        &self,
+        url: &str,
+        payload: &Value,
+        token: &str,
+        timeout: Duration,
+    ) -> Result<(u16, String), String> {
         let mut req = self.agent.post(url).timeout(timeout);
         if !token.is_empty() {
             req = req.set("Authorization", &format!("Bearer {token}"));
@@ -295,13 +351,15 @@ struct LiveInner {
     dir: String,
     cols: u16,
     rows: u16,
-    pending: String,      // decoded text read from the program, not yet numbered
-    output: Vec<Chunk>,   // numbered, not yet acknowledged by the relay
+    pending: String,    // decoded text read from the program, not yet numbered
+    output: Vec<Chunk>, // numbered, not yet acknowledged by the relay
+    out_bytes: usize,   // bytes in `output`, maintained by seal/trim
     seq: i64,
-    closed: bool,         // the process has been reaped
-    drained: bool,        // the reader delivered everything
+    closed: bool,  // the process has been reaped
+    drained: bool, // the reader delivered everything
     exit_code: Option<i64>,
     closed_at: Option<Instant>,
+    closing_at: Option<Instant>, // TERM sent; KILL follows if this lapses three seconds
 }
 
 struct Live {
@@ -322,12 +380,17 @@ fn spawn_pre(cwd: &str, shell: &str) -> Result<SpawnPre, String> {
     use std::ffi::CString;
     let file = CString::new(shell).map_err(|_| "路径无效".to_string())?;
     let cwd = CString::new(cwd).map_err(|_| "路径无效".to_string())?;
-    let has_utf8_locale = std::env::vars().any(|(k, v)| {
-        (k == "LANG" || k == "LC_ALL") && v.to_lowercase().contains("utf-8")
+    // vars_os: a non-UTF-8 variable must not panic the whole agent
+    let has_utf8_locale = std::env::vars_os().any(|(k, v)| {
+        let k = k.to_string_lossy();
+        (k == "LANG" || k == "LC_ALL") && v.to_string_lossy().to_lowercase().contains("utf-8")
     });
-    let mut envs: Vec<String> = std::env::vars()
-        .filter(|(k, _)| !STRIP_ENV.contains(&k.as_str())) // never hand a parent coding session down
-        .map(|(k, v)| format!("{k}={v}"))
+    let mut envs: Vec<String> = std::env::vars_os()
+        .filter(|(k, _)| {
+            let k = k.to_string_lossy();
+            !STRIP_ENV.iter().any(|s| s == &k) // never hand a parent coding session down
+        })
+        .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
         .collect();
     envs.push("TERM=xterm-256color".into());
     envs.push("COLORTERM=truecolor".into());
@@ -340,24 +403,50 @@ fn spawn_pre(cwd: &str, shell: &str) -> Result<SpawnPre, String> {
     for e in &envs {
         strings.push(CString::new(e.as_str()).map_err(|_| "环境无效".to_string())?);
     }
-    let mut envp: Vec<*const libc::c_char> = strings.iter().map(|c| c.as_ptr() as *const libc::c_char).collect();
+    let mut envp: Vec<*const libc::c_char> = strings
+        .iter()
+        .map(|c| c.as_ptr() as *const libc::c_char)
+        .collect();
     envp.push(std::ptr::null());
     // every pointer above stays valid: file and _envp_strings move into the struct and
     // keep the buffers alive until execvpe has run
     let argv = vec![file.as_ptr() as *const libc::c_char, std::ptr::null()];
-    Ok(SpawnPre { cwd, file, argv, envp, _envp_strings: strings })
+    Ok(SpawnPre {
+        cwd,
+        file,
+        argv,
+        envp,
+        _envp_strings: strings,
+    })
 }
 
 impl Live {
-    fn spawn(id: &str, cwd: &str, cols: u16, rows: u16, shell: &str, wake: Arc<Parker>)
-        -> Result<Arc<Live>, String>
-    {
+    fn spawn(
+        id: &str,
+        cwd: &str,
+        cols: u16,
+        rows: u16,
+        shell: &str,
+        wake: Arc<Parker>,
+    ) -> Result<Arc<Live>, String> {
         let pre = spawn_pre(cwd, shell)?;
         let mut master: i32 = 0;
         let mut slave: i32 = 0;
-        let ws = libc::winsize { ws_col: cols, ws_row: rows, ws_xpixel: 0, ws_ypixel: 0 };
+        let ws = libc::winsize {
+            ws_col: cols,
+            ws_row: rows,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
         unsafe {
-            if libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &ws) != 0 {
+            if libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &ws,
+            ) != 0
+            {
                 return Err("终端创建失败".into());
             }
             match libc::fork() {
@@ -382,9 +471,19 @@ impl Live {
                         id: id.to_string(),
                         pid,
                         inner: Mutex::new(LiveInner {
-                            fd: master, dir: cwd.to_string(), cols, rows,
-                            pending: String::new(), output: Vec::new(), seq: 0,
-                            closed: false, drained: false, exit_code: None, closed_at: None,
+                            fd: master,
+                            dir: cwd.to_string(),
+                            cols,
+                            rows,
+                            pending: String::new(),
+                            output: Vec::new(),
+                            out_bytes: 0,
+                            seq: 0,
+                            closed: false,
+                            drained: false,
+                            exit_code: None,
+                            closed_at: None,
+                            closing_at: None,
                         }),
                     });
                     {
@@ -481,18 +580,21 @@ impl Live {
     }
 
     fn write(&self, text: &str) -> Result<(), String> {
-        let fd = {
-            let inner = self.inner.lock().unwrap();
-            if inner.fd < 0 {
-                return Err("终端已结束".into());
-            }
-            inner.fd
-        };
+        // the lock is held for the whole write: closing the terminal between the fd check
+        // and the write could otherwise hand the reused fd number to a new terminal
         let bytes = text.as_bytes();
         let mut done = 0usize;
+        let inner = self.inner.lock().unwrap();
+        if inner.fd < 0 {
+            return Err("终端已结束".into());
+        }
         while done < bytes.len() {
             let n = unsafe {
-                libc::write(fd, bytes[done..].as_ptr() as *const libc::c_void, bytes.len() - done)
+                libc::write(
+                    inner.fd,
+                    bytes[done..].as_ptr() as *const libc::c_void,
+                    bytes.len() - done,
+                )
             };
             if n < 0 {
                 return Err("终端已结束".into());
@@ -505,7 +607,12 @@ impl Live {
     fn resize(&self, cols: u16, rows: u16) {
         let mut inner = self.inner.lock().unwrap();
         if inner.fd >= 0 {
-            let ws = libc::winsize { ws_col: cols, ws_row: rows, ws_xpixel: 0, ws_ypixel: 0 };
+            let ws = libc::winsize {
+                ws_col: cols,
+                ws_row: rows,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
             unsafe { libc::ioctl(inner.fd, libc::TIOCSWINSZ, &ws as *const libc::winsize) };
         }
         inner.cols = cols;
@@ -536,15 +643,55 @@ impl Live {
         }
     }
 
+    /// Sends TERM now; the report loop escalates to KILL later, outside the state lock.
+    fn begin_close(&self) {
+        unsafe { libc::killpg(self.pid, libc::SIGTERM) };
+        let mut inner = self.inner.lock().unwrap();
+        if inner.closing_at.is_none() {
+            inner.closing_at = Some(Instant::now());
+        }
+    }
+
+    /// Escalates a close to KILL once TERM has had its three seconds.
+    fn escalate(&self) {
+        let due = {
+            let inner = self.inner.lock().unwrap();
+            !inner.closed
+                && inner.fd >= 0
+                && inner
+                    .closing_at
+                    .map(|t| t.elapsed() > Duration::from_secs(3))
+                    .unwrap_or(false)
+        };
+        if due {
+            unsafe { libc::killpg(self.pid, libc::SIGKILL) };
+        }
+    }
+
     fn trim(&self, upto: i64) {
         let mut inner = self.inner.lock().unwrap();
-        inner.output.retain(|c| c.seq > upto);
+        let mut kept = Vec::with_capacity(inner.output.len());
+        let mut bytes = 0usize;
+        for chunk in inner.output.drain(..) {
+            if chunk.seq > upto {
+                bytes += chunk.data.len();
+                kept.push(chunk);
+            }
+        }
+        inner.output = kept;
+        inner.out_bytes = bytes;
     }
 
     fn can_forget(&self) -> bool {
         let inner = self.inner.lock().unwrap();
-        inner.closed && inner.pending.is_empty() && inner.output.is_empty()
-            && (inner.drained || inner.closed_at.map(|t| t.elapsed() > Duration::from_secs(15)).unwrap_or(false))
+        inner.closed
+            && inner.pending.is_empty()
+            && inner.output.is_empty()
+            && (inner.drained
+                || inner
+                    .closed_at
+                    .map(|t| t.elapsed() > Duration::from_secs(15))
+                    .unwrap_or(false))
     }
 
     fn dispose(&self) {
@@ -556,20 +703,37 @@ impl Live {
     }
 }
 
-/// Turns pending text into numbered pieces; only the report thread calls this.
-fn seal(live: &Live) -> Vec<Chunk> {
+/// Turns pending text into numbered pieces; only the report thread calls this. Pieces the
+/// relay has not confirmed are dropped once they outgrow OUTPUT_FLOOR_BYTES: the relay
+/// deduplicates by seq, so a reader that asks past dropped output gets its reset flag.
+fn seal(live: &Live) {
     let mut inner = live.inner.lock().unwrap();
     let text = std::mem::take(&mut inner.pending);
-    let mut out = Vec::new();
     let mut rest = text.as_str();
+    let mut fresh: Vec<Chunk> = Vec::new();
     while !rest.is_empty() {
         inner.seq += 1;
         // split at a character boundary, CHUNK_CHARS characters at a time
-        let end = rest.char_indices().nth(CHUNK_CHARS).map(|(i, _)| i).unwrap_or(rest.len());
-        out.push(Chunk { seq: inner.seq, data: rest[..end].to_string() });
+        let end = rest
+            .char_indices()
+            .nth(CHUNK_CHARS)
+            .map(|(i, _)| i)
+            .unwrap_or(rest.len());
+        fresh.push(Chunk {
+            seq: inner.seq,
+            data: rest[..end].to_string(),
+        });
         rest = &rest[end..];
     }
-    out
+    for chunk in &fresh {
+        inner.out_bytes += chunk.data.len();
+    }
+    inner.output.extend(fresh);
+    while inner.out_bytes > OUTPUT_FLOOR_BYTES && inner.output.len() > 1 {
+        let dropped = inner.output.remove(0);
+        let dropped_len = dropped.data.len();
+        inner.out_bytes -= dropped_len;
+    }
 }
 
 fn output_batch(terminals: &HashMap<String, Arc<Live>>) -> Vec<Value> {
@@ -578,11 +742,22 @@ fn output_batch(terminals: &HashMap<String, Arc<Live>>) -> Vec<Value> {
     for live in terminals.values() {
         let chunks: Vec<Chunk> = {
             let inner = live.inner.lock().unwrap();
-            inner.output.iter().take(30).map(|c| Chunk { seq: c.seq, data: c.data.clone() }).collect()
+            inner
+                .output
+                .iter()
+                .take(30)
+                .map(|c| Chunk {
+                    seq: c.seq,
+                    data: c.data.clone(),
+                })
+                .collect()
         };
         for c in chunks {
-            let encoded = serde_json::to_string(&json!({"terminal": &live.id, "seq": c.seq, "data": &c.data}))
-                .map(|s| s.len()).unwrap_or(0);
+            let encoded = serde_json::to_string(
+                &json!({"terminal": &live.id, "seq": c.seq, "data": &c.data}),
+            )
+            .map(|s| s.len())
+            .unwrap_or(0);
             if !batch.is_empty() && size + encoded > BATCH_BYTES {
                 return batch;
             }
@@ -606,21 +781,34 @@ struct Projects {
 impl Projects {
     fn load(data: &Path) -> Projects {
         let file = data.join("terminal-projects.json");
-        let own = std::fs::read_to_string(&file).ok()
+        let own = std::fs::read_to_string(&file)
+            .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
             .and_then(|v| v.as_array().cloned())
-            .map(|items| items.iter().filter_map(|item| {
-                let name = item.get("name")?.as_str()?.to_string();
-                let path = item.get("path")?.as_str()?.to_string();
-                if name.is_empty() || path.is_empty() { None } else { Some((name, path)) }
-            }).collect())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let name = item.get("name")?.as_str()?.to_string();
+                        let path = item.get("path")?.as_str()?.to_string();
+                        if name.is_empty() || path.is_empty() {
+                            None
+                        } else {
+                            Some((name, path))
+                        }
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         Projects { file, own }
     }
 
     fn save(&self) -> Result<(), String> {
-        let list: Vec<Value> = self.own.iter()
-            .map(|(n, p)| json!({"name": n, "path": p})).collect();
+        let list: Vec<Value> = self
+            .own
+            .iter()
+            .map(|(n, p)| json!({"name": n, "path": p}))
+            .collect();
         write_private(&self.file, &serde_json::to_string(&list).unwrap())
             .map_err(|_| "记录保存失败".to_string())
     }
@@ -640,7 +828,8 @@ impl Projects {
 
     fn entries(&self, cfg: &Value) -> Vec<Value> {
         let fixed = parse_dirs(cfg);
-        let mut out: Vec<Value> = fixed.iter()
+        let mut out: Vec<Value> = fixed
+            .iter()
             .map(|(n, p)| json!({"name": n, "path": p, "fixed": true, "exists": true}))
             .collect();
         for (name, path) in &self.own {
@@ -652,9 +841,13 @@ impl Projects {
         out
     }
 
-    fn change(&mut self, op: &Value, action: &str, cfg: &Value, terminals: &HashMap<String, Arc<Live>>)
-        -> Result<(), String>
-    {
+    fn change(
+        &mut self,
+        op: &Value,
+        action: &str,
+        cfg: &Value,
+        terminals: &HashMap<String, Arc<Live>>,
+    ) -> Result<(), String> {
         let fixed = parse_dirs(cfg);
         let name = tidy(op.get("name").and_then(|v| v.as_str()).unwrap_or(""), 40);
         if action == "project_add" {
@@ -694,11 +887,13 @@ impl Projects {
         } else {
             let at = match self.own.iter().position(|(x, _)| *x == name) {
                 Some(at) => at,
-                None => return Err(if fixed.contains_key(&name) {
-                    "这个项目写在电脑的配置文件里，请在电脑上修改".into()
-                } else {
-                    "没有这个项目".into()
-                }),
+                None => {
+                    return Err(if fixed.contains_key(&name) {
+                        "这个项目写在电脑的配置文件里，请在电脑上修改".into()
+                    } else {
+                        "没有这个项目".into()
+                    })
+                }
             };
             if action == "project_remove" {
                 let busy = terminals.iter().any(|(_, live)| {
@@ -714,7 +909,8 @@ impl Projects {
                 if to.is_empty() {
                     return Err("名称需为 1 至 40 字".into());
                 }
-                if to != name && (fixed.contains_key(&to) || self.own.iter().any(|(x, _)| *x == to)) {
+                if to != name && (fixed.contains_key(&to) || self.own.iter().any(|(x, _)| *x == to))
+                {
                     return Err("已有同名项目".into());
                 }
                 self.own[at].0 = to.clone();
@@ -762,7 +958,10 @@ impl Parker {
     fn wait(&self, d: Duration) {
         let mut set = self.0.lock().unwrap();
         if !*set {
-            let (guard, _) = self.1.wait_timeout(set, d).unwrap_or_else(|p| p.into_inner());
+            let (guard, _) = self
+                .1
+                .wait_timeout(set, d)
+                .unwrap_or_else(|p| p.into_inner());
             set = guard;
         }
         *set = false;
@@ -786,9 +985,16 @@ impl Agent {
             instance: random_hex(32),
             projects: Mutex::new(Projects::load(&data)),
             state: Mutex::new(State {
-                server: String::new(), token: String::new(), next_login: 0.0,
-                terminals: HashMap::new(), completed: BTreeMap::new(), reported: BTreeSet::new(),
-                last_activity: now(), last_input: 0.0, soon: false, paired: false,
+                server: String::new(),
+                token: String::new(),
+                next_login: 0.0,
+                terminals: HashMap::new(),
+                completed: BTreeMap::new(),
+                reported: BTreeSet::new(),
+                last_activity: now(),
+                last_input: 0.0,
+                soon: false,
+                paired: false,
             }),
             parker: Arc::new(Parker(Mutex::new(false), Condvar::new())),
             report_http: Http::new(),
@@ -818,13 +1024,17 @@ impl Agent {
         }
         state.next_login = now() + 60.0; // one attempt a minute until it works
         let attempt = self.report_http.post(
-            &format!("{}/api/login", state.server), &json!({"password": self.password}), "",
-            Duration::from_secs(20));
+            &format!("{}/api/login", state.server),
+            &json!({"password": self.password}),
+            "",
+            Duration::from_secs(20),
+        );
         let (status, body) = match attempt {
             Ok(r) => r,
             Err(_) => return false,
         };
-        let token = serde_json::from_str::<Value>(&body).ok()
+        let token = serde_json::from_str::<Value>(&body)
+            .ok()
             .and_then(|v| v.get("token").and_then(|t| t.as_str()).map(String::from))
             .filter(|t| status == 200 && t.len() >= 32);
         match token {
@@ -839,70 +1049,94 @@ impl Agent {
 
     fn report(&self) {
         let cfg = read_config(&self.data);
-        let (server_before, token, dirs, payload, ack_ids) = {
-            let mut state = self.state.lock().unwrap();
-            let server = cfg_str(&cfg, "Server").trim().trim_end_matches('/').to_string();
-            if server != state.server {
-                state.server = server;
-                state.token.clear();
-            }
-            if state.server.is_empty() {
-                return;
-            }
-            if state.token.is_empty() && (now() < state.next_login || !self.login(&mut state)) {
-                return;
-            }
-            if !state.paired {
-                state.paired = true;
-                let name = tidy(cfg_str(&cfg, "Name"), 60);
-                let name = if name.is_empty() { hostname() } else { name };
-                print_pairing(&state.server, &self.password, &name);
-            }
-            let enabled = cfg.get("RemoteEnabled").and_then(|v| v.as_bool()) == Some(true);
-            if !enabled {
-                for live in state.terminals.values() {
-                    let closed = live.inner.lock().unwrap().closed;
-                    if !closed {
-                        live.kill();
+        let (server_before, token, dirs, payload, ack_ids) =
+            {
+                let mut state = self.state.lock().unwrap();
+                let server = cfg_str(&cfg, "Server")
+                    .trim()
+                    .trim_end_matches('/')
+                    .to_string();
+                if server != state.server {
+                    state.server = server;
+                    state.token.clear();
+                }
+                if state.server.is_empty() {
+                    return;
+                }
+                if state.token.is_empty() && (now() < state.next_login || !self.login(&mut state)) {
+                    return;
+                }
+                if !state.paired {
+                    state.paired = true;
+                    let name = tidy(cfg_str(&cfg, "Name"), 60);
+                    let name = if name.is_empty() { hostname() } else { name };
+                    print_pairing(&state.server, &self.password, &name);
+                }
+                let enabled = cfg.get("RemoteEnabled").and_then(|v| v.as_bool()) == Some(true);
+                if !enabled {
+                    for live in state.terminals.values() {
+                        let closed = live.inner.lock().unwrap().closed;
+                        if !closed {
+                            live.begin_close();
+                        }
                     }
                 }
-            }
-            let dirs = self.projects.lock().unwrap().all(&cfg);
-            for live in state.terminals.values() {
-                let chunks = seal(live);
-                live.inner.lock().unwrap().output.extend(chunks);
-            }
-            let output = output_batch(&state.terminals);
-            if !output.is_empty() {
-                state.last_activity = now();
-            }
-            let acks: Vec<Value> = state.completed.iter()
-                .filter(|(id, _)| !state.reported.contains(*id))
-                .take(200)
-                .map(|(id, a)| json!({"id": id, "error": a.error}))
-                .collect();
-            let ack_ids: Vec<String> = acks.iter()
-                .map(|a| a.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string())
-                .collect();
-            let terminals: Vec<Value> = state.terminals.values().map(|live| {
+                let dirs = self.projects.lock().unwrap().all(&cfg);
+                for live in state.terminals.values() {
+                    live.escalate();
+                }
+                for live in state.terminals.values() {
+                    seal(live);
+                }
+                let output = output_batch(&state.terminals);
+                if !output.is_empty() {
+                    state.last_activity = now();
+                }
+                let acks: Vec<Value> = state
+                    .completed
+                    .iter()
+                    .filter(|(id, _)| !state.reported.contains(*id))
+                    .take(200)
+                    .map(|(id, a)| json!({"id": id, "error": a.error}))
+                    .collect();
+                let ack_ids: Vec<String> = acks
+                    .iter()
+                    .map(|a| {
+                        a.get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .collect();
+                let terminals: Vec<Value> = state.terminals.values().map(|live| {
                 let inner = live.inner.lock().unwrap();
                 json!({"id": live.id, "state": if inner.closed { "closed" } else { "running" },
                        "cols": inner.cols, "rows": inner.rows, "session": "", "status": "",
                        "exit_code": inner.exit_code})
             }).collect();
-            let entries = self.projects.lock().unwrap().entries(&cfg);
-            let payload = json!({
-                "info": {"instance": self.instance, "enabled": enabled, "tools": ["shell"],
-                         "workspaces": dirs.keys().collect::<Vec<_>>(),
-                         "projects": entries},
-                "terminals": terminals,
-                "output": output,
-                "acks": acks,
-            });
-            (state.server.clone(), state.token.clone(), dirs, payload, ack_ids)
-        };
+                let entries = self.projects.lock().unwrap().entries(&cfg);
+                let payload = json!({
+                    "info": {"instance": self.instance, "enabled": enabled, "tools": ["shell"],
+                             "workspaces": dirs.keys().collect::<Vec<_>>(),
+                             "projects": entries},
+                    "terminals": terminals,
+                    "output": output,
+                    "acks": acks,
+                });
+                (
+                    state.server.clone(),
+                    state.token.clone(),
+                    dirs,
+                    payload,
+                    ack_ids,
+                )
+            };
         let result = self.report_http.post(
-            &format!("{server_before}/api/terminal/agent"), &payload, &token, Duration::from_secs(20));
+            &format!("{server_before}/api/terminal/agent"),
+            &payload,
+            &token,
+            Duration::from_secs(20),
+        );
         let (status, body) = match result {
             Ok(r) => r,
             Err(_) => return,
@@ -942,7 +1176,9 @@ impl Agent {
                 state.reported.remove(&id);
             }
         }
-        let forget: Vec<String> = state.terminals.iter()
+        let forget: Vec<String> = state
+            .terminals
+            .iter()
             .filter(|(_, live)| live.can_forget())
             .map(|(id, _)| id.clone())
             .collect();
@@ -954,10 +1190,25 @@ impl Agent {
     }
 
     fn execute(&self, op: &Value, cfg: &Value, dirs: &BTreeMap<String, String>, state: &mut State) {
-        let action = op.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let project = matches!(action.as_str(), "project_add" | "project_remove" | "project_rename");
-        let op_id = op.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let terminal = op.get("terminal").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let action = op
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let project = matches!(
+            action.as_str(),
+            "project_add" | "project_remove" | "project_rename"
+        );
+        let op_id = op
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let terminal = op
+            .get("terminal")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         // shape and freshness, before anything is carried out
         if !is_lower_hex(&op_id, 16, 32) || (!project && !is_lower_hex(&terminal, 32, 32)) {
             say("拒绝操作：操作编号无效");
@@ -980,13 +1231,24 @@ impl Agent {
         if cfg.get("RemoteEnabled").and_then(|v| v.as_bool()) != Some(true) {
             error = "电脑远控已关闭".into();
         } else if project {
-            if let Err(e) = self.projects.lock().unwrap().change(op, &action, cfg, &state.terminals) {
+            if let Err(e) = self
+                .projects
+                .lock()
+                .unwrap()
+                .change(op, &action, cfg, &state.terminals)
+            {
                 error = e;
             }
         } else if action == "start" {
-            error = self.start_terminal(op, dirs, &terminal, cfg, state).err().unwrap_or_default();
+            error = self
+                .start_terminal(op, dirs, &terminal, cfg, state)
+                .err()
+                .unwrap_or_default();
         } else {
-            let existing = state.terminals.get(&terminal).map(Arc::clone)
+            let existing = state
+                .terminals
+                .get(&terminal)
+                .map(Arc::clone)
                 .filter(|l| !l.inner.lock().unwrap().closed);
             match existing {
                 None => error = "终端已结束".into(),
@@ -995,7 +1257,7 @@ impl Agent {
                         "input" => self.do_input(&live, op, state),
                         "resize" => self.do_resize(&live, op),
                         "close" => {
-                            live.kill();
+                            live.begin_close();
                             String::new()
                         }
                         _ => "操作无效".into(),
@@ -1004,7 +1266,11 @@ impl Agent {
             }
         }
         if !error.is_empty() {
-            say(&format!("操作 {} 失败：{}", &op_id[..op_id.len().min(8)], error));
+            say(&format!(
+                "操作 {} 失败：{}",
+                &op_id[..op_id.len().min(8)],
+                error
+            ));
         }
         state.completed.insert(op_id.clone(), Ack { error });
         state.reported.remove(&op_id);
@@ -1033,8 +1299,14 @@ impl Agent {
         }
     }
 
-    fn start_terminal(&self, op: &Value, dirs: &BTreeMap<String, String>, terminal: &str,
-                      cfg: &Value, state: &mut State) -> Result<(), String> {
+    fn start_terminal(
+        &self,
+        op: &Value,
+        dirs: &BTreeMap<String, String>,
+        terminal: &str,
+        cfg: &Value,
+        state: &mut State,
+    ) -> Result<(), String> {
         if state.terminals.contains_key(terminal) {
             return Ok(()); // already started; the operation is a repeat
         }
@@ -1047,8 +1319,11 @@ impl Agent {
         if !Path::new(&cwd).is_dir() {
             return Err("电脑上没有这个文件夹".into());
         }
-        let running = state.terminals.values()
-            .filter(|l| !l.inner.lock().unwrap().closed).count();
+        let running = state
+            .terminals
+            .values()
+            .filter(|l| !l.inner.lock().unwrap().closed)
+            .count();
         if running >= MAX_TERMINALS {
             return Err(format!("最多同时运行 {MAX_TERMINALS} 个终端，请先结束一个"));
         }
@@ -1073,13 +1348,18 @@ impl Agent {
             }
             let started = Instant::now();
             let payload = json!({"instance": self.instance, "wait": 12});
-            match self.pull_http.post(&format!("{server}/api/terminal/agent/pull"), &payload,
-                                      &token, Duration::from_secs(20)) {
+            match self.pull_http.post(
+                &format!("{server}/api/terminal/agent/pull"),
+                &payload,
+                &token,
+                Duration::from_secs(20),
+            ) {
                 Ok((401, _)) => self.state.lock().unwrap().token.clear(),
                 Ok((200, body)) => {
                     if let Ok(result) = serde_json::from_str::<Value>(&body) {
                         if let Some(ops) = result.get("operations").and_then(|v| v.as_array()) {
-                            let ops: Vec<Value> = ops.iter().filter(|op| op.is_object()).cloned().collect();
+                            let ops: Vec<Value> =
+                                ops.iter().filter(|op| op.is_object()).cloned().collect();
                             if !ops.is_empty() {
                                 let cfg = read_config(&self.data);
                                 let mut state = self.state.lock().unwrap();
@@ -1096,9 +1376,10 @@ impl Agent {
                 Ok(_) => {}
                 Err(_) => {}
             }
-            // an answer that came back at once must not become a busy loop
+            // an answer that came back at once must not become a busy loop; plain sleep —
+            // the shared wake event belongs to the report loop and must not be consumed here
             if started.elapsed() < Duration::from_millis(40) {
-                self.parker.wait(Duration::from_millis(40));
+                std::thread::sleep(Duration::from_millis(40));
             }
         }
     }
@@ -1141,15 +1422,30 @@ impl Agent {
 }
 
 fn print_pairing(server: &str, password: &str, name: &str) {
-    let enc = |s: &str| s.bytes().map(|b| match b {
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
-        _ => format!("%{b:02X}"),
-    }).collect::<String>();
-    let payload = format!("remotecli://connect?u={}&p={}&n={}",
-                          enc(server), enc(password), enc(name));
+    let enc = |s: &str| {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect::<String>()
+    };
+    let payload = format!(
+        "remotecli://connect?u={}&p={}&n={}",
+        enc(server),
+        enc(password),
+        enc(name)
+    );
     eprintln!("\n配对：手机 App 点“扫码添加电脑”，扫下面的二维码，或手动输入地址与密码。");
     eprintln!("  地址：{server}\n  名称：{name}\n  密码：{password}\n");
-    if let Ok(out) = std::process::Command::new("qrencode").arg("-t").arg("ANSIUTF8").arg(&payload).output() {
+    if let Ok(out) = std::process::Command::new("qrencode")
+        .arg("-t")
+        .arg("ANSIUTF8")
+        .arg(&payload)
+        .output()
+    {
         if out.status.success() && !out.stdout.is_empty() {
             eprintln!("{}", String::from_utf8_lossy(&out.stdout));
         }
@@ -1168,7 +1464,10 @@ fn set_password(folder: &Path) -> u8 {
     let _ = std::fs::create_dir_all(folder);
     match write_private(&folder.join("password.txt"), &format!("{secret}\n")) {
         Ok(()) => {
-            println!("密码已写入 {}（权限 600）", folder.join("password.txt").display());
+            println!(
+                "密码已写入 {}（权限 600）",
+                folder.join("password.txt").display()
+            );
             0
         }
         Err(_) => 2,
@@ -1182,7 +1481,10 @@ extern "C" fn on_signal(_sig: libc::c_int) {
 fn main() -> std::process::ExitCode {
     let argv: Vec<String> = std::env::args().collect();
     let mut data = std::env::var("REMOTECLI_DATA").unwrap_or_else(|_| {
-        format!("{}/.local/state/remote-cli-agent", std::env::var("HOME").unwrap_or_default())
+        format!(
+            "{}/.local/state/remote-cli-agent",
+            std::env::var("HOME").unwrap_or_default()
+        )
     });
     if let Some(at) = argv.iter().position(|a| a == "--data") {
         if at + 1 < argv.len() {
@@ -1213,7 +1515,10 @@ fn main() -> std::process::ExitCode {
             argv.first().map(String::as_str).unwrap_or("remote-cli-agent"), data.display()));
         return std::process::ExitCode::from(2);
     }
-    say(&format!("remote-cli agent (Linux, Rust) {VERSION}，数据目录 {}", data.display()));
+    say(&format!(
+        "remote-cli agent (Linux, Rust) {VERSION}，数据目录 {}",
+        data.display()
+    ));
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);

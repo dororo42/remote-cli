@@ -1,0 +1,6 @@
+[Unit]
+Description=remote-cli online watchdog (journal-warns when the agent is offline)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/remote-cli-review/tools/online_watchdog.py
