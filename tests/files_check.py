@@ -179,6 +179,10 @@ def main():
     for folder in (data, project, outside):
         folder.mkdir()
     made = samples(project)
+    # RCLI_TEST_DOCX and RCLI_TEST_PPTX put a document of one's own in place of the made-up ones, to see how it is shown.
+    for wanted, kind in (("RCLI_TEST_DOCX", "word"), ("RCLI_TEST_PPTX", "slides")):
+        if os.environ.get(wanted) and kind in made:
+            (project / made[kind]).write_bytes(Path(os.environ[wanted]).read_bytes())
     (outside / "secret.txt").write_text("not part of the project")
     linked = subprocess.run(["cmd", "/c", "mklink", "/J", str(project / "link"), str(outside)], capture_output=True).returncode == 0
     (data / "config.json").write_text(json.dumps({"Server": "http://127.0.0.1:%d" % PORT, "RemoteEnabled": True, "RemoteMaxMode": "full", "RemoteDirs": ["cohort-study=%s" % project]}), encoding="utf-8")
@@ -213,7 +217,8 @@ def main():
             if call("/api/terminal")["device"]["workspaces"]:
                 break
             time.sleep(0.5)
-        assert "files" in call("/api/terminal")["device"]["features"]
+        features = call("/api/terminal")["device"]["features"]
+        assert "files" in features
 
         top = files("file_list")
         names = {e["name"]: e for e in top["entries"]}
@@ -300,13 +305,13 @@ def main():
                 view = lambda path: base + "/files/?dir=cohort-study" + ("&path=" + quote(path.rsplit("/", 1)[0]) if "/" in path else "") + "&file=" + quote(path.rsplit("/", 1)[-1])
                 drawn = {"pdf": "document.querySelectorAll('.sheet-of-paper canvas').length > 0", "image": "!!document.querySelector('.picture img') && document.querySelector('.picture img').naturalWidth > 0",
                          "markdown": "Array.from(document.querySelectorAll('.doc img')).every(i => i.naturalWidth > 0) && !!document.querySelector('.doc h1')",
-                         "word": "!!document.querySelector('.doc.paper table')", "sheet": "document.querySelectorAll('.grid td').length > 8", "sheet_csv": "document.querySelectorAll('.grid td').length > 8",
-                         "slides": "document.querySelectorAll('.slide').length === 2", "notebook": "!!document.querySelector('.notebook .code')", "code": "!!document.querySelector('.code .hljs-keyword')",
+                         "word": "document.querySelectorAll('.word-looks section.docx table').length > 0", "sheet": "document.querySelectorAll('.grid td').length > 8", "sheet_csv": "document.querySelectorAll('.grid td').length > 8",
+                         "slides": "document.querySelectorAll('.slide-looks .pptx-preview-wrapper > *').length >= 2", "notebook": "!!document.querySelector('.notebook .code')", "code": "!!document.querySelector('.code .hljs-keyword')",
                          "unknown": "!!document.querySelector('.unknown')"}
                 shot(base + "/?project=cohort-study", "project.png", "!document.getElementById('project').hidden")
                 shot(base + "/files/?dir=cohort-study", "folder.png", "document.querySelectorAll('#entries li').length > 5")
                 for kind, path in sorted(made.items()):
-                    shot(view(path), kind + ".png", drawn[kind])
+                    shot(view(path), kind + ".png", drawn[kind], seconds=60 if kind in ("word", "slides") else 20)
                 # Saving inside the app: the page hands the file to the phone piece by piece. A stand-in for the app
                 # collects the pieces; together they must be the file.
                 stand_in = ask("Page.addScriptToEvaluateOnNewDocument", source="window.RemoteCliNative = { got: [], saveStart(n) { this.name = n; this.got = []; return ''; }, "

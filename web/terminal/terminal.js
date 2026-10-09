@@ -64,10 +64,20 @@
 
   let running = false, restoring = true, initialized = false, lastSize = '', tool = 'claude', ended = false;
   let wide = 0, tall = 0, start = 0, paletteOpen = false, sizeTimer = 0;
+  // A terminal can be open on the phone and in a window on the computer at once, and the two are seldom the same
+  // size. The program is drawn for one size only: that of whoever typed last. `theirs` is the size the computer
+  // reports; `sized` is when this page last asked for its own, so that a report still on its way is not taken for
+  // someone else's wish.
+  let theirs = '', sized = 0, elsewhere = false;
 
   function send(data) {
     if (!bridge) return false;
     if (!running) { notice.textContent = restoring && !ended ? '正在载入终端输出，稍后再发送' : '终端尚未连接或已经结束'; return false; }
+    const mine = `${term.cols}x${term.rows}`;
+    if (theirs && theirs !== mine && Date.now() - sized > 2000) {
+      lastSize = mine; sized = Date.now();
+      bridge.resize(JSON.stringify({ cols: term.cols, rows: term.rows }));
+    }
     bridge.input(data);
     return true;
   }
@@ -81,7 +91,7 @@
     clearTimeout(sizeTimer);
     if (running && size !== lastSize && bridge) sizeTimer = setTimeout(() => {
       if (!running || size === lastSize) return;
-      lastSize = size;
+      lastSize = size; sized = Date.now();
       bridge.resize(JSON.stringify({ cols, rows }));
     }, 180);
   }
@@ -226,6 +236,10 @@
   $('again').addEventListener('click', () => { if (bridge) bridge.again(); });
   $('back').addEventListener('click', () => { if (bridge) bridge.close(); });
   $('voice').addEventListener('click', () => { if (bridge) bridge.voice(); });
+  // A microphone that does nothing is worse than none: many phones have no recognizer of their own, and there the
+  // one on the keyboard is the way to speak. In a browser the button stays only where the browser can listen.
+  const app = window.RemoteCliNative;
+  if (app ? (app.canDictate && !app.canDictate()) : !(window.SpeechRecognition || window.webkitSpeechRecognition)) $('voice').hidden = true;
 
   let wasEnded = null;
   function show(element, text) { if (element.textContent !== text) element.textContent = text; }
@@ -234,6 +248,12 @@
       const t = payload.terminal, device = payload.device;
       const live = t.state === 'running' && device.online && device.enabled;
       tool = t.tool; ended = t.state === 'closed';
+      // The size changing to one this page did not ask for means the terminal is open in another place too. A size
+      // that merely has not caught up with this page's own request says nothing.
+      const reported = t.cols && t.rows ? `${t.cols}x${t.rows}` : '';
+      if (reported && theirs && reported !== theirs && reported !== lastSize && Date.now() - sized > 2500) elsewhere = true;
+      if (reported === `${term.cols}x${term.rows}`) elsewhere = false;
+      theirs = reported;
       slash.hidden = !(COMMANDS[tool] || []).length;
       if ($('files').hidden) $('files').hidden = false;        // the folder this terminal works in is known now
       if (!initialized || payload.reset) {
@@ -244,7 +264,10 @@
       }
       const more = payload.after < t.seq;
       // Output arrives many times a second: the page around the terminal is touched only where something changed.
-      const where = (tool === 'codex' ? 'Codex' : tool === 'shell' ? 'PowerShell' : 'Claude Code') + ' · ' + t.dir;
+      const plain = device.shell || 'PowerShell';      // what the computer calls its plain terminal
+      const where = (tool === 'codex' ? 'Codex' : tool === 'shell' ? plain : 'Claude Code') + ' · ' + t.dir;
+      // Someone else's size on the screen means the terminal is open in another place too.
+      $('shared').hidden = !(running && elsewhere);
       const loading = restoring && more ? `载入输出 ${Math.round(100 * (payload.after - start) / Math.max(1, t.seq - start))}%` : '';
       show($('title'), t.title);
       show(status, where + ' · ' + (loading || (!device.online ? '电脑离线，等待重连' : !device.enabled ? '电脑远控已关闭' : t.state === 'starting' ? '正在启动'
@@ -255,7 +278,7 @@
       if ($('ended').hidden !== (!ended || more)) $('ended').hidden = !ended || more;
       if (ended !== wasEnded) {
         wasEnded = ended;
-        show($('ended-text'), tool === 'shell' ? 'PowerShell 已结束，画面保留到这里' : '终端已结束，对话保存在电脑上');
+        show($('ended-text'), tool === 'shell' ? plain + ' 已结束，画面保留到这里' : '终端已结束，对话保存在电脑上');
         $('again').hidden = tool === 'shell';
         input.disabled = ended; sendButton.disabled = ended; $('voice').disabled = ended;
         drawPalette();

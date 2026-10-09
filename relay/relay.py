@@ -282,6 +282,28 @@ def _said(term):
     return view.text
 
 
+def _question(term):
+    """The question a terminal's program is waiting on, as the last lines of its screen: enough to answer it from
+    the list without opening the terminal, and never answered without having been shown."""
+    _said(term)                         # brings the kept screen up to date
+    kept = _screens.get(term["id"])
+    if not kept:
+        return []
+    lines = [line[:160] for line in kept[1].lines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    lines = lines[-14:]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    return lines
+
+
+def _shell(value):
+    """The name the computer gives its plain terminal ("PowerShell", "bash"), for titles and buttons."""
+    value = "".join(c for c in value if c.isprintable()).strip() if isinstance(value, str) else ""
+    return value[:24]
+
+
 def _public(term):
     shown = {k: v for k, v in term.items() if k not in ("output", "instance", "size", "out_at", "touched", "calm_until")}
     # Until the owner names a terminal, it carries the name of the conversation it has open.
@@ -389,7 +411,9 @@ def _overview(path, terminal, after, now):
             for gone in [key for key in _screens if key not in state["threads"]]:
                 del _screens[gone]
             return {"device": _view(now), "terminals": sorted(
-                [dict(_public(t), said=_said(t) if t["state"] == "running" else "") for t in state["threads"].values()], key=lambda t: -t["created"]),
+                [dict(_public(t), said=_said(t) if t["state"] == "running" else "",
+                      asks=_question(t) if t["state"] == "running" and t.get("phase") == "confirm" else [])
+                 for t in state["threads"].values()], key=lambda t: -t["created"]),
                 "sessions": [_public_session(s, attached.get(s["id"], "")) for s in _sessions]}
         term = state["threads"].get(terminal)
         if not term:
@@ -408,7 +432,7 @@ def _overview(path, terminal, after, now):
             if length >= 180_000:
                 break
         # A terminal's page needs to know only whether the computer is there; the lists of folders stay with the list.
-        return {"device": {"online": now - _device["seen"] < 15, "enabled": _device["enabled"]}, "terminal": _public(term), "chunks": out, "reset": reset,
+        return {"device": {"online": now - _device["seen"] < 15, "enabled": _device["enabled"], "shell": _device.get("shell", "")}, "terminal": _public(term), "chunks": out, "reset": reset,
                 "after": out[-1]["seq"] if out else term.get("seq", 0), "tick": _tick[0]}
 
 
@@ -475,7 +499,7 @@ def command(path, payload, now=None):
             if sum(t["state"] in ("starting", "running") for t in state["threads"].values()) >= MAX_TERMINALS:
                 raise RemoteError("最多同时运行 8 个终端，请先结束一个")
             terminal = uuid.uuid4().hex
-            term = {"id": terminal, "tool": tool, "dir": folder, "title": LABELS[tool] + (" · 副本" if fork else ""), "session": "" if fork else session, "status": "",
+            term = {"id": terminal, "tool": tool, "dir": folder, "title": (_device.get("shell") or LABELS[tool] if tool == "shell" else LABELS[tool]) + (" · 副本" if fork else ""), "session": "" if fork else session, "status": "",
                     "created": int(now * 1000), "state": "starting", "error": "", "seq": 0, "output": [], "size": 0, "cols": 80, "rows": 24,
                     "instance": _device["instance"], "previous": previous, "history": bool(payload.get("history")), "touched": False}
             state["threads"][terminal] = term
@@ -520,6 +544,7 @@ def command(path, payload, now=None):
 
 FILE_ACTIONS = ("file_list", "file_read")
 FILE_SECONDS = 25
+ANSWERED = FILE_ACTIONS + ("session_read",)     # operations whose acknowledgment carries an answer
 
 
 def files(path, payload, now=None, wait=FILE_SECONDS):
@@ -548,24 +573,54 @@ def files(path, payload, now=None, wait=FILE_SECONDS):
             raise RemoteError("电脑端版本不支持查看文件，请更新电脑端")
         if folder not in _device["workspaces"]:
             raise RemoteError("没有这个项目")
-        op = {"id": op_id, "terminal": "", "state": "queued", "error": "", "at": now,
-              "payload": {"id": op_id, "action": action, "dir": folder, "path": where, "offset": payload.get("offset", 0)}}
-        _pending[op_id] = _pending.queued[op_id] = op
-        _wake()
-        deadline = time.monotonic() + wait
-        while op["state"] == "queued":
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            _changed.wait(min(remaining, 5))
-        _pending.queued.pop(op_id, None)
-        _pending.pop(op_id, None)       # asked once, answered once: nothing of a file stays here
-        if op["state"] == "queued":
-            op["state"] = "error"
-            raise RemoteError("电脑没有及时回应，请重试")
-        if op["error"]:
-            raise RemoteError(op["error"])
-        return op.get("result") or {}
+        return _held({"id": op_id, "action": action, "dir": folder, "path": where, "offset": payload.get("offset", 0)}, now, wait)
+
+
+def _held(question, now, wait):
+    """Passes a question on to the computer and waits for its answer. Called with _changed held."""
+    op_id = question["id"]
+    op = {"id": op_id, "terminal": "", "state": "queued", "error": "", "at": now, "payload": question}
+    _pending[op_id] = _pending.queued[op_id] = op
+    _wake()
+    deadline = time.monotonic() + wait
+    while op["state"] == "queued":
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        _changed.wait(min(remaining, 5))
+    _pending.queued.pop(op_id, None)
+    _pending.pop(op_id, None)           # asked once, answered once: nothing of the answer stays here
+    if op["state"] == "queued":
+        op["state"] = "error"
+        raise RemoteError("电脑没有及时回应，请重试")
+    if op["error"]:
+        raise RemoteError(op["error"])
+    return op.get("result") or {}
+
+
+def conversation(path, payload, now=None, wait=FILE_SECONDS):
+    """The last things said in a conversation saved on the computer, so that it can be looked at before anything
+    is done to the program that has it open. The computer reads it; nothing of it is written here."""
+    now = time.time() if now is None else now
+    if not isinstance(payload, dict):
+        raise RemoteError("请求格式无效")
+    op_id, session = payload.get("id"), payload.get("session")
+    if not isinstance(op_id, str) or not _id.fullmatch(op_id):
+        raise RemoteError("操作编号无效")
+    if not isinstance(session, str) or not _session.fullmatch(session):
+        raise RemoteError("对话编号无效")
+    with _changed:
+        _expire(now)
+        if op_id in _pending:
+            raise RemoteError("操作编号已被其它操作使用")
+        if not _view(now)["online"] or not _device["enabled"]:
+            raise RemoteError("电脑未连接或远控已关闭，请等待电脑上线后重试")
+        if "peek" not in _device.get("features", []):
+            raise RemoteError("电脑端版本不支持查看对话内容，请更新电脑端")
+        saved = next((s for s in _sessions if s["id"] == session), None)
+        if not saved:
+            raise RemoteError("电脑上没有找到这个对话，请刷新后重试")
+        return _held({"id": op_id, "action": "session_read", "session": session, "tool": saved["tool"], "dir": saved["dir"]}, now, wait)
 
 
 def pull(path, payload, now=None):
@@ -612,8 +667,8 @@ def agent(path, payload, now=None):
                 if isinstance(s, dict) and isinstance(s.get("id"), str) and _session.fullmatch(s["id"]) and s.get("tool") in ("claude", "codex")
                 and isinstance(s.get("dir"), str) and isinstance(s.get("title"), str) and s["title"].strip() and type(s.get("updated")) is int]
         _device.update(seen=now, instance=instance, enabled=info.get("enabled") is True,
-                       version=str(info.get("version") or "")[:20], newer=str(info.get("newer") or "")[:20],
-                       features=[x for x in info.get("features", []) if x in ("codex-fork", "codex-takeover", "terminal-exit", "files", "update")],
+                       version=str(info.get("version") or "")[:20], newer=str(info.get("newer") or "")[:20], shell=_shell(info.get("shell")),
+                       features=[x for x in info.get("features", []) if x in ("codex-fork", "codex-takeover", "terminal-exit", "files", "update", "peek")],
                        tools=[x for x in info.get("tools", []) if x in ("claude", "codex", "shell")],
                        workspaces=[x for x in info.get("workspaces", []) if isinstance(x, str) and 0 < len(x) <= 60],
                        projects=_folders(info.get("projects"), 60), candidates=_folders(info.get("candidates"), 12))
@@ -628,7 +683,7 @@ def agent(path, payload, now=None):
                 continue
             op = _pending.get(ack.get("id"))
             if op and op["state"] == "queued":
-                if op["payload"]["action"] in FILE_ACTIONS:
+                if op["payload"]["action"] in ANSWERED:
                     op["result"] = ack.get("result") if isinstance(ack.get("result"), dict) else {}
                     wrote = True        # the request that waits for it looks again
                 op.update(state="error" if ack.get("error") else "done", error=str(ack.get("error", ""))[:300])

@@ -2,7 +2,8 @@
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
-  const TOOLS = { claude: 'Claude Code', codex: 'Codex', shell: 'PowerShell' };
+  // The plain terminal is called what the computer calls it: PowerShell on Windows, the person's shell elsewhere.
+  const TOOLS = { claude: 'Claude Code', codex: 'Codex', shell: '终端' };
   const ABOUT = { claude: 'Anthropic', codex: 'OpenAI', shell: '命令行' };
   const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
   const native = window.RemoteCliNative || null;
@@ -198,7 +199,7 @@
   }
   // ?take=<conversation> comes from the app's workbench: the question about taking over a conversation that runs on
   // the computer is asked at once, and the terminal that follows leads back to the workbench.
-  let take = new URLSearchParams(location.search).get('take') || '', fromBench = !!take;
+  let take = new URLSearchParams(location.search).get('take') || '', anew = new URLSearchParams(location.search).get('new') === '1', fromBench = !!take || anew;
   function open(terminal) { location.href = 'terminal/?id=' + encodeURIComponent(terminal) + (fromBench ? '&from=bench' : ''); }
   async function start(tool, dir, session, takeover, fork) {
     const payload = { action: 'start', tool, dir, history: false };
@@ -212,17 +213,97 @@
     await run({ action: 'close', terminal: t.id }, '正在结束…');
     refresh();
   }
-  async function takeOver(session) {
-    if (!usable()) return;
+  // A conversation that a program on the computer has open. Looking at it does nothing to that program: the last
+  // things said are read from the conversation's file. Carrying on from the phone is a separate, deliberate step,
+  // offered below what was said, in the words of what will happen on the computer.
+  function ways(session) {
     const host = sessionHost(session), locked = sessionActivity(session) === 'locked';
     const canClose = session.can_takeover === true && !locked;
-    const choices = [{ label: canClose ? '结束原终端并接管对话' : '我已关闭原应用，检查接管', sub: '继续同一段历史；后台锁释放后才能接管', value: 'close', kind: 'solid' }];
-    if (session.tool === 'codex' && (data.device.features || []).includes('codex-fork')) choices.push({ label: '另建副本', sub: '这是独立的新对话，两边之后各自继续，不是接管', value: 'copy' });
-    const reason = host === 'shared'
-      ? '电脑没有可定位的可见终端；Codex 共享 app-server 仍占用写入锁。请先在原应用中结束并关闭对应会话，再检查接管；也可以直接新开副本。'
-      : canClose ? '接管会结束原终端中的这段对话，正在执行的任务可能中断。' : (session.takeover_reason || '请先在原终端中结束并关闭这段对话，再检查接管。');
-    const choice = await ask('接管 ' + TOOLS[session.tool] + ' 原对话', reason, choices);
+    const choices = [canClose
+      ? { label: '在手机上继续', sub: '电脑上的那个窗口会关闭，正在执行的任务会中断', value: 'close', kind: 'solid' }
+      : { label: '我已在电脑上关掉它，在手机上继续', sub: '还开着的话不会动它，会告诉你原因', value: 'close', kind: 'solid' }];
+    if (session.tool === 'codex' && (data.device.features || []).includes('codex-fork'))
+      choices.push({ label: '另开一份继续', sub: '带着到现在为止的内容新开一段；电脑上的那段不受影响，之后各走各的', value: 'copy' });
+    const why = canClose ? ''
+      : host === 'shared' ? '这段对话由电脑上的 Codex 应用或编辑器打开着，手机不能替你关掉它。请先在那个应用里结束这段对话。'
+      : session.takeover_reason || '手机不能确定是哪个程序在用这段对话，所以不会去关它。请先在电脑上结束使用它的程序。';
+    return { choices, why };
+  }
+  // What was said, laid out to be read: the tools answer in Markdown, which is set as text with headings, lists, code
+  // and tables rather than shown as its source; what the person asked stands apart on the right; and a run of things
+  // the tool did is one quiet block, folded when it is long, so that it does not push the talk off the screen.
+  const loading = {};
+  const need = name => loading[name] || (loading[name] = new Promise((done, failed) => {
+    const script = el('script', { src: 'files/vendor/' + name, onload: done, onerror: failed });
+    document.head.append(script);
+  }));
+  async function writeSaid(box, messages, toolName) {
+    let rich = false;
+    try { await Promise.all([need('marked.min.js'), need('purify.min.js')]); rich = !!(window.marked && window.DOMPurify); } catch (error) { /* plain text then */ }
+    const set = text => {
+      if (!rich) return el('div', { className: 'plain', textContent: text });
+      // nothing that could act or load: no links to follow, no pictures, no forms, no styles of its own
+      const html = DOMPurify.sanitize(marked.parse(text, { gfm: true, breaks: true }),
+        { FORBID_TAGS: ['style', 'form', 'button', 'textarea', 'select', 'input', 'img', 'a', 'iframe', 'video', 'audio'], FORBID_ATTR: ['style', 'href', 'src'] });
+      const body = el('div', { className: 'md', html });
+      body.querySelectorAll('table').forEach(table => { const wrap = el('div', { className: 'wide' }); table.replaceWith(wrap); wrap.append(table); });
+      return body;
+    };
+    let run = null, last = '';
+    messages.forEach(m => {
+      if (m.role === 'tool') {
+        if (!run) { run = { list: el('ul'), count: 0 }; run.box = el('details', { className: 'did' }, el('summary'), run.list); box.append(run.box); }
+        run.list.append(el('li', { textContent: m.text })); run.count++;
+        run.box.firstChild.textContent = '做了 ' + run.count + ' 个操作';
+        run.box.open = run.count <= 3;          // a few are shown; a long run is opened by a tap
+        return;
+      }
+      run = null;
+      const mine = m.role === 'user';
+      box.append(el('div', { className: 'turn ' + (mine ? 'user' : 'assistant') },
+        !mine && last !== 'assistant' ? el('b', { textContent: toolName }) : '', set(m.text)));
+      last = m.role;
+    });
+  }
+  async function takeOver(session) {
+    if (!usable()) return;
+    const { choices, why } = ways(session), canPeek = (data.device.features || []).includes('peek');
+    const choice = await openSheet((form, finish) => {
+      form.append(el('h3', { textContent: session.title }),
+        el('p', { textContent: (hostLabel[sessionHost(session)] || hostLabel.unknown) + ' · ' + TOOLS[session.tool] + ' · ' + session.dir }));
+      if (canPeek) {
+        const said = el('div', { className: 'said' }, el('p', { className: 'quiet', textContent: '正在读取对话…' }));
+        form.append(said, el('p', { className: 'quiet', textContent: '只是查看，不影响电脑上的程序。' }));
+        api('/api/conversation', { id: newId(), session: session.id }).then(got => {
+          said.textContent = '';
+          const messages = got.messages || [];
+          if (got.more) said.append(el('p', { className: 'quiet', textContent: '更早的内容没有显示' }));
+          if (!messages.length) said.append(el('p', { className: 'quiet', textContent: '这段对话还没有内容' }));
+          writeSaid(said, messages, TOOLS[session.tool]).then(() => { said.scrollTop = said.scrollHeight; });      // what was said last is what one came to see
+        }).catch(error => { said.textContent = ''; said.append(el('p', { className: 'quiet', textContent: error.message })); });
+      }
+      if (why) form.append(el('p', { className: 'why', textContent: why }));
+      choices.forEach(c => form.append(el('button', { type: 'button', className: 'choice ' + (c.kind || ''), onclick: () => finish(c.value) },
+        el('span', null, c.label, el('small', { textContent: c.sub })))));
+    });
     if (choice) start(session.tool, session.dir, session.id, choice === 'close', choice === 'copy');
+  }
+  // ?new=1 comes from the app's workbench: a terminal is started without walking to a project first. The projects
+  // used last come first; each offers the tools the computer has.
+  async function startAnywhere() {
+    if (!usable()) return toast('电脑离线，暂时不能新建');
+    const tools = Object.keys(TOOLS).filter(t => (data.device.tools || []).includes(t));
+    const latest = name => Math.max(0, ...data.terminals.filter(t => t.dir === name).map(t => t.created || 0), ...(data.sessions || []).filter(s => s.dir === name).map(s => s.updated || 0));
+    const names = (data.device.workspaces || []).slice().sort((a, b) => latest(b) - latest(a));
+    if (!names.length || !tools.length) return toast(names.length ? '电脑上没有可用的工具' : '请先添加一个项目');
+    const picked = await openSheet((form, finish) => {
+      form.append(el('h3', { textContent: '新建终端' }), el('p', { textContent: '选一个项目和要用的工具。最近用过的项目在前。' }));
+      const list = el('div', { className: 'anywhere' });
+      names.slice(0, 12).forEach(name => list.append(el('div', { className: 'row' }, el('b', { textContent: name }),
+        el('span', null, ...tools.map(tool => el('button', { type: 'button', className: 'tool ' + tool, ariaLabel: '在 ' + name + ' 新建 ' + TOOLS[tool], html: ICON[tool], onclick: () => finish({ tool, name }) }))))));
+      form.append(list);
+    });
+    if (picked) start(picked.tool, picked.name);
   }
   async function addProject() {
     const candidates = (data.device.candidates || []).slice(0, 4).map(c => ({ label: '添加 ' + c.name, sub: c.path, value: c.path }));
@@ -248,6 +329,16 @@
     const card = el('li', { className: 'card ' + phase }, el('button', { type: 'button', className: 'open', onclick: () => open(t.id) },
       el('span', { className: 'tool ' + t.tool, html: ICON[t.tool] }), el('span', { className: 'text' }, el('b', { textContent: t.title }), meta, peek)));
     if (running(t)) card.append(el('button', { type: 'button', className: 'side', ariaLabel: '结束这个终端', html: ICON.stop, onclick: () => endTerminal(t) }));
+    // A question the program waits on is answered here, under what it asks: the question is on the card, so nothing
+    // is allowed unseen. The two keys are the ones Claude Code and Codex take for "yes" and "no".
+    if (phase === 'confirm' && (t.asks || []).length) {
+      const answer = (key, done) => async () => { if (await run({ action: 'input', terminal: t.id, data: key }, '')) { toast(done); refresh(); } };
+      card.classList.add('asking');
+      card.append(el('div', { className: 'ask' }, el('pre', { textContent: t.asks.join('\n') }), el('div', { className: 'answers' },
+        el('button', { type: 'button', className: 'yes', textContent: '允许（回车）', onclick: answer('\r', '已允许') }),
+        el('button', { type: 'button', className: 'no', textContent: '拒绝（Esc）', onclick: answer('\x1b', '已拒绝') }),
+        el('button', { type: 'button', className: 'see', textContent: '进去看', onclick: () => open(t.id) }))));
+    }
     return card;
   }
   // A writer lock means the conversation is held, not that a computer window is showing it.
@@ -261,7 +352,7 @@
     if (!s.live) return 'history';
     return sessionHost(s) === 'cli' ? 'active' : 'locked';
   }
-  const hostLabel = { cli: '电脑 CLI 运行中', shared: '后台锁定 · 没有可见窗口', remote: '其它远程终端锁定', unknown: '后台锁定 · 归属待确认' };
+  const hostLabel = { cli: '电脑上打开着', shared: '被电脑上的应用占用', remote: '被另一个远程终端占用', unknown: '被电脑上的程序占用' };
   function sessionCard(s, withProject) {
     const meta = el('span', { className: 'meta' });
     if (s.live) {
@@ -351,7 +442,7 @@
       launch.dataset.signature = tools.join() + ready;
       launch.replaceChildren(...tools.map(tool => el('button', { type: 'button', disabled: !ready, onclick: () => start(tool, project) },
         el('span', { className: 'tool ' + tool, html: ICON[tool] }), el('span', null, '新建 ' + TOOLS[tool], el('small', { textContent: ABOUT[tool] })))));
-      if (ready && !tools.length) launch.append(el('p', { textContent: '电脑上没有找到 claude、codex 或 PowerShell。' }));
+      if (ready && !tools.length) launch.append(el('p', { textContent: '电脑上没有找到 claude、codex 或命令行终端。' }));
     }
     const own = mine.filter(t => t.dir === project).sort((a, b) => a.rank - b.rank || b.at - a.at);
     $('p-active').hidden = !own.length;
@@ -391,7 +482,13 @@
   async function refresh() {
     clearTimeout(timer);
     try {
-      data = await api('/api/terminal'); draw(); peeks();
+      data = await api('/api/terminal');
+      if (data.device.shell) TOOLS.shell = data.device.shell;
+      draw(); peeks();
+      if (anew) {
+        anew = false; history.replaceState(history.state, '', location.pathname + (project ? '?project=' + encodeURIComponent(project) : ''));
+        startAnywhere();
+      }
       if (take) {
         const wanted = (data.sessions || []).find(s => s.id === take && !s.terminal);
         take = ''; history.replaceState(history.state, '', location.pathname + (project ? '?project=' + encodeURIComponent(project) : ''));
@@ -406,14 +503,19 @@
 
   (async () => {
     try {
-      // The app hands the password over once, after the "#"; it never travels in a request line.
-      const given = new URLSearchParams(location.hash.slice(1)).get('p');
-      if (given) {
-        history.replaceState(null, '', location.pathname);
-        try { await api('/api/login', { password: given }); } catch (error) { showLogin(); $('login-error').textContent = error.message; return; }
+      // The app hands the password over once, after the "#"; it never travels in a request line. The program on the
+      // computer opens its own window with a ticket instead: good once, for a minute, and of no use afterwards.
+      const handed = new URLSearchParams(location.hash.slice(1)), given = handed.get('p'), ticket = handed.get('t');
+      const wanted = new URLSearchParams(location.search).get('open') || '';
+      if (given || ticket) {
+        history.replaceState(null, '', location.pathname + location.search);
+        try { await api('/api/login', ticket ? { ticket } : { password: given }); }
+        catch (error) { showLogin(); $('login-error').textContent = ticket ? '这个窗口的登录已过期，请从电脑端程序重新打开' : error.message; return; }
       }
       const session = await (await fetch('/api/session', { credentials: 'same-origin' })).json();
       if (!session.signed_in) return showLogin();
+      // ?open=<terminal> goes straight to that terminal: the computer's own window opens the one that was picked.
+      if (/^[a-f0-9]{32}$/.test(wanted)) return location.replace('terminal/?id=' + wanted);
       // ?project=<name> opens one project directly, for a link or a picture of that page.
       project = history.state && history.state.project || new URLSearchParams(location.search).get('project') || '';
       $('home').hidden = false;

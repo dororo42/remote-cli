@@ -86,6 +86,25 @@
     for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
     return bytes;
   }
+  // A Word file with its formatting (headings, emphasis, colours, tables, pictures, lists), flowing to the width
+  // of the screen like any page of text; a PowerPoint file as its slides, each the width of the screen.
+  async function wordLooks(bytes) {
+    await need('jszip.min.js');           // the second looks for the first when it is loaded
+    await need('docx-preview.min.js');
+    const box = el('div', { className: 'looks word-looks' });
+    await docx.renderAsync(bytes, box, null, { inWrapper: false, ignoreWidth: true, ignoreHeight: true, breakPages: false, useBase64URL: true,
+      renderHeaders: false, renderFooters: false, renderFootnotes: true });
+    box.querySelectorAll('table').forEach(table => { const wrap = el('div', { className: 'wide' }); table.replaceWith(wrap); wrap.append(table); });
+    return box;
+  }
+  async function slideLooks(bytes) {
+    await need('pptx-preview.umd.js');
+    const box = el('div', { className: 'looks slide-looks' });
+    const width = Math.max(300, Math.min(document.documentElement.clientWidth - 20, 960));       // the margin beside the slides
+    const viewer = pptxPreview.init(box, { width, height: Math.round(width * 9 / 16), mode: 'list' });
+    await viewer.preview(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    return box;
+  }
   /** The whole file, piece by piece. Refuses one larger than `limit`; `first` is a piece that was fetched already. */
   async function read(path, limit, mine, first) {
     let piece = first || await ask('file_read', path, 0);
@@ -258,11 +277,6 @@
     });
     return page;
   }
-  async function word(bytes) {
-    await Promise.all([need('mammoth.browser.min.js'), need('purify.min.js')]);
-    const made = await mammoth.convertToHtml({ arrayBuffer: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) });
-    return documentOf(made.value || '<p>这份文档里没有文字。</p>', true);
-  }
   function table(rows) {
     const shown = rows.slice(0, 2000), columns = Math.min(80, shown.reduce((most, row) => Math.max(most, row.length), 0));
     const letters = n => { let s = ''; for (n++; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + (n - 1) % 26) + s; return s; };
@@ -285,39 +299,6 @@
       while (rows.length && rows[rows.length - 1].every(v => v === '')) rows.pop();
       return rows.length ? table(rows) : el('p', { className: 'note', textContent: '这张表是空的。' });
     } }));
-  }
-  // A presentation is a zip of XML: each slide gives its title, its text in reading order and its pictures.
-  async function slides(bytes) {
-    await need('xlsx.full.min.js');
-    const zip = XLSX.CFB.read(bytes, { type: 'array' }), files = {};
-    zip.FullPaths.forEach((name, at) => { files[name.replace(/^[^/]*\//, '')] = zip.FileIndex[at]; });
-    const xml = name => files[name] && files[name].content ? new DOMParser().parseFromString(new TextDecoder().decode(new Uint8Array(files[name].content)), 'application/xml') : null;
-    const links = name => { const map = {}, rels = xml(name.replace(/([^/]+)$/, '_rels/$1.rels')); if (rels) Array.from(rels.getElementsByTagName('Relationship')).forEach(r => { map[r.getAttribute('Id')] = r.getAttribute('Target'); }); return map; };
-    const main = xml('ppt/presentation.xml'), order = links('ppt/presentation.xml');
-    const names = main ? Array.from(main.getElementsByTagName('p:sldId')).map(s => 'ppt/' + order[s.getAttribute('r:id')]).filter(n => files[n]) : [];
-    if (!names.length) throw new Error('这份演示文稿里没有找到幻灯片');
-    const page = el('div', { className: 'slides' });
-    names.forEach((name, at) => {
-      const slide = xml(name), rels = links(name), card = el('section', { className: 'slide' }, el('span', { className: 'count', textContent: (at + 1) + ' / ' + names.length }));
-      Array.from(slide.getElementsByTagName('p:sp')).forEach(shape => {
-        const holder = shape.getElementsByTagName('p:ph')[0], title = holder && /title/i.test(holder.getAttribute('type') || '');
-        Array.from(shape.getElementsByTagName('a:p')).forEach(paragraph => {
-          const said = Array.from(paragraph.getElementsByTagName('a:t')).map(t => t.textContent).join('');
-          if (!said.trim()) return;
-          const level = Number(((paragraph.getElementsByTagName('a:pPr')[0] || { getAttribute: () => 0 }).getAttribute('lvl')) || 0);
-          card.append(title ? el('h2', { textContent: said }) : el('p', { textContent: said, className: 'level-' + Math.min(3, level) }));
-        });
-      });
-      Array.from(slide.getElementsByTagName('a:tbl')).forEach(grid => card.append(el('div', { className: 'wide' }, el('table', null, ...Array.from(grid.getElementsByTagName('a:tr')).map(row =>
-        el('tr', null, ...Array.from(row.getElementsByTagName('a:tc')).map(cell => el('td', { textContent: Array.from(cell.getElementsByTagName('a:t')).map(t => t.textContent).join('') }))))))));
-      Array.from(slide.getElementsByTagName('a:blip')).forEach(picture => {
-        const target = rels[picture.getAttribute('r:embed')] || '', file = files[('ppt/slides/' + target).replace(/[^/]+\/\.\.\//g, '')], type = K.kind(target).type;
-        if (file && file.content && type.startsWith('image/')) card.append(el('img', { src: hand(new Uint8Array(file.content), type), alt: '' }));
-      });
-      if (card.children.length === 1) card.append(el('p', { className: 'note', textContent: '这一页没有文字' }));
-      page.append(card);
-    });
-    return el('div', null, el('p', { className: 'note', textContent: '这里显示每一页的文字、表格和图片，不是原来的版式。' }), page);
   }
   async function pdf(bytes, mine) {
     await need('pdf.min.js');
@@ -390,9 +371,9 @@
       else if (view === 'code' && kind.ext === 'ipynb') list = [{ label: '笔记本', draw: () => notebook(text()) }, source];
       else if (view === 'code') list = [Object.assign({}, source, { label: '' })];
       else if (view === 'image') list = kind.ext === 'svg' ? [{ label: '图片', draw: () => picture(got.bytes, kind.type) }, Object.assign({}, source, { draw: async () => { await need('highlight.min.js'); return code(text(), 'xml'); } })] : [{ label: '', draw: () => picture(got.bytes, kind.type) }];
-      else if (view === 'word') list = [{ label: '', draw: () => word(got.bytes) }];
+      else if (view === 'word') list = [{ label: '', draw: () => wordLooks(got.bytes) }];
       else if (view === 'sheet') list = await workbook(got.bytes, kind.ext);
-      else if (view === 'slides') list = [{ label: '', draw: () => slides(got.bytes) }];
+      else if (view === 'slides') list = [{ label: '', draw: () => slideLooks(got.bytes) }];
       else if (view === 'pdf') list = [{ label: '', draw: () => pdf(got.bytes, mine) }];
       if (mine !== run) return;
       await tabs(list, 0);

@@ -380,6 +380,55 @@ class TerminalRelayTests(unittest.TestCase):
         tr.overview(self.path, now=1004 + 601)
         self.assertEqual(len(tr._pending), 0)
 
+    def test_a_question_is_shown_with_the_terminal_so_it_can_be_answered_from_the_list(self):
+        self.start()
+        live = {"info": self.info, "terminals": [{"id": self.terminal, "state": "running"}]}
+        asked = "\x1b[2J\x1b[H Bash command\r\n\r\n   rm -rf build\r\n\r\n Do you want to proceed?\r\n > 1. Yes\r\n   2. No\r\n"
+        tr.agent(self.path, dict(live, output=[{"terminal": self.terminal, "seq": 1, "data": asked}]), now=1004)
+        tr.agent(self.path, live, now=1007)         # quiet for a moment with the question on the screen
+        shown = tr.overview(self.path, now=1007)["terminals"][0]
+        self.assertEqual(shown["phase"], "confirm")
+        self.assertEqual([line.strip() for line in shown["asks"]], ["Bash command", "", "rm -rf build", "", "Do you want to proceed?", "> 1. Yes", "2. No"])
+        tr.agent(self.path, dict(live, output=[{"terminal": self.terminal, "seq": 2, "data": "building " * 150}]), now=1008)      # it went on
+        tr.agent(self.path, live, now=1020)
+        self.assertEqual(tr.overview(self.path, now=1020)["terminals"][0]["asks"], [])      # no question, nothing to answer
+
+    def test_the_plain_terminal_is_called_what_the_computer_calls_it(self):
+        self.assertEqual(tr.overview(self.path, now=1001)["device"].get("shell", ""), "")
+        self.start()
+        self.assertEqual(tr.overview(self.path, now=1004)["terminals"][0]["title"], "Codex")
+        tr.agent(self.path, {"info": dict(self.info, shell="bash\x07" + "x" * 40)}, now=1005)
+        self.assertEqual(tr.overview(self.path, now=1005)["device"]["shell"], ("bash" + "x" * 40)[:24])
+        tr.agent(self.path, {"info": dict(self.info, shell="zsh")}, now=1006)
+        shell = tr.command(self.path, {"id": "d" * 32, "action": "start", "tool": "shell", "dir": "demo"}, now=1006)["terminal"]
+        self.assertEqual(next(t for t in tr.overview(self.path, now=1006)["terminals"] if t["id"] == shell)["title"], "zsh")
+
+    def test_a_conversation_is_read_by_the_computer_before_anything_is_done_to_it(self):
+        import threading
+        sid = "11111111-2222-3333-4444-555555555555"
+        ask = {"id": "c" * 32, "session": sid}
+        with self.assertRaisesRegex(RemoteError, "更新电脑端"):
+            tr.conversation(self.path, ask, now=1001, wait=0)
+        info = dict(self.info, features=["peek"])
+        tr.agent(self.path, {"info": info}, now=1001)
+        with self.assertRaisesRegex(RemoteError, "没有找到这个对话"):
+            tr.conversation(self.path, ask, now=1001, wait=0)
+        tr.agent(self.path, {"info": info, "sessions": [{"id": sid, "tool": "claude", "dir": "demo", "title": "原对话", "updated": 1, "live": True, "host": "cli"}]}, now=1001)
+        for bad in (dict(ask, session="x"), dict(ask, id="x"), dict(ask, session=None)):
+            with self.assertRaises(RemoteError):
+                tr.conversation(self.path, bad, now=1001, wait=0)
+        answers = {}
+        waiting = threading.Thread(target=lambda: answers.update(got=tr.conversation(self.path, ask, now=1001, wait=5)))
+        waiting.start()
+        asked = tr.pull(self.path, {"instance": self.info["instance"], "wait": 3})["operations"]
+        # the tool and the folder are what the computer reported, not what the viewer says
+        self.assertEqual([(o["action"], o["session"], o["tool"], o["dir"]) for o in asked], [("session_read", sid, "claude", "demo")])
+        said = [{"role": "user", "text": "修一下登录"}, {"role": "assistant", "text": "好的"}]
+        tr.agent(self.path, {"info": info, "acks": [{"id": ask["id"], "error": "", "result": {"messages": said, "more": False}}]}, now=1002)
+        waiting.join(5)
+        self.assertEqual(answers["got"]["messages"], said)
+        self.assertNotIn(ask["id"], tr._pending)        # nothing of it is kept
+
     def test_files_are_asked_of_the_computer_and_answered_once(self):
         import threading
         ask = {"id": "f" * 32, "action": "file_list", "dir": "demo", "path": "src"}
