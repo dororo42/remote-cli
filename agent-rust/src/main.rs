@@ -1384,18 +1384,17 @@ impl Agent {
         }
     }
 
-    fn run(self: &'static Self) -> i32 {
-        // the agent lives for the whole process (Box::leak in main), so the listener
-        // thread can hold a plain 'static reference
-        let agent: &'static Agent = self;
+    // the agent lives for the whole process (Box::leak in main), so the listener thread
+    // can hold a plain 'static reference
+    fn run(agent: &'static Agent) -> i32 {
         std::thread::spawn(move || agent.listen());
         while !STOP.load(Ordering::SeqCst) {
-            self.report();
+            agent.report();
             let (soon, last_activity, last_input) = {
-                let state = self.state.lock().unwrap();
+                let state = agent.state.lock().unwrap();
                 (state.soon, state.last_activity, state.last_input)
             };
-            self.state.lock().unwrap().soon = false;
+            agent.state.lock().unwrap().soon = false;
             let pause = if soon {
                 Duration::from_millis(20)
             } else if now() - last_activity < 20.0 {
@@ -1403,12 +1402,12 @@ impl Agent {
             } else {
                 Duration::from_millis(700)
             };
-            self.parker.wait(pause);
+            agent.parker.wait(pause);
             if now() - last_input < 0.15 {
                 std::thread::sleep(Duration::from_millis(12));
             }
         }
-        let mut state = self.state.lock().unwrap();
+        let mut state = agent.state.lock().unwrap();
         for live in state.terminals.values() {
             let closed = live.inner.lock().unwrap().closed;
             if !closed {
@@ -1524,5 +1523,5 @@ fn main() -> std::process::ExitCode {
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
     }
     let agent: &'static Agent = Box::leak(Box::new(Agent::new(data, password)));
-    std::process::ExitCode::from(agent.run() as u8)
+    std::process::ExitCode::from(Agent::run(agent) as u8)
 }
