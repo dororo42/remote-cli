@@ -23,5 +23,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: relay unit tests
         run: python -m unittest discover -s relay -p "test_*.py"
-      - name: agent-linux tests (unit + end-to-end against the real relay)
+      - name: build the Rust agent
+        run: cargo build --release --manifest-path agent-rust/Cargo.toml
+      - name: agent-linux tests (unit + e2e against the real relay, Python and Rust binaries)
         run: python -m unittest discover -s agent-linux -p "test_*.py"
