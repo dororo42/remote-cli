@@ -1,0 +1,31 @@
+name: Android build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: accept licenses and install the SDK pieces the build needs
+        shell: pwsh
+        run: |
+          "y`r`n" * 50 | & "$env:ANDROID_HOME\cmdline-tools\latest\bin\sdkmanager.bat" --licenses *> $null
+          & "$env:ANDROID_HOME\cmdline-tools\latest\bin\sdkmanager.bat" "build-tools;36.0.0" "platforms;android-36" | Out-Null
+      - name: keep the signing key across builds
+        uses: actions/cache@v4
+        with:
+          path: ~\.remote-cli-signing
+          key: remote-cli-signing
+      - name: build the APK
+        run: powershell -ExecutionPolicy Bypass -File android\build.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RemoteCli-android
+          path: dist/*.apk
+          if-no-files-found: error

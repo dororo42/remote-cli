@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths: ["relay/**", "agent-linux/**", ".github/workflows/ci.yml"]
+  pull_request:
+    paths: ["relay/**", "agent-linux/**", ".github/workflows/ci.yml"]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    name: tests (Python ${{ matrix.python-version }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: relay unit tests
+        run: python -m unittest discover -s relay -p "test_*.py"
+      - name: agent-linux tests (unit + end-to-end against the real relay)
+        run: python -m unittest discover -s agent-linux -p "test_*.py"
