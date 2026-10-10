@@ -1,7 +1,14 @@
 name: Android build
 
+# Fork-local build check. The signing key comes from repository secrets — never from an
+# Actions cache, where eviction would silently mint a new key and break in-app updates
+# on installed phones.
+
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   apk:
@@ -17,11 +24,19 @@ jobs:
         run: |
           "y`r`n" * 50 | & "$env:ANDROID_HOME\cmdline-tools\latest\bin\sdkmanager.bat" --licenses *> $null
           & "$env:ANDROID_HOME\cmdline-tools\latest\bin\sdkmanager.bat" "build-tools;36.0.0" "platforms;android-36" | Out-Null
-      - name: keep the signing key across builds
-        uses: actions/cache@v4
-        with:
-          path: ~\.remote-cli-signing
-          key: remote-cli-signing
+      - name: restore the signing key from the repository secrets
+        shell: pwsh
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_PASSWORD }}
+        run: |
+          if (-not $env:KEYSTORE_B64 -or -not $env:KEYSTORE_PASSWORD) {
+            Write-Error "ANDROID_SIGNING_KEYSTORE_B64 / ANDROID_SIGNING_PASSWORD are not set; refusing to sign with a throwaway key that would silently break in-app updates"
+            exit 1
+          }
+          New-Item -ItemType Directory -Force ~\.remote-cli-signing | Out-Null
+          [IO.File]::WriteAllBytes("$HOME\.remote-cli-signing\signing.p12", [Convert]::FromBase64String($env:KEYSTORE_B64))
+          [IO.File]::WriteAllText("$HOME\.remote-cli-signing\signing-password.txt", $env:KEYSTORE_PASSWORD)
       - name: build the APK
         run: powershell -ExecutionPolicy Bypass -File android\build.ps1
       - uses: actions/upload-artifact@v4

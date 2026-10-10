@@ -3,4 +3,12 @@ Description=remote-cli online watchdog (journal-warns when the agent is offline)
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 %h/remote-cli-review/tools/online_watchdog.py
+# Fork-local deployment tool; the upstream install.sh does not install it. Copy the
+# script to ~/.local/share/remote-cli-agent/tools/ and enable the timer as a USER unit
+# (never as a system unit: %h would resolve to /root):
+#   systemctl --user enable --now remote-cli-watchdog.timer
+ExecStart=/usr/bin/python3 %h/.local/share/remote-cli-agent/tools/online_watchdog.py --url http://127.0.0.1:8722 --password-file %h/.local/state/remote-cli-agent/password.txt
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes

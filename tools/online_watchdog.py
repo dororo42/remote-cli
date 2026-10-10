@@ -2,7 +2,7 @@
 nonzero otherwise, so a systemd timer (or OnFailure) can turn it into an alert.
 
     python3 online_watchdog.py --url http://127.0.0.1:8722 \
-        --password-file ~/.local/state/remote-cli/relay/password.txt
+        --password-file ~/.local/state/remote-cli-agent/password.txt
 """
 import argparse
 import json
@@ -15,8 +15,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="remote-cli online watchdog")
     ap.add_argument("--url", default="http://127.0.0.1:8722")
     ap.add_argument("--password-file",
-                    default=os.path.expanduser("~/.local/state/remote-cli/relay/password.txt"))
+                    default=os.path.expanduser("~/.local/state/remote-cli-agent/password.txt"))
     args = ap.parse_args()
+    args.url = args.url.rstrip("/")   # a trailing slash would double it into //api/login
 
     try:
         with open(args.password_file, encoding="utf-8") as stream:
@@ -46,7 +47,11 @@ def main() -> int:
         print(f"watchdog: login failed (HTTP {status}) — password changed or relay broken",
               file=sys.stderr)
         return 1
-    token = json.loads(body).get("token", "")
+    try:
+        token = json.loads(body).get("token", "")
+    except ValueError:
+        print("watchdog: relay login answered non-JSON", file=sys.stderr)
+        return 1
 
     req = urllib.request.Request(args.url + "/api/terminal",
                                  headers={"Authorization": "Bearer " + token})
