@@ -23,7 +23,11 @@ namespace RemoteCli {
 /// terminal agent. Everything it starts ends when it exits.
 public sealed class App : Form {
     const string Version = "1.0.2";
-    const string TunnelDownload = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe";
+    // cloudflared pinned to one release, checked against the sha256 Cloudflare publishes
+    // for the artifact (the digest field of the release API, cross-checked 2026-10-12).
+    const string TunnelDownload = "https://github.com/cloudflare/cloudflared/releases/download/2026.10.0/cloudflared-windows-amd64.exe";
+    const long TunnelBytes = 55365048;
+    const string TunnelSha256 = "86aee4017b26625cee8484c113558f48effa4cd47f7aa05fcf425604e5d2b23c";
     readonly string appDir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\');
     readonly string dataDir = TerminalAgent.DefaultData;
     readonly JavaScriptSerializer json = new JavaScriptSerializer();
@@ -249,23 +253,40 @@ public sealed class App : Form {
     void Reconnect() { Task.Run(() => Connect()); }
 
     async void DownloadTunnel(object sender, EventArgs e) {
+        if (Held()) return;
         if (File.Exists(TunnelFile)) { Reconnect(); return; }
         if (!Confirm("下载隧道程序？", "从 Cloudflare 的 GitHub 发布页下载 cloudflared（约 60 MB），用来建立临时公网地址，不需要账号。", "下载", false)) return;
         var button = (Button)sender;
         button.Enabled = false;
         try {
-            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
-            using (var client = new WebClient()) {
-                client.DownloadProgressChanged += (s, p) => Say("正在下载隧道程序 " + p.ProgressPercentage + "%");
-                await client.DownloadFileTaskAsync(new Uri(TunnelDownload), TunnelFile + ".part");
-            }
-            if (new FileInfo(TunnelFile + ".part").Length < 10 * 1024 * 1024) throw new IOException("下载的文件不完整");
-            File.Move(TunnelFile + ".part", TunnelFile);
+            await FetchTunnel(percent => Say("正在下载隧道程序 " + percent + "%"));
             Reconnect();
         } catch (Exception error) {
-            try { File.Delete(TunnelFile + ".part"); } catch { }
             Say("下载失败：" + error.Message + "。也可以自己下载 cloudflared-windows-amd64.exe，改名为 cloudflared.exe 放到 " + dataDir, true);
         } finally { button.Enabled = true; }
+    }
+    // cloudflared, from Cloudflare's release page, into the data folder. Throws when it could not be had whole.
+    async Task FetchTunnel(Action<int> progress) {
+        try {
+            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            using (var client = new WebClient()) {
+                client.DownloadProgressChanged += (s, p) => progress(p.ProgressPercentage);
+                await client.DownloadFileTaskAsync(new Uri(TunnelDownload), TunnelFile + ".part");
+            }
+            var part = new FileInfo(TunnelFile + ".part");
+            if (part.Length != TunnelBytes) throw new IOException("cloudflared 大小不符，已阻止安装未经验证的程序。");
+            string hex;
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            using (var stream = part.OpenRead()) {
+                hex = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "");
+            }
+            if (!string.Equals(hex, TunnelSha256, StringComparison.OrdinalIgnoreCase))
+                throw new IOException("cloudflared 校验不符，已阻止安装未经验证的程序。请检查网络环境后重试。");
+            File.Move(TunnelFile + ".part", TunnelFile);
+        } catch (Exception) {
+            try { File.Delete(TunnelFile + ".part"); } catch { }
+            throw;
+        }
     }
 
     // ---------- window

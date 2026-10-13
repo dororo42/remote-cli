@@ -2,7 +2,7 @@
 # remote-cli on Linux in one command: the relay and the agent of this computer as services
 # of your own user, a public address, and the code for the phone to scan.
 #
-#   curl -fsSL https://raw.githubusercontent.com/KangWang42/remote-cli/main/agent-linux/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/KangWang42/remote-ai/main/agent-linux/install.sh | bash
 #   curl -fsSL .../install.sh | bash -s -- --dir ~/projects/demo --name my-server
 #
 #   install.sh [--dir PATH[=NAME]]... [--name NAME] [--port N] [--tunnel | --url URL | --lan]
@@ -25,8 +25,16 @@
 # and nothing needs root. Running it again keeps the password, the projects and the settings.
 set -euo pipefail
 
-source_url="https://codeload.github.com/KangWang42/remote-cli/tar.gz/refs/heads/main"
-tunnel_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-"
+# The repository under the name it is to have and the one it had (it is renamed with the product): the first that answers.
+sources=("https://codeload.github.com/KangWang42/remote-ai/tar.gz/refs/heads/main" "https://codeload.github.com/KangWang42/remote-cli/tar.gz/refs/heads/main")
+# cloudflared pinned to one release, checked against the sha256 Cloudflare publishes for
+# each artifact (the digest field of the release API, cross-checked 2026-10-12).
+cf_version="2026.10.0"
+tunnel_url="https://github.com/cloudflare/cloudflared/releases/download/${cf_version}/cloudflared-linux-"
+cf_sha256_amd64="d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db"
+cf_sha256_arm64="e6422b9d4f72d3194bc5a38676f13667c06666523217b842a877d72a80b5ac08"
+cf_sha256_arm="1dbe8e4ec17e74bb7f49cf91db6a4903bd0f9fe41984556c7503e40b765fd099"
+cf_sha256_386="f6fbd789e6ce9c824d4d560cbbfad2753d55ce398ece16b4c9fbf17271dceab3"
 share="$HOME/.local/share/remote-cli-agent"
 state="$HOME/.local/state/remote-cli-agent"
 relay_state="$HOME/.local/state/remote-cli-relay"
@@ -67,7 +75,11 @@ find_source() {
     command -v tar >/dev/null || fail "需要 tar 来解开下载的程序。"
     fetched="$(mktemp -d)"
     say "正在下载 remote-cli…"
-    download "$source_url" "$fetched/source.tar.gz" || fail "下载程序失败：$source_url"
+    got=""
+    for source_url in "${sources[@]}"; do
+        if download "$source_url" "$fetched/source.tar.gz" 2>/dev/null; then got=1; break; fi
+    done
+    [ -n "$got" ] || fail "下载程序失败：${sources[*]}"
     tar -xzf "$fetched/source.tar.gz" -C "$fetched" --strip-components=1
     repo="$fetched"
 }
@@ -171,7 +183,7 @@ uninstall() {
 # kept in the program folder.
 tunnel_program() {
     if command -v cloudflared >/dev/null; then command -v cloudflared; return; fi
-    local file="$share/bin/cloudflared" kind
+    local file="$share/bin/cloudflared" kind sum
     if [ ! -x "$file" ]; then
         case "$(uname -m)" in
             x86_64|amd64) kind="amd64" ;;
@@ -184,6 +196,14 @@ tunnel_program() {
         mkdir -p "$share/bin"
         download "$tunnel_url$kind" "$file.part" \
             || fail "下载 cloudflared 失败（需要能访问 GitHub）。可以改用 --lan，或有域名时用 --url。"
+        case "$kind" in
+            amd64) sum="$cf_sha256_amd64" ;;
+            arm64) sum="$cf_sha256_arm64" ;;
+            arm) sum="$cf_sha256_arm" ;;
+            386) sum="$cf_sha256_386" ;;
+        esac
+        echo "$sum  $file.part" | sha256sum -c - >/dev/null 2>&1 \
+            || { rm -f "$file.part"; fail "cloudflared 校验不符，已阻止安装未经验证的程序。请检查网络环境后重试。"; }
         chmod 755 "$file.part"
         "$file.part" --version >/dev/null 2>&1 || { rm -f "$file.part"; fail "下载到的 cloudflared 不能运行。"; }
         mv "$file.part" "$file"
