@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -218,6 +219,14 @@ class Pure(unittest.TestCase):
                          ["/b/claude", "--resume", "--permission-mode", "acceptEdits"])
         self.assertEqual(agent.tool_argv("codex", "/b/codex", sid, False, "", False), ["/b/codex", "resume", sid])
         self.assertEqual(agent.tool_argv("codex", "/b/codex", "", False, "read", False), ["/b/codex", "-s", "read-only"])
+        self.assertEqual(agent.tool_argv("opencode", "/b/opencode", "ses_abc123", False, "", False),
+                         ["/b/opencode", "--session", "ses_abc123"])
+        self.assertEqual(agent.tool_argv("opencode", "/b/opencode", "", True, "edit", False),
+                         ["/b/opencode", "--continue", "--auto"])
+        self.assertEqual(agent.tool_argv("opencode", "/b/opencode", "", False, "read", False), ["/b/opencode"])
+        self.assertTrue(agent.session_id_ok("opencode", "ses_ebd8614d0ffe4Z18FfuXFMXIFJ"))
+        self.assertFalse(agent.session_id_ok("opencode", sid))
+        self.assertTrue(agent.session_id_ok("claude", sid))
 
     def test_sessions(self):
         home = tempfile.mkdtemp()
@@ -299,6 +308,50 @@ class Pure(unittest.TestCase):
         for wrong in ((named, "codex", "项目"), (empty, "claude", "项目"), ("not-an-id", "claude", "项目"), (named, "claude", "别的")):
             with self.assertRaises(agent.OpError):
                 sessions.read(*wrong, dirs)
+
+    def test_opencode_sessions(self):
+        home = tempfile.mkdtemp()
+        project = tempfile.mkdtemp() + "/项目"
+        os.makedirs(project)
+        data = tempfile.mkdtemp()                      # stands in for XDG_DATA_HOME
+        os.makedirs(os.path.join(data, "opencode"))
+        named, plain, archived = ("ses_%s" % uuid.uuid4().hex for _ in range(3))
+        con = sqlite3.connect(os.path.join(data, "opencode", "opencode.db"))
+        con.execute("create table project (id text, worktree text)")
+        con.execute("create table session_v2 (id text, project_id text, directory text, title text, "
+                    "time_updated integer, time_archived text)")
+        con.execute("create table session_message (id text, session_id text, type text, seq integer, data text)")
+        con.execute("insert into project values ('p1', ?)", (project,))
+        con.execute("insert into session_v2 values (?, 'p1', ?, '修登录', 1792107587487, null)", (named, project))
+        con.execute("insert into session_v2 values (?, 'p1', ?, '', 1792100000000, null)", (plain, project))
+        con.execute("insert into session_v2 values (?, 'p1', ?, '归档的', 1792100000000, 'x')", (archived, project))
+        con.executemany("insert into session_message values (?, ?, ?, ?, ?)", [
+            ("m1", named, "user", 1, json.dumps({"time": {"created": 1}, "text": "登录报错"})),
+            ("m2", named, "assistant", 2, json.dumps({"time": {"created": 2}, "content": [
+                {"type": "reasoning", "text": "先想"}, {"type": "text", "text": "看一下登录代码"}]})),
+        ])
+        con.commit()
+        con.close()
+        sessions = agent.Sessions()
+        sessions.home = home
+        before = os.environ.get("XDG_DATA_HOME")
+        os.environ["XDG_DATA_HOME"] = data
+        try:
+            found = {s["id"]: s for s in sessions.scan({"项目": project, "别的": "/no/such"}, [])}
+            got = sessions.read(named, "opencode", "项目", {"项目": project})
+        finally:
+            if before is None:
+                os.environ.pop("XDG_DATA_HOME", None)
+            else:
+                os.environ["XDG_DATA_HOME"] = before
+        self.assertEqual(set(found), {named, plain})       # the archived one is out
+        self.assertEqual((found[named]["title"], found[named]["tool"], found[named]["dir"], found[named]["live"]),
+                         ("修登录", "opencode", "项目", False))
+        self.assertTrue(found[plain]["title"].startswith("Opencode 对话 "))
+        self.assertEqual(got["title"], "修登录")
+        self.assertEqual([(m["role"], m["text"]) for m in got["messages"]],
+                         [("user", "登录报错"), ("assistant", "看一下登录代码")])
+        self.assertEqual(got["updated"], 2)
 
     def test_qr_code(self):
         text = "remotecli://connect?u=https%3A%2F%2Fa-b-c-d.trycloudflare.com&p=3AasQ_tDwOpmumz1aqxb6znL&n=ubuntu"
@@ -526,7 +579,8 @@ class EndToEnd(unittest.TestCase):
 
         # 8. a tool installed for this user is offered and started; a new Claude Code
         # conversation is named by the agent, so the terminal knows it at once
-        self.assertEqual(device["tools"], ["claude", "shell"])
+        self.assertIn("claude", device["tools"])       # the stand-in; what else is here is the machine's own
+        self.assertIn("shell", device["tools"])
         new = self.op({"action": "start", "tool": "claude", "dir": "项目"})["terminal"]
         shown = self.read_until(new, "STANDIN_CLAUDE[")
         named = re.search(r"STANDIN_CLAUDE\[--session-id ([0-9a-f-]{36})\]", shown)

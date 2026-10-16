@@ -3,8 +3,8 @@
   'use strict';
   const $ = id => document.getElementById(id);
   // The plain terminal is called what the computer calls it: PowerShell on Windows, the person's shell elsewhere.
-  const TOOLS = { claude: 'Claude Code', codex: 'Codex', shell: '终端' };
-  const ABOUT = { claude: 'Anthropic', codex: 'OpenAI', shell: '命令行' };
+  const TOOLS = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', shell: '终端' };
+  const ABOUT = { claude: 'Anthropic', codex: 'OpenAI', opencode: 'SST', shell: '命令行' };
   const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
   const native = window.RemoteCliNative || null;
   // The look belongs to the app, not to one computer: inside the app it is kept there, so every computer's pages
@@ -28,6 +28,7 @@
     chev: svg('<path d="M9 6l6 6-6 6"/>', 18), stop: svg('<rect x="7" y="7" width="10" height="10" rx="2"/>', 20), plus: svg('<path d="M12 5v14M5 12h14"/>', 20),
     folder: svg('<path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2.2h7a2 2 0 0 1 2 2v7.8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>'),
     claude: svg('<path d="M12 3.5v17M3.5 12h17M6 6l12 12M18 6L6 18"/>'), codex: svg('<path d="M12 3l7.8 4.5v9L12 21l-7.8-4.5v-9z"/><path d="M9 10l-2 2 2 2M15 10l2 2-2 2"/>'),
+    opencode: svg('<circle cx="12" cy="12" r="8.5"/><path d="M12 8.5v7M8.5 12h7"/>'),
     shell: svg('<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M7.5 10l3 2.2-3 2.2M12.5 15h4"/>'), mark: svg('<path d="M7 8l5 4-5 4M13.5 16.5h4.5"/>', 30)
   };
   function el(tag, props, ...children) {
@@ -442,7 +443,7 @@
       launch.dataset.signature = tools.join() + ready;
       launch.replaceChildren(...tools.map(tool => el('button', { type: 'button', disabled: !ready, onclick: () => start(tool, project) },
         el('span', { className: 'tool ' + tool, html: ICON[tool] }), el('span', null, '新建 ' + TOOLS[tool], el('small', { textContent: ABOUT[tool] })))));
-      if (ready && !tools.length) launch.append(el('p', { textContent: '电脑上没有找到 claude、codex 或命令行终端。' }));
+      if (ready && !tools.length) launch.append(el('p', { textContent: '电脑上没有找到 claude、codex、opencode 或命令行终端。' }));
     }
     const own = mine.filter(t => t.dir === project).sort((a, b) => a.rank - b.rank || b.at - a.at);
     $('p-active').hidden = !own.length;

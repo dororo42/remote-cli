@@ -33,7 +33,7 @@ The code shown on the computer is `remotecli://connect?u=<address>&p=<password>&
 `GET /api/terminal` →
 
 ```json
-{"device": {"online": true, "enabled": true, "workspaces": ["demo"], "tools": ["claude", "codex", "shell"],
+{"device": {"online": true, "enabled": true, "workspaces": ["demo"], "tools": ["claude", "codex", "opencode", "shell"],
             "projects": [{"name": "demo", "path": "D:\\demo", "fixed": true, "exists": true}],
             "candidates": [{"name": "notes", "path": "D:\\notes", "updated": 1700000000000, "tools": ["claude"]}]},
  "terminals": [{"id": "...", "tool": "shell", "dir": "demo", "title": "PowerShell", "state": "running", "status": "idle", "seq": 12, "cols": 80, "rows": 24, "session": ""}],
@@ -43,6 +43,9 @@ The code shown on the computer is `remotecli://connect?u=<address>&p=<password>&
 `workspaces` are the project names a terminal may be started in. `sessions` are conversations the tools saved on
 the computer; `live` means a program on the computer has it open, `terminal` is set when one of the relay's
 terminals already shows it. `state` is `starting`, `running` or `closed`; `status` is `busy`, `idle` or empty.
+A conversation `id` has the shape of the tool that owns it — a UUID for `claude` and `codex`, `ses_…` for
+`opencode` — and the computer refuses an id that is not that tool's own. Which tools a computer has is what it
+reports in `device.tools`; the Rust agent (agent-rust) is the deployment without Python and runs `shell` only.
 
 Agents may advertise `info.features`: `codex-fork`, `codex-takeover`, `terminal-exit`, `files`, `update` and `peek`. These are forwarded
 under `device.features`. Sessions may include `can_takeover`, `ownership_known`, and `takeover_reason`.
@@ -118,7 +121,7 @@ to held requests. Switching to the background cancels the active reader; returni
 
 | `action` | Fields |
 | --- | --- |
-| `start` | `tool` (`claude`, `codex`, `shell`), `dir` (a workspace name); optional `session` (continue that conversation), `takeover` (end the owning computer CLI first), `fork` (Codex only: new conversation with the source history), `history` (let the tool show its own list) |
+| `start` | `tool` (`claude`, `codex`, `opencode`, `shell`), `dir` (a workspace name); optional `session` (continue that conversation), `takeover` (end the owning computer CLI first), `fork` (Codex only: new conversation with the source history), `history` (let the tool show its own list) |
 | `input` | `terminal`, `data` (at most 16,000 characters) |
 | `resize` | `terminal`, `cols` (20–240), `rows` (6–100) |
 | `rename` | `terminal`, `title` |
