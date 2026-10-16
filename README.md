@@ -1,5 +1,7 @@
 <h1 align="center">Remote CLI</h1>
 
+> **本仓库是开发用 fork，不是发布仓库。** 它是 [Remote AI](https://github.com/KangWang42/remote-ai)（原名 remote-cli）的试验分支：Linux 电脑端的改动先在这里开发和测试，再经 PR 合入上游。**部署请使用上游仓库**——本 fork 的安装与更新通道都指向上游 main，本 fork 的任何本地差异都会在下次更新时被上游代码替换。上游没有、本 fork 额外提供的只有 `tools/` 下的在线看门狗和 `.github/workflows/windows.yml`。
+
 <p align="center">
   <b>在手机上使用电脑里的终端、Claude Code 和 Codex。</b><br>
   电脑装一个程序，手机装一个 App，扫码连上。

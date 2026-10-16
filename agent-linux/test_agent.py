@@ -370,9 +370,10 @@ class EndToEnd(unittest.TestCase):
             stream.write(json.dumps({"type": "ai-title", "aiTitle": "上次的对话", "sessionId": cls.saved}) + "\n")
         with open(os.path.join(cls.project, "说明.txt"), "w", encoding="utf-8") as stream:
             stream.write("文件内容 e2e\n")
+        cls.agent_log = open(os.path.join(cls.tmp, "agent.log"), "wb")
         cls.agent = subprocess.Popen(cls.agent_command(agent_data),
                                      env={**os.environ, "RCLI_PASSWORD": PASSWORD, "HOME": cls.home},
-                                     stdout=subprocess.DEVNULL, stderr=open(os.path.join(cls.tmp, "agent.log"), "wb"))
+                                     stdout=subprocess.DEVNULL, stderr=cls.agent_log)
         cls.token = request("POST", cls.base + "/api/login", {"password": PASSWORD})[1]["token"]
         view = None
         deadline = time.time() + 30
@@ -410,6 +411,7 @@ class EndToEnd(unittest.TestCase):
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 process.kill()
+        cls.agent_log.close()
         with open(os.path.join(cls.tmp, "agent.log"), encoding="utf-8", errors="replace") as stream:
             refused = [line for line in stream if "失败" in line or "拒绝" in line]
         if refused:                     # what the agent itself said, when a step went wrong
@@ -684,6 +686,7 @@ class EnvILocaleFallback(unittest.TestCase):
             if agent is not None:
                 agent.terminate()
             relay.terminate()
+            relay_log.close()
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
 
