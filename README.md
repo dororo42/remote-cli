@@ -2,6 +2,8 @@
 
 # Remote AI
 
+> **本仓库是开发用 fork，不是发布仓库。** 它是 [Remote AI](https://github.com/KangWang42/remote-ai)（原名 remote-cli）的开发分支：改动先在分支上开发和测试，再经 PR 合入上游；`main` 跟随上游 `main`。部署请使用上游仓库。
+
 **在手机上接着用电脑里的 Claude Code、Codex 和终端**
 
 电脑上问一句，手机上接着问一句，对话仍在原来的应用里。<br>
