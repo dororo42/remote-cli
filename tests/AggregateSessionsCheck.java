@@ -14,6 +14,14 @@ public final class AggregateSessionsCheck {
     }
     private static void require(boolean ok, String reason) { if (!ok) throw new AssertionError(reason); }
     public static void main(String[] args) {
+        for (String name : new String[]{"opencode", "qoder", "cline"}) {
+            AggregateSessions.Entry entry = new AggregateSessions.Entry(false, "session", "project", "", name, "", "", "", false, "", "", "", false, 1L);
+            String label = "opencode".equals(name) ? "OpenCode" : "qoder".equals(name) ? "Qoder" : "Cline";
+            require(label.equals(entry.toolName()) && label.equals(entry.shownTitle()), "Linux tools retain their names on native cards");
+            java.util.List<AggregateSessions.Thing> things = java.util.Arrays.asList(new AggregateSessions.Thing("pc", "Computer", entry, "history"));
+            require(AggregateSessions.board(things, "", "", "").tools.contains(name), "Linux tools can be selected in native filters");
+            require(AggregateSessions.board(things, label, "", "").found.size() == 1, "Search matches the tool's visible name");
+        }
         List<AggregateSessions.Project> groups = AggregateSessions.projects(Arrays.asList("同名项目", "空项目", "同名项目"), Arrays.asList(
             saved("同名项目", "cli", "cli", true, ""),
             terminal("同名项目", "confirm", "running", "phone-session"),
@@ -47,6 +55,11 @@ public final class AggregateSessionsCheck {
             terminal("终端独有项目", "busy", "starting", ""), terminal("同名项目", "idle", "closed", "")));
         require(AggregateSessions.signature(groups).equals(AggregateSessions.signature(copied)), "Unchanged display must retain its views during refresh");
         require(AggregateSessions.terminalPath(TERMINAL).equals("/terminal/?id=" + TERMINAL), "Terminal link must identify the exact terminal");
+        // a terminal that runs a conversation (form "chat") opens the conversation's page, and is a conversation in the lists
+        require(AggregateSessions.terminalPath(TERMINAL, true).equals("/chat/?id=" + TERMINAL), "A conversation opens its own page");
+        AggregateSessions.Entry talk = new AggregateSessions.Entry(true, TERMINAL, "thesis", "核对回归表", "claude", "running", "busy", "busy", false, "", "", "");
+        talk.chat = true;
+        require("app".equals(talk.source()) && "手机对话 · thesis".equals(AggregateSessions.where(talk)), AggregateSessions.where(talk));
         boolean refused = false;
         try { AggregateSessions.terminalPath("../?p=secret"); } catch (IllegalArgumentException expected) { refused = true; }
         require(refused, "Terminal route must reject malformed identifiers");

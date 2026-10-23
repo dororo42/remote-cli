@@ -72,7 +72,7 @@ The code shown on the computer is `remotecli://connect?u=<address>&p=<password>&
 `GET /api/terminal` →
 
 ```json
-{"device": {"online": true, "enabled": true, "workspaces": ["demo"], "tools": ["claude", "codex", "shell"],
+{"device": {"online": true, "enabled": true, "workspaces": ["demo"], "tools": ["claude", "codex", "opencode", "qoder", "cline", "shell"],
             "projects": [{"name": "demo", "path": "D:\\demo", "fixed": true, "exists": true, "tools": ["codex"], "kinds": ["Codex 桌面版", "终端"]}],
             "candidates": [{"name": "notes", "path": "D:\\notes", "updated": 1700000000000, "live": false, "tools": ["claude"], "kinds": ["Claude 桌面版", "终端"]}]},
  "terminals": [{"id": "...", "tool": "shell", "dir": "demo", "title": "PowerShell", "state": "running", "status": "idle", "seq": 12, "cols": 80, "rows": 24, "session": ""}],
@@ -214,7 +214,7 @@ One answer carries at most about 180,000 characters; `after < terminal.seq` mean
 twice. `state` is `queued` until the computer has done it, then `done` or `error`.
 
 On an upgraded viewer connection, send the same operation object as a text message (`input`, `resize`,
-`rename` and `close` only, for the connection's terminal). The relay replies with
+`rename`, `close`, and for a chat `say`, `stop` and `answer`, for the connection's terminal). The relay replies with
 `{"t": "ack", "status": 200, "id": "...", "terminal": "...", "state": "queued", "error": ""}`.
 Validation errors return an acknowledgment with status 400; storage failures return 500. A queued
 acknowledgment means accepted by the relay, not yet executed by the computer. Inputs can be sent in
@@ -229,16 +229,22 @@ to held requests. Switching to the background cancels the active reader; returni
 
 | `action` | Fields |
 | --- | --- |
-| `start` | `tool` (`claude`, `codex`, `shell`), `dir` (a workspace name); optional `session` (continue that conversation), `takeover` (end the owning computer CLI first), `fork` (Codex only: new conversation with the source history), `history` (let the tool show its own list) |
+| `start` | `tool` (`claude`, `codex`, `opencode`, `qoder`, `cline`, `shell`), `dir` (a workspace name); optional `session` (continue that conversation), `takeover` (end the owning computer CLI first), `fork` (Codex only: new conversation with the source history), `history` (let the tool show its own list), `form: "chat"` (a conversation run through its tool's structured mode, see "Chats"; `claude` and `codex` only, needs the `chat` capability, not with `history` or `fork`) with optional `text` (the first thing to say, at most 8,000 characters) |
 | `input` | `terminal`, `data` (at most 16,000 characters) |
 | `say` | `terminal`, `text` (at most 8,000 characters, no control characters but line breaks and tabs). A message for a running terminal from where the terminal is not on the screen (a list, the app's workbench): what the box of the terminal's page sends, the text and then Enter. The relay knows from the program's output whether it takes pasted text in brackets (`ESC [ ? 2004 h`): it then gives the computer `input` with the text between `ESC [ 200 ~` and `ESC [ 201 ~` and `\r`, and otherwise the text on one line and `\r`. Refused while the terminal's phase is `confirm`: Enter would answer its question |
-| `resize` | `terminal`, `cols` (20–240), `rows` (6–100) |
+| `resize` | `terminal`, `cols` (20–240), `rows` (6–100). Not for a chat |
+| `stop` | `terminal` of a chat: stop what it is at now (see "Chats"). Refused while its phase is not `busy` or `confirm` |
+| `answer` | `terminal` of a chat, `ask` (the id of what it asks), `decision`: `allow`, `always`, `deny`, or `choice:<n>` for a question with choices |
 | `rename` | `terminal`, `title` |
 | `close` | `terminal` |
 | `project_add` | `path`, optional `name`, `create` |
 | `project_rename` | `name`, `to` |
 | `project_remove` | `name`. The folder and what is in it stay. A project that stands in the computer's own settings (`fixed`) is renamed or removed from the phone only where the computer says it does that (the `projects` capability: the Windows program, for the projects added in its window); else the relay refuses |
 | `update` | none. The program on the computer looks for a newer release of itself and installs it; needs the `update` capability |
+
+Linux Python agents also offer OpenCode, Qoder and Cline when installed; Windows continues to offer Claude Code, Codex and shell. Conversation IDs are validated by tool: UUID for Claude Code/Codex/Qoder, `ses_` plus 10–40 alphanumeric characters for OpenCode, and 10–16 digits plus `_` and 4–10 alphanumeric characters for Cline. The same shapes apply to conversation reads and marks, terminal resumes and agent reports. The relay resolves the tool and workspace from its reported session list, not from client-supplied values.
+
+Linux `RemoteMaxMode=read` starts Qoder with `--permission-mode plan` and Cline with `--plan`; Qoder `edit` uses `--permission-mode accept_edits`. OpenCode uses its own default permissions for `read` and `--auto` for `edit`; it does not provide a separate read-only flag. These modes remain the tools' own interactive permission modes. Qoder startup parameters follow its [CLI reference](https://docs.qoder.com/cli/cli-reference) and [Plan mode](https://docs.qoder.com/cli/plan-mode) documentation.
 
 ### Files
 
@@ -252,6 +258,32 @@ to the project folder, with `/`.
 
 A refusal is `400 {"error": "..."}`. The computer answers only for paths inside the project folder and refuses a
 path whose real location, after links and junctions, is outside it. The relay keeps nothing of an answer.
+
+Uploads use the same authenticated endpoint and require both `files` and `file-upload` capabilities (currently
+Windows). Every request has a fresh operation `id`, the fixed workspace `dir`, destination `path` including the
+filename, and a client-generated 32-character lowercase hex `upload` ID. Only these operations are accepted:
+
+- `file_upload_start` adds integer `size` (0 through 314,572,800 bytes), returning `{"offset": 0}`.
+- `file_upload_chunk` adds integer `offset` and base64 `data` (1 through 737,280 decoded bytes). The offset must
+  equal the bytes already written; the reply's `offset` is the new byte count. Chunks cannot exceed the declared size.
+- `file_upload_finish` publishes the complete file, returning `{"offset": <size>}`. It refuses incomplete files.
+- `file_upload_cancel` removes this upload's temporary file. Cancelling an unknown ID is harmless.
+
+The Windows agent owns at most four uploads per instance. Each holds its destination directory and ancestors
+against rename, rejects reparse-point subdirectories, absolute/traversal paths, alternate streams and reserved
+Windows names. It writes a temporary file in the destination directory and atomically renames it after flushing.
+Existing files and folders are never replaced, including a name created while uploading. Cancellation and sessions
+idle for ten minutes remove temporary files; forcibly terminating the computer process can leave hidden
+`.remoteai-upload-*.tmp` files that may be removed when no upload is active. Uploads are not resumable after restart.
+The relay validates size, offset and base64 bounds and forwards only operation-specific fields; it does not persist
+file contents. An older relay or agent refuses upload operations without affecting file reads.
+
+Android implements `WebChromeClient.onShowFileChooser` with `ACTION_OPEN_DOCUMENT`, `CATEGORY_OPENABLE`, local
+files and optional multiple selection. Only granted `content:` URIs from external providers are returned to the
+requesting WebView; cancellation, replacement of the page or Activity destruction clears the callback. No broad
+storage permission is requested. See the [Android file chooser API](https://developer.android.com/reference/android/webkit/WebChromeClient#onShowFileChooser(android.webkit.WebView,%20android.webkit.ValueCallback%3Candroid.net.Uri[]%3E,%20android.webkit.WebChromeClient.FileChooserParams)).
+Downloads continue using `file_read` and the native Saver bridge, with size, offset and modification-time checks
+across chunks. The browser fallback uses an ordinary download; the Android app saves through its existing Saver.
 
 ### A conversation that is open on the computer
 
@@ -273,6 +305,13 @@ out. The tool and the folder asked of the computer are the ones it reported for 
 With `"action": "say"` or `"action": "answer"` the same request acts on a conversation that has that way in its
 `reach` (the computer needs the `reach` capability). Neither takes the conversation from the program that has it:
 it stays open on the computer and is used there as before.
+
+The Windows agent sets both tools' `SessionEnd` command hooks to `3` seconds, within
+[Codex's supported limit](https://learn.chatgpt.com/docs/hooks) and
+[Claude Code's shutdown budget](https://code.claude.com/docs/en/hooks#sessionend).
+Hooks that only report state use `10` seconds; only `PermissionRequest` and `Stop` retain `2000` seconds for
+phone interaction. Checking the installed hooks replaces Remote AI's previous timeouts, preserving other
+hooks and the configuration backup. Codex may require reviewing the changed definitions in `/hooks` again.
 
 - `messages[].role` is `user`, `assistant`, `tool` (one step of the tool's: for Claude Code its name and what it is
   for, or else its command or file; for Codex the command that ran, or the files read or changed, as Codex notes
@@ -485,6 +524,61 @@ conversation", below). The Linux agent knows the first way only.
 
 The computer keeps the questions and rules in `schedules.json` and `chains.json` of its data folder; the Windows
 program encrypts their words for the Windows account.
+
+## Chats
+
+A chat is a terminal whose program is not drawn on a screen: the computer runs Claude Code or Codex through the
+tool's own structured mode, and the terminal's output is the conversation's events, one JSON object a line. It is
+what the phone shows as a conversation (`web/chat/`; the terminal page hands such a terminal over to it), begun by
+`start` with `form: "chat"`. Everything a terminal has applies: numbered output, `after`, `reset`, several readers,
+the list, `close`, `rename`, keeping it across an update of the computer's program. The computer offers it with the
+capability `chat` (Windows program 1.7.0, Linux agent 0.7.0; the Rust agent does not).
+
+| Tool | Run as | Said | Stopped | Asks |
+| --- | --- | --- | --- | --- |
+| Claude Code | `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --replay-user-messages --permission-prompt-tool stdio --session-id <new id>` (or `--resume <id>`), with `--permission-mode plan` or `acceptEdits` for the computer's `read` and `edit` | a `user` message on its standard input; one sent while it works is taken when it gets to it | the control request `interrupt` | a `can_use_tool` control request, answered `allow` (with the input), `allow` with one validated and displayed `updatedPermissions` suggestion for `always`, or `deny` |
+| Codex | `codex app-server`; `thread/start` with the project folder (`sandbox` for `read` and `edit`) or `thread/resume` | `turn/start`, or `turn/steer` while a turn runs | `turn/interrupt` of the running turn | `item/commandExecution/requestApproval` and `item/fileChange/requestApproval`, answered `accept`, `acceptForSession`, `decline`; `item/tool/requestUserInput` with one question and its choices |
+
+Run on Claude Code 2.1.283 and Codex 0.163.0. The conversation is the tool's own and saved where its other
+windows find it: it is listed with the others, and can be gone on with in a terminal or a desktop app once the chat
+is closed. While a chat has it, the computer lists it as held by the phone's own program. Requests of the tools that
+this protocol does not answer are refused, so that the tool does not wait.
+
+Claude permission suggestions are validated by the computer before offering `always`, both for chats
+(Windows and Python Linux) and Windows `PermissionRequest` hooks. Only a complete `addRules` / `allow`
+suggestion for `localSettings` is accepted; chats also accept `session`. Changes to user/shared settings,
+permission modes, directories and replacement rules are not offered. Each suggestion contains 1–4 rules
+and its complete scope must fit within 600 characters. For `Bash` and `PowerShell`, a nonempty command
+is required: either no `*`, or one trailing ` *` / `:*`. Embedded stars, including quoted file globs
+and regex stars, multiple stars and multiline commands cannot be saved from the phone. This deliberately
+also excludes some otherwise valid patterns such as `git log * main`. A rejected suggestion leaves
+single-use allow and deny available; a forged `always` answer is rejected. If several suggestions arrive,
+only the first eligible one is displayed and returned unchanged, never the entire suggestion list.
+The program does not rewrite or broaden rejected rules, edit existing permission lists or suppress
+Claude's startup warnings. See Claude Code's [permission updates](https://code.claude.com/docs/en/hooks#permission-update-entries)
+and [wildcard matching](https://code.claude.com/docs/en/permissions#wildcard-patterns).
+
+The events (`t` names the kind; `at` is the computer's time in milliseconds):
+
+| `t` | Fields | Means |
+| --- | --- | --- |
+| `state` | `state`: `starting`, `busy`, `confirm`, `idle`, `ended`; `at` | how it stands; `busy` from what was said until the turn ends |
+| `session` | `session` | the conversation's id in its tool, once known |
+| `history` | `messages` (as `/api/conversation` gives them: `role`, `text`, `detail`, `result`), `more` | what was said before, where a saved conversation is gone on with; it comes before what follows |
+| `item` | `id`, `kind` (`user`, `text`, `thought`, `step`, `note`), `text`, `at`; a `user` item may have `op` (the phone's operation id it came of); a `step` has `name`, `detail` (the command, or the file), `state: "run"` | something said or done begins |
+| `more` | `id`, `text` | more of a text or thought, as it is written |
+| `set` | `id`, `text` | the whole text, once its tool says it; replaces what came in pieces |
+| `out` | `id`, `text` | more of what a step prints; at most 60,000 characters a step |
+| `done` | `id`, `ok`, optional `result` (its last lines, where nothing was printed as it ran) | a step ended |
+| `ask` | `id` (16 hex), `kind` (`tool`, `plan`, `command`, `edit`, `question`), `title`, `text`, `options` (`id`, `label`) | it asks before it goes on; answered by `answer` |
+| `answered` | `id`, `decision` (or `gone`: it no longer asks, after a stop or when it ended) | what it asked is settled |
+| `turn` | `end` (`done`, `stopped`, `failed`), optional `error`, `at` | a turn ended |
+| `note` | `text`, `at` | something said of the conversation (the computer's program was updated, the tool exited) |
+
+A reader that begins later is given what the relay keeps (as for a terminal): an event about an item whose `item`
+was before that is shown as a new one. The computer reports a chat in `terminals` with `form: "chat"`, `status`
+(`starting`, `busy`, `confirm`, `idle`), `said` (one line of what it said last) and `ask` (what it asks, or ""); the
+relay lists its phase from `status`, `said` from the computer and `asks` from `ask`, not from a screen.
 
 ## Computer
 

@@ -12,8 +12,19 @@ import java.util.Set;
 
 /** One computer's project inventory. Kept independent of Android views for regression checks. */
 final class AggregateSessions {
+    static String toolName(String tool) {
+        if ("claude".equals(tool)) return "Claude Code";
+        if ("codex".equals(tool)) return "Codex";
+        if ("opencode".equals(tool)) return "OpenCode";
+        if ("qoder".equals(tool)) return "Qoder";
+        if ("cline".equals(tool)) return "Cline";
+        return "终端";
+    }
+
     static final class Entry {
         final boolean terminal, live, done;
+        /** A terminal of the phone's that runs a conversation through its tool's structured mode (form "chat"): a conversation, shown as one. */
+        boolean chat;
         final long at;
         final String id, project, title, tool, state, phase, status, host, attached, session;
         String said = "";       // one line of what a running terminal last said; changes often and is left out of signatures
@@ -52,7 +63,7 @@ final class AggregateSessions {
          * app, an editor). One that no program has open is told by what started it; "" where the computer does not say.
          */
         String source() {
-            if (terminal) return "term";
+            if (terminal) return chat ? "app" : "term";
             // the computer says by what it is used (a command line inside an editor's terminal is a terminal's)
             if (!live || !kind.isEmpty()) return sourceOfKind(kind);
             return origin.contains("桌面版") || origin.contains("后台服务") || "shared".equals(host) || (!origin.isEmpty() && !"命令行".equals(origin) && !"电脑独立终端".equals(origin)) ? "app" : "term";
@@ -103,7 +114,7 @@ final class AggregateSessions {
         int rank() { return AggregateSessions.rank(kind(null)); }
         /** What the computer calls its plain terminal ("PowerShell", "bash"); empty from a computer that does not say. */
         String shell = "";
-        String toolName() { return "claude".equals(tool) ? "Claude Code" : "codex".equals(tool) ? "Codex" : shell.isEmpty() ? "PowerShell" : shell; }
+        String toolName() { return "shell".equals(tool) ? (shell.isEmpty() ? "PowerShell" : shell) : AggregateSessions.toolName(tool); }
         String shownTitle() { return title.isEmpty() ? toolName() : title; }
     }
     static String label(String kind) {
@@ -148,7 +159,7 @@ final class AggregateSessions {
     static String location(Entry entry) {
         // a terminal of the phone's; the program that has a conversation open (and whether it is an editor's terminal);
         // for one that is only saved, by what it was started
-        return entry.terminal ? (entry.running() ? "手机终端" : "")
+        return entry.terminal ? (entry.running() ? (entry.chat ? "手机对话" : "手机终端") : "")
             : !entry.live ? entry.kind
             : "电脑独立终端".equals(entry.origin) ? ""
             : entry.origin + ("终端".equals(entry.kind) && !entry.origin.isEmpty() && !"命令行".equals(entry.origin) && !entry.origin.contains("桌面版") ? " 的终端" : "");
@@ -162,7 +173,7 @@ final class AggregateSessions {
         boolean running() { return entry.running(); }
         /** What a search looks through. */
         String words() {
-            return (entry.shownTitle() + '\n' + entry.place() + '\n' + entry.toolName() + '\n' + sourceLabel(entry.source()) + '\n' + (entry.terminal && entry.running() ? "手机终端\n" : "") + entry.origin + '\n' + entry.kind + '\n' + computer + '\n' + label(kind)
+            return (entry.shownTitle() + '\n' + entry.place() + '\n' + entry.toolName() + '\n' + sourceLabel(entry.source()) + '\n' + (entry.terminal && entry.running() ? (entry.chat ? "手机对话\n" : "手机终端\n") : "") + entry.origin + '\n' + entry.kind + '\n' + computer + '\n' + label(kind)
                 + (entry.apart() ? "\n未加入项目" : "") + (entry.pinned ? "\n置顶" : "") + (entry.hidden ? "\n已隐藏" : "")).toLowerCase(java.util.Locale.ROOT);
         }
     }
@@ -186,7 +197,7 @@ final class AggregateSessions {
         List<String> words = new ArrayList<>();
         for (String word : query.trim().toLowerCase(java.util.Locale.ROOT).split("\\s+")) if (!word.isEmpty()) words.add(word);
         board.searched = !words.isEmpty();
-        for (String known : new String[]{"claude", "codex", "shell"}) for (Thing thing : things) if (known.equals(thing.entry.tool)) { board.tools.add(known); break; }
+        for (String known : new String[]{"claude", "codex", "opencode", "qoder", "cline", "shell"}) for (Thing thing : things) if (known.equals(thing.entry.tool)) { board.tools.add(known); break; }
         for (String known : new String[]{"term", "app"}) for (Thing thing : things) if (known.equals(thing.entry.source())) { board.sources.add(known); break; }
         for (Thing thing : things) {
             Entry entry = thing.entry;
@@ -275,9 +286,11 @@ final class AggregateSessions {
         }
         return counts;
     }
-    static String terminalPath(String id) {
+    static String terminalPath(String id) { return terminalPath(id, false); }
+    /** A terminal's page, or a conversation's for one that runs a conversation (web/chat/). */
+    static String terminalPath(String id, boolean chat) {
         if (id == null || !id.matches("[a-f0-9]{32}")) throw new IllegalArgumentException("终端编号无效");
-        return "/terminal/?id=" + id;
+        return (chat ? "/chat/?id=" : "/terminal/?id=") + id;
     }
     static String signature(List<Project> projects) { return signature(projects, null); }
     static String signature(List<Project> projects, Map<String, Long> seen) {

@@ -4,6 +4,8 @@ The computer makes outbound HTTPS requests. Operation IDs and output sequence nu
 make retrying a dropped response safe; input is never silently executed twice.
 """
 import collections
+import base64
+import binascii
 import copy
 import json
 import os
@@ -62,6 +64,13 @@ class _Operations(collections.OrderedDict):
 _id = re.compile(r"^[a-f0-9]{16,32}$")
 _terminal = re.compile(r"^[a-f0-9]{32}$")
 _session = re.compile(r"^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
+_session_re = {"opencode": re.compile(r"^ses_[A-Za-z0-9]{10,40}$"),
+               "cline": re.compile(r"^[0-9]{10,16}_[A-Za-z0-9]{4,10}$")}
+
+
+def session_id_ok(tool, session):
+    """A conversation id in this tool's own shape; claude, codex and qoder name a UUID."""
+    return bool(_session_re.get(tool, _session).fullmatch(session))
 _word = re.compile(r"^[a-z0-9_]{1,40}$")
 PROJECT_ACTIONS = ("project_add", "project_remove", "project_rename")
 DESKTOP_ACTIONS = ("app_open",)
@@ -69,7 +78,7 @@ DESKTOP_ACTIONS = ("app_open",)
 DESKTOP_TOOLS = ("codex", "claude")
 UPDATE_ACTION = "update"      # the program on the computer looks for a newer version of itself and installs it
 MAX_TERMINALS, MAX_HISTORY, OUTPUT_LIMIT, CLOSED_LIMIT = 8, 12, 2_000_000, 300_000
-LABELS = {"claude": "Claude Code", "codex": "Codex", "shell": "PowerShell"}
+LABELS = {"claude": "Claude Code", "codex": "Codex", "opencode": "OpenCode", "qoder": "Qoder", "cline": "Cline", "shell": "PowerShell"}
 OP_SECONDS = 120
 
 
@@ -79,6 +88,15 @@ def _name(value, limit=40):
 
 _stamp = re.compile(r"[0-9.]{1,48}")         # how the file of a conversation was when it was read, in the words of the computer
 
+def _words(text, most=8000):
+    """What a person wrote, as it may be handed on: without carriage returns, not empty, not too long, and with no
+    control characters but line breaks and tabs. None where it is not that."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip() if isinstance(text, str) else ""
+    if not text or len(text) > most or any(ord(c) < 32 and c not in "\n\t" for c in text):
+        return None
+    return text
+
+
 def _folders(items, limit):
     """Folders as the computer reports them; the relay only shows them and hands the chosen one back."""
     out = []
@@ -86,7 +104,7 @@ def _folders(items, limit):
         if isinstance(item, dict) and _name(item.get("name"), 60) and _name(item.get("path"), 260):
             out.append({"name": item["name"], "path": item["path"], "fixed": item.get("fixed") is True, "exists": item.get("exists") is not False,
                         "updated": item["updated"] if type(item.get("updated")) is int else 0, "live": item.get("live") is True,
-                        "tools": [t for t in str(item.get("tools", "")).split() if t in ("claude", "codex")],
+                        "tools": [t for t in str(item.get("tools", "")).split() if t in ("claude", "codex", "opencode", "qoder", "cline")],
                         # by what the folder is used on the computer, in the computer's words: a desktop app, an editor, a terminal
                         "kinds": [k[:20] for k in item.get("kinds", []) if isinstance(k, str) and k.strip()][:4] if isinstance(item.get("kinds"), list) else []})
     return out
@@ -136,7 +154,7 @@ def _resume(term, chunks):
     """Where a reader that has nothing yet begins, and what has to be said before that piece."""
     modes = dict(term.get("modes") or {})
     whole = 0, _preamble(modes)
-    if term.get("state") != "running" or term.get("tool") == "shell":
+    if term.get("state") != "running" or term.get("tool") == "shell" or term.get("form") == "chat":
         return whole            # a shell's history is read back, and an ended terminal is short already
     at, size = len(chunks), 0
     while at > 0 and size + len(chunks[at - 1]["data"]) <= TAIL:
@@ -231,6 +249,9 @@ def _phase(term, now):
         return "starting"
     if term["state"] != "running":
         return "failed" if term.get("exit_code") not in (None, 0) else "ended"
+    if term.get("form") == "chat":
+        # a conversation run through its tool's structured mode says itself how it stands
+        return term.get("status") if term.get("status") in ("starting", "busy", "confirm") else "idle"
     quiet = now - term.get("out_at", 0)
     # Claude Code says itself whether it is working; for the others, fresh output means work.
     working = term.get("status") == "busy" if term.get("status") else quiet < ACTIVE_SECONDS
@@ -281,7 +302,8 @@ def _public_session(session, terminal=""):
     return shown
 
 
-FILE_ACTIONS = ("file_list", "file_read")
+UPLOAD_ACTIONS = ("file_upload_start", "file_upload_chunk", "file_upload_finish", "file_upload_cancel")
+FILE_ACTIONS = ("file_list", "file_read") + UPLOAD_ACTIONS
 FILE_SECONDS = 25
 WAKE_SECONDS = 85       # a message that is handed to a conversation where it sits idle takes a short run of its tool on the computer
 # What the program on the computer is asked about itself: a few of its settings, and the line it is reached by.
@@ -291,6 +313,11 @@ COMPUTER_ACTIONS = ("settings_read", "settings_change", "line_switch", "line_tak
 WORK_ACTIONS = ("stats", "schedules", "schedule_set", "schedule_remove", "handoff", "chains", "chain_set", "chain_remove")
 # What the phone can do to a conversation that a program on the computer has open, where its tool lets it be reached.
 REACH = ("say", "answer", "stop")
+# What is done to a terminal that runs a conversation through its tool's structured mode (form "chat"; docs/PROTOCOL.md,
+# "Chats"): what is said, a stop, an answer to what it asks, ending it. It has no screen to type into or size.
+CHAT_TOOLS = ("claude", "codex")
+CHAT_ACTIONS = ("say", "stop", "answer", "close", "rename")
+CHAT_DECISIONS = re.compile(r"^(allow|always|deny|choice:[0-9]{1,2})$")
 # By which way the computer does each thing to a conversation that a program there has open (docs/PROTOCOL.md):
 # its application's own channel, its tool's hooks, its tool's own way to one that sits idle; ending closes its program.
 WAYS = {"say": ("codex-desktop", "hook", "wake"), "stop": ("codex-desktop", "hook"), "answer": ("hook",), "end": ("process",)}
@@ -476,11 +503,15 @@ class Relay:
             if len(threads) >= MAX_HISTORY and not any(at < created for at in closed):
                 return None
         named = _name(item.get("title"), 60)
+        if item.get("form") == "chat" and tool not in CHAT_TOOLS:
+            return None
         term = {"id": key, "tool": tool, "dir": folder, "folder": apart, "title": item["title"].strip() if named else self._device.get("shell") or LABELS[tool] if tool == "shell" else LABELS[tool],
                 "session": session, "status": "", "created": created, "state": item["state"], "error": "", "seq": 0, "output": [], "size": 0, "cols": 80, "rows": 24,
                 "instance": instance, "previous": "", "history": False, "touched": True}
         if named:
             term["renamed"] = True
+        if item.get("form") == "chat":
+            term["form"] = "chat"
         threads[key] = term
         _room(state)
         return threads.get(key)
@@ -488,6 +519,8 @@ class Relay:
     def _said(self, term):
         """One line of what a terminal's program last said or did, for the lists. The screen is brought up to date only
         when someone looks, so a terminal nobody watches costs nothing."""
+        if term.get("form") == "chat":
+            return term.get("said", "")
         output = term.get("output") or []
         if not output:
             return ""
@@ -519,6 +552,8 @@ class Relay:
     def _question(self, term):
         """The question a terminal's program is waiting on, as the last lines of its screen: enough to answer it from
         the list without opening the terminal, and never answered without having been shown."""
+        if term.get("form") == "chat":
+            return [line[:160] for line in term.get("asking", "").split("\n") if line.strip()][:14]
         self._said(term)                         # brings the kept screen up to date
         kept = self._screens.get(term["id"])
         if not kept:
@@ -532,7 +567,7 @@ class Relay:
         return lines
 
     def _public(self, term):
-        shown = {k: v for k, v in term.items() if k not in ("output", "instance", "size", "out_at", "touched", "calm_until", "modes", "modes_rest")}
+        shown = {k: v for k, v in term.items() if k not in ("output", "instance", "size", "out_at", "touched", "calm_until", "modes", "modes_rest", "asking")}
         # Until the owner names a terminal, it carries the name of the conversation it has open.
         if not term.get("renamed"):
             shown["title"] = next((s["title"] for s in self._sessions if s["id"] == term.get("session")), term["title"])
@@ -704,6 +739,16 @@ class Relay:
                     raise RemoteError("历史对话编号无效")
                 if any(type(payload.get(k, False)) is not bool for k in ("history", "takeover", "fork")):
                     raise RemoteError("历史选项无效")
+                chat = payload.get("form", "") == "chat"
+                if payload.get("form", "") not in ("", "chat") or "text" in payload and not chat:
+                    raise RemoteError("终端选项无效")
+                if chat:
+                    if tool not in CHAT_TOOLS or "chat" not in self._device.get("features", []):
+                        raise RemoteError("电脑端版本不支持这种对话，请更新电脑端")
+                    if payload.get("history") or payload.get("fork"):
+                        raise RemoteError("对话选项无效")
+                    if "text" in payload and _words(payload["text"]) is None:
+                        raise RemoteError("内容为空、超过 8000 字或含有控制字符")
                 session = payload.get("session", "")
                 if payload.get("history") and not session and not previous:
                     raise RemoteError("请在项目中选择具体的历史对话；新建终端不会打开 resume 选择器")
@@ -712,7 +757,7 @@ class Relay:
                 if fork and (tool != "codex" or not session or payload.get("takeover") or "codex-fork" not in self._device.get("features", [])):
                     raise RemoteError("电脑端不支持这个副本选项，请更新电脑后台")
                 if session:
-                    saved = next((s for s in self._sessions if s["id"] == session and s["tool"] == tool and s["dir"] == folder), None)                     if isinstance(session, str) and _session.fullmatch(session) else None
+                    saved = next((s for s in self._sessions if s["id"] == session and s["tool"] == tool and s["dir"] == folder), None)                     if isinstance(session, str) and session_id_ok(tool, session) else None
                     if not saved:
                         raise RemoteError("电脑上没有找到这个对话，请刷新后重试")
                     if saved.get("live") and not fork and not payload.get("takeover"):
@@ -732,11 +777,16 @@ class Relay:
                 if sum(t["state"] in ("starting", "running") for t in state["threads"].values()) >= MAX_TERMINALS:
                     raise RemoteError("最多同时运行 8 个终端，请先结束一个")
                 terminal = uuid.uuid4().hex
+                if chat and not called and payload.get("text"):
+                    # a new conversation is called by what it was first told, until its tool names it
+                    called = " ".join(_words(payload["text"]).split())[:40]
                 term = {"id": terminal, "tool": tool, "dir": folder, "folder": where,
                         # one outside every project is called what its conversation is: the computer lists that conversation only while it is open
-                        "title": (called[:60] if apart and called else self._device.get("shell") or LABELS[tool] if tool == "shell" else LABELS[tool]) + (" · 副本" if fork else ""), "session": "" if fork else session, "status": "",
+                        "title": (called[:60] if (apart or chat) and called else self._device.get("shell") or LABELS[tool] if tool == "shell" else LABELS[tool]) + (" · 副本" if fork else ""), "session": "" if fork else session, "status": "",
                         "created": int(now * 1000), "state": "starting", "error": "", "seq": 0, "output": [], "size": 0, "cols": 80, "rows": 24,
                         "instance": self._device["instance"], "previous": previous, "history": bool(payload.get("history")), "touched": False}
+                if chat:
+                    term.update(form="chat", touched=True)
                 state["threads"][terminal] = term
                 _room(state)
             else:
@@ -752,13 +802,26 @@ class Relay:
                     return {"id": op_id, "terminal": terminal, "state": "done", "error": ""}
                 if term["state"] != "running":
                     raise RemoteError("终端已结束或尚未启动")
-                if action == "say":
+                if term.get("form") == "chat":
+                    if action not in CHAT_ACTIONS:
+                        raise RemoteError("这段对话不支持此操作")
+                    if action == "say":
+                        text = _words(payload.get("text"))
+                        if text is None:
+                            raise RemoteError("内容为空、超过 8000 字或含有控制字符")
+                        asked, payload = payload, {"id": op_id, "action": "say", "terminal": terminal, "text": text}
+                    elif action == "stop" and term.get("phase") not in ("busy", "confirm"):
+                        raise RemoteError("它现在没有在执行")
+                    elif action == "answer":
+                        if not isinstance(payload.get("ask"), str) or not _ask.fullmatch(payload["ask"]) or not isinstance(payload.get("decision"), str) or not CHAT_DECISIONS.fullmatch(payload["decision"]):
+                            raise RemoteError("回答无效")
+                        payload = {"id": op_id, "action": "answer", "terminal": terminal, "ask": payload["ask"], "decision": payload["decision"]}
+                elif action == "say":
                     # A message, as typed into the box of the terminal's page and sent: the text, then Enter. It comes
                     # from where the terminal is not on the screen, so the relay puts it the way the program takes
                     # pasted text, which it knows from what the program printed; the computer is given plain input.
-                    text = payload.get("text")
-                    text = text.replace("\r\n", "\n").replace("\r", "\n").strip() if isinstance(text, str) else ""
-                    if not text or len(text) > 8000 or any(ord(c) < 32 and c not in "\n\t" for c in text):
+                    text = _words(payload.get("text"))
+                    if text is None:
                         raise RemoteError("内容为空、超过 8000 字或含有控制字符")
                     # Enter answers "yes" to a question the program waits on: that is answered where the question is read.
                     if term.get("phase") == "confirm":
@@ -776,7 +839,7 @@ class Relay:
                     if any(type(payload.get(k)) is not int for k in ("cols", "rows")) or not (20 <= payload["cols"] <= 240 and 6 <= payload["rows"] <= 100):
                         raise RemoteError("终端尺寸无效")
                     term["calm_until"] = max(term.get("calm_until", 0), now + REDRAW_SECONDS)
-                elif action != "close":
+                elif action not in ("close", "say", "stop", "answer") or term.get("form") != "chat" and action != "close":
                     raise RemoteError("不支持此操作")
             op = {"id": op_id, "terminal": terminal, "state": "queued", "error": "", "at": now, "payload": copy.deepcopy(payload)}
             if asked is not None:
@@ -803,6 +866,26 @@ class Relay:
             raise RemoteError("路径无效")
         if type(payload.get("offset", 0)) is not int or payload.get("offset", 0) < 0:
             raise RemoteError("位置无效")
+        question = {"id": op_id, "action": action, "dir": folder, "path": where, "offset": payload.get("offset", 0)}
+        if action in UPLOAD_ACTIONS:
+            upload = payload.get("upload")
+            if not isinstance(upload, str) or not re.fullmatch(r"[a-f0-9]{32}", upload):
+                raise RemoteError("上传编号无效")
+            question["upload"] = upload
+            if action == "file_upload_start":
+                size = payload.get("size")
+                if type(size) is not int or not 0 <= size <= 300 * 1024 * 1024:
+                    raise RemoteError("单个文件上传上限为 300 MB")
+                question["size"] = size
+            if action == "file_upload_chunk":
+                data = payload.get("data")
+                if not isinstance(data, str) or not 0 < len(data) <= 983040:
+                    raise RemoteError("上传分块大小无效")
+                try:
+                    base64.b64decode(data, validate=True)
+                except (ValueError, binascii.Error):
+                    raise RemoteError("上传内容无效")
+                question["data"] = data
         with self._changed:
             self._expire(now)
             if op_id in self._pending:
@@ -811,9 +894,11 @@ class Relay:
                 raise RemoteError("电脑未连接或远控已关闭，请等待电脑上线后重试")
             if "files" not in self._device.get("features", []):
                 raise RemoteError("电脑端版本不支持查看文件，请更新电脑端")
+            if action in UPLOAD_ACTIONS and "file-upload" not in self._device.get("features", []):
+                raise RemoteError("这台电脑暂不支持上传文件，请更新 Windows 电脑端")
             if folder not in self._device["workspaces"]:
                 raise RemoteError("没有这个项目")
-            return self._held({"id": op_id, "action": action, "dir": folder, "path": where, "offset": payload.get("offset", 0)}, now, wait)
+            return self._held(question, now, wait)
 
     def _held(self, question, now, wait):
         """Passes a question on to the computer and waits for its answer. Called with self._changed held."""
@@ -847,7 +932,7 @@ class Relay:
         op_id, session, action = payload.get("id"), payload.get("session"), payload.get("action", "read")
         if not isinstance(op_id, str) or not _id.fullmatch(op_id):
             raise RemoteError("操作编号无效")
-        if not isinstance(session, str) or not _session.fullmatch(session):
+        if not isinstance(session, str) or not any(session_id_ok(tool, session) for tool in ("claude", "opencode", "cline")):
             raise RemoteError("对话编号无效")
         more = {}
         if action == "say":
@@ -1123,12 +1208,12 @@ class Relay:
                      "can_takeover": s.get("can_takeover") is True, "ownership_known": s.get("ownership_known") is True,
                      "takeover_reason": str(s.get("takeover_reason") or "")[:200]}
                     for s in payload["sessions"][:120]
-                    if isinstance(s, dict) and isinstance(s.get("id"), str) and _session.fullmatch(s["id"]) and s.get("tool") in ("claude", "codex")
+                    if isinstance(s, dict) and isinstance(s.get("id"), str) and session_id_ok(s.get("tool"), s["id"]) and s.get("tool") in ("claude", "codex", "opencode", "qoder", "cline")
                     and _placed(s) and isinstance(s.get("title"), str) and s["title"].strip() and type(s.get("updated")) is int]
             self._device.update(seen=now, instance=instance, enabled=info.get("enabled") is True,
                            version=str(info.get("version") or "")[:20], newer=str(info.get("newer") or "")[:20], shell=_shell(info.get("shell")),
-                           features=[x for x in info.get("features", []) if x in ("codex-fork", "codex-takeover", "terminal-exit", "files", "update", "peek", "settings", "reach", "marks", "delete", "projects", "end", "outbox", "work", "chains", "codex-desktop-control") + tuple(tool + "-desktop-open" for tool in DESKTOP_TOOLS)],
-                           tools=[x for x in info.get("tools", []) if x in ("claude", "codex", "shell")],
+                           features=[x for x in info.get("features", []) if x in ("codex-fork", "codex-takeover", "terminal-exit", "files", "file-upload", "update", "peek", "settings", "reach", "marks", "delete", "projects", "end", "outbox", "work", "chains", "codex-desktop-control", "chat") + tuple(tool + "-desktop-open" for tool in DESKTOP_TOOLS)],
+                           tools=[x for x in info.get("tools", []) if x in ("claude", "codex", "opencode", "qoder", "cline", "shell")],
                            workspaces=[x for x in info.get("workspaces", []) if isinstance(x, str) and 0 < len(x) <= 60],
                            projects=_folders(info.get("projects"), 60), candidates=_folders(info.get("candidates"), 40))
             for term in state["threads"].values():
@@ -1185,13 +1270,18 @@ class Relay:
                         _trim(term)
                         dirty = True
                     session = item.get("session")
-                    if isinstance(session, str) and _session.fullmatch(session) and session != term.get("session"):
+                    if isinstance(session, str) and session_id_ok(term["tool"], session) and session != term.get("session"):
                         term["session"] = session
                         dirty = True
-                    status = item.get("status") if item.get("status") in ("idle", "busy") and term["state"] == "running" else ""
+                    status = item.get("status") if item.get("status") in (("idle", "busy", "confirm", "starting") if term.get("form") == "chat" else ("idle", "busy")) and term["state"] == "running" else ""
                     wrote = wrote or status != term.get("status")
                     term["status"] = status
                     term["completion"] = str(item.get("completion") or "")[:200]
+                    if term.get("form") == "chat":
+                        # what it said last and what it asks, in the computer's words
+                        said, asking = str(item.get("said") or "")[:200], str(item.get("ask") or "")[:2000]
+                        wrote = wrote or said != term.get("said") or asking != term.get("asking")
+                        term["said"], term["asking"] = said, asking
                     exit_code = item.get("exit_code")
                     if term["state"] == "closed" and type(exit_code) is int and term.get("exit_code") != exit_code:
                         term["exit_code"] = exit_code

@@ -67,6 +67,8 @@ python tests\reach_check.py                               # 电脑上开着的�
 python tests\reach_e2e_check.py [chrome.exe [输出文件夹]]  # 同一件事经真实的中转、电脑端和钩子程序走一遍：列表、确认、发消息，以及列表页上的卡片（虚构的 Codex 目录和事件）；对话的置顶和隐藏由电脑端记住；未加入项目的对话被列出、查看、发消息，文件夹加为项目后归入该项目
 python tests\session_copies_check.py                      # 同一段对话只列一次，用虚构的对话文件
 python tests\said_check.py                                # 手机上看到的对话内容：问了什么、答了什么、做了什么，用虚构的对话文件
+python tests\chat_check.py [电脑端程序所在文件夹]            # 手机上的对话（Chats.cs）：经真实的中转和电脑端，两个工具各一遍：带第一句话新建、手机编号随原话返回、回答分段到达、执行前的确认和回答、执行中停止、拒绝、结束；带历史继续保存过的对话。工具是按两者协议说话的替身（tests\chat_standin.py），对话目录是编造的
+python tests\chat_ui_check.py <chrome.exe> <输出文件夹>   # 对话页：边写边显示、步骤和实时输出、确认按钮、发消息、停止、继续、结束后再打开；终端页把对话交给对话页；“应用”一点即开始、长按改在桌面应用打开；历史对话按所选方式继续。真实中转，电脑由测试扮演；截图 chat-ask.png、chat-busy.png（即 docs\images\chat.png）、chat-done.png、chat-dark.png
 python tests\look_check.py                                # 先看对话再接手、票据登录、手机和电脑共用一个终端；真实的中转和电脑端
 python tests\tunnel_check.py --local                      # 直连回显延迟
 python tests\tunnel_download_check.py --bash <bash路径>    # 四种 Linux 架构及 Windows 下载校验：正确文件通过、损坏文件拒绝、临时文件清理；Windows 上需 Git Bash
@@ -79,6 +81,7 @@ python tests\move_check.py                             # 电脑端换到另一�
 python tests\history_check.py                          # 电脑端保留已交给中转的输出，中转缺少时从缺的地方再给一遍
 chrome --headless=new --window-size=1480,520 --screenshot=skins.png tests\skin_code_check.html   # 各外观下代码、diff 和 16 色的显示
 python tests\setup_check.py dist\RemoteCli-Setup-x.y.z.exe      # 安装程序，沙盒方式，不碰已有安装
+python tests\tools_ui_check.py <chrome.exe> <输出文件夹>   # 六种工具的启动按钮、新工具终端与 Ctrl+P 输入，手机和桌面布局
 python tests\pages_check.py <chrome.exe> <输出文件夹>     # 用本机的中转和电脑端截取列表页和终端页；对话是编造的（tests\made_up.py），不会把本机真实的对话画进图里
 java -cp .cache\zxing-core-3.5.3.jar tests\QrDecodeCheck.java <二维码.png> <内容>   # 手机端的二维码识别
 ```

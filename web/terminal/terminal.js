@@ -59,7 +59,7 @@
       ['/quit', '退出 Codex（终端随之结束）']],
     shell: []
   };
-  const KEYS = { escape: '\x1b', tab: '\t', backtab: '\x1b[Z', up: '\x1b[A', down: '\x1b[B', left: '\x1b[D', right: '\x1b[C', enter: '\r', interrupt: '\x03',
+  const KEYS = { escape: '\x1b', tab: '\t', backtab: '\x1b[Z', up: '\x1b[A', down: '\x1b[B', left: '\x1b[D', right: '\x1b[C', enter: '\r', interrupt: '\x03', ctrlp: '\x10',
     pageup: '\x1b[5~', pagedown: '\x1b[6~' };
 
   let running = false, restoring = true, initialized = false, lastSize = '', tool = 'claude', ended = false;
@@ -341,7 +341,8 @@
       // Output arrives many times a second: the page around the terminal is touched only where something changed.
       const plain = device.shell || 'PowerShell';      // what the computer calls its plain terminal
       // its project; one that took on a conversation outside every project runs in that conversation's folder
-      const where = (tool === 'codex' ? 'Codex' : tool === 'shell' ? plain : 'Claude Code') + ' · ' + (t.dir || String(t.folder || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop());
+      const toolName = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', qoder: 'Qoder', cline: 'Cline', shell: plain }[tool] || tool;
+      const where = toolName + ' · ' + (t.dir || String(t.folder || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop());
       // Someone else's size on the screen means the terminal is open in another place too.
       $('shared').hidden = !(running && elsewhere);
       const loading = restoring && more ? `载入输出 ${Math.round(100 * (payload.after - start) / Math.max(1, t.seq - start))}%` : '';
