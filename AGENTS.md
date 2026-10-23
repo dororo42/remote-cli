@@ -6,3 +6,11 @@
 - 发布时上传 `RemoteCli-Setup-X.Y.Z.exe` 和 `RemoteCli-Android.apk` 两个文件；用户要求（2026-10-11 起）不再附 `SHA256SUMS.txt`，Release 说明里也不写校验值（两端的更新程序用 GitHub 给出的文件摘要校验下载）。APK 签名证书必须与上一正式版一致，不直接使用未经比对的默认密钥；必要时用 `android/build.ps1 -SecretDir` 指定既有发布密钥目录。确认 Release 标签指向此次已验证的提交，公开版本和文件摘要与本地成品一致；不覆盖旧版附件，不改写远端历史。
 - 用户要求：项目保持清晰、可扩展的结构，不做无意义的堆砌。新能力以职责单一、接口明确的模块加入（例如 `agent-windows/Relays.cs`、`public-relays.json`、`relay.Relay`）；状态放在可以有多个实例的对象里，不靠全局变量或重复加载模块；改动同时带上测试和文档（涉及三方接口的写进 `docs/PROTOCOL.md`），并去掉因此不再需要的代码。
 - README 和 Release 说明直接描述功能、变化及必要的使用限制，使用自然、客观的中文；不加入助手自述或“未核验”“没有在手机上看过”等制作过程说明，不虚构测试证据。
+
+## Current Handoff
+
+- Latest: `handoffs/2026-10-19-182341-pr6-green-fork-synced/HANDOFF.md`
+- Branch: tools-on-upstream @ fd84b64
+- Status: [TODO: 进行中 / 等待决策 / …]
+
+任何 agent 开始工作前，先读上面的 HANDOFF.md。这份指针由 orbital_handoff 维护，手工交接时请同步更新。
