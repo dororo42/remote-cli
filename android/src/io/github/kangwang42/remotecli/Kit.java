@@ -18,10 +18,14 @@ import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
-import java.util.function.IntConsumer;
-
+// java.util.function 需要 API 24；本分支要跑到 Android 6（API 23），用自带的小接口替代。
 /** The colours and small views the app's own screens are built from, matching the pages a computer serves. */
 final class Kit {
+    /** java.util.function.Consumer 的小替身。 */
+    public interface StringIn { void accept(String value); }
+    /** java.util.function.IntConsumer 的小替身。 */
+    public interface IntIn { void accept(int value); }
+
     /** One row per skin in web/terminal/skins.js: background, panel, raised, line, ink, muted, accent, on accent, good, busy, bad. */
     private static final int[][] SKINS = {
         {0x1a1b26, 0x222436, 0x2c2f47, 0x2f334d, 0xc0caf5, 0x8189ad, 0x7aa2f7, 0x10121c, 0x9ece6a, 0xe0af68, 0xf7768e},
@@ -269,7 +273,7 @@ final class Kit {
         window.setLayout(-1, -2); window.setGravity(Gravity.BOTTOM);
     }
     /** A sheet with a box to write in and one button, which hands over what was written. */
-    void write(String title, String note, String hint, String yes, java.util.function.Consumer<String> written) {
+    void write(String title, String note, String hint, String yes, StringIn written) {
         final Dialog dialog = new Dialog(activity);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
         LinearLayout box = sheetBox(title, note, 3);
@@ -286,7 +290,7 @@ final class Kit {
         raise(dialog, box, true);
         field.requestFocus();
     }
-    void sheet(String title, String note, String[] labels, String[] notes, int danger, IntConsumer picked) {
+    void sheet(String title, String note, String[] labels, String[] notes, int danger, IntIn picked) {
         final Dialog dialog = new Dialog(activity);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
         LinearLayout box = sheetBox(title, note, 0);

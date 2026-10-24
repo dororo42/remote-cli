@@ -10,7 +10,6 @@ import android.widget.Toast;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.view.View;
-import java.util.function.IntConsumer;
 import org.json.JSONObject;
 
 /** Optional, user-initiated desktop access, independent of the terminal connection. */
@@ -22,7 +21,7 @@ final class UuRemote {
     UuRemote(MainActivity activity, Kit kit) { this.activity = activity; this.kit = kit; store = new DesktopStore(activity); }
     private void say(String text) { Toast.makeText(activity, text, Toast.LENGTH_LONG).show(); }
     private Intent intent(String url) { return new Intent(Intent.ACTION_VIEW, Uri.parse(url)).setPackage(PACKAGE); }
-    private void choices(String title, String note, String[] labels, String[] notes, int danger, IntConsumer picked) {
+    private void choices(String title, String note, String[] labels, String[] notes, int danger, Kit.IntIn picked) {
         LinearLayout content = kit.column();
         content.setPadding(kit.dp(12), kit.dp(8), kit.dp(12), kit.dp(8));
         content.addView(kit.text(note, 14, kit.MUTED), kit.below(0));

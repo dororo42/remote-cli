@@ -12,7 +12,6 @@ import android.view.ViewTreeObserver;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
-import java.util.function.Consumer;
 
 /**
  * The tabs at the foot of the app's own lists: 任务, 项目, 协作, 我的. They are the ones a computer's pages draw at
@@ -44,7 +43,7 @@ final class Tabs {
         return "small".equals(chosen) ? 14f : "large".equals(chosen) ? 17f : "larger".equals(chosen) ? 19f : 15.5f;
     }
 
-    View build(String current, Consumer<String> picked) {
+    View build(String current, Kit.StringIn picked) {
         LinearLayout bar = kit.column();
         bar.setBackgroundColor(kit.BG);
         View line = new View(activity);

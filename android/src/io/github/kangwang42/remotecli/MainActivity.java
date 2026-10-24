@@ -108,7 +108,7 @@ public final class MainActivity extends Activity {
     /** How many things wait for an answer on every computer: Workbench says it, the tab of 任务 shows it. */
     void waiting(int count) { tabs.count(count); }
     /** One of the computers, for what is done on one of them: asked only where there are several. */
-    void pick(String title, java.util.List<String> urls, java.util.function.Consumer<String> chosen) {
+    void pick(String title, java.util.List<String> urls, Kit.StringIn chosen) {
         if (urls.isEmpty()) { android.widget.Toast.makeText(this, computers().length() == 0 ? "请先添加电脑" : "没有在线的电脑", android.widget.Toast.LENGTH_SHORT).show(); return; }
         if (urls.size() == 1) { chosen.accept(urls.get(0)); return; }
         String[] names = new String[urls.size()];
