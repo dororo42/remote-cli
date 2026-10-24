@@ -457,8 +457,9 @@ public final class MainActivity extends Activity {
     // ---- reminders: off until the person turns them on
     boolean watching() { return prefs.getBoolean("watch", false); }
     String reminderStatus() {
-        boolean allowed = getSystemService(NotificationManager.class).areNotificationsEnabled();
-        android.app.NotificationChannel channel = getSystemService(NotificationManager.class).getNotificationChannel("tasks");
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        boolean allowed = android.os.Build.VERSION.SDK_INT < 24 || nm.areNotificationsEnabled();   // 24 以前系统没有这一开关
+        android.app.NotificationChannel channel = nm.getNotificationChannel("tasks");
         allowed &= channel == null || channel.getImportance() > NotificationManager.IMPORTANCE_NONE;
         return watching() && allowed ? "已开启" : allowed ? "未开启" : "需授权";
     }
@@ -477,10 +478,11 @@ public final class MainActivity extends Activity {
         LinearLayout page = kit.page(22);
         page.addView(kit.head("提醒与权限", kit.text("这些开关由 Android 系统管理，开启后提醒更稳定。", 13, kit.MUTED)), kit.below(18));
         NotificationManager nm = getSystemService(NotificationManager.class);
-        boolean notifications = nm.areNotificationsEnabled();
+        boolean notifications = android.os.Build.VERSION.SDK_INT < 24 || nm.areNotificationsEnabled();
         boolean channel = nm.getNotificationChannel("tasks") == null || nm.getNotificationChannel("tasks").getImportance() != NotificationManager.IMPORTANCE_NONE;
         boolean battery = getSystemService(android.os.PowerManager.class).isIgnoringBatteryOptimizations(getPackageName());
-        int data = getSystemService(android.net.ConnectivityManager.class).getRestrictBackgroundStatus();
+        int data = android.os.Build.VERSION.SDK_INT < 24 ? android.net.ConnectivityManager.RESTRICT_BACKGROUND_STATUS_DISABLED
+                                                         : getSystemService(android.net.ConnectivityManager.class).getRestrictBackgroundStatus();
         page.addView(kit.text("必要权限", 13, kit.MUTED), kit.below(4));
         page.addView(reminderRow("通知", notifications && channel ? "已允许" : "需要允许", notifications && channel ? kit.GOOD : kit.BAD,
             () -> systemSettings(new Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, getPackageName()))), kit.below(8));
@@ -721,7 +723,7 @@ public final class MainActivity extends Activity {
          * The tabs at the foot of a computer's page are the app's: the page asks which of them the app has lists
          * for, and a press on one of those leads to that list (by the page's name of the tab).
          */
-        @JavascriptInterface public String appTabs() { return String.join(",", Tabs.NAMES); }
+        @JavascriptInterface public String appTabs() { return android.text.TextUtils.join(",", Tabs.NAMES); }   // String.join 是 API 26
         @JavascriptInterface public void appPage(String tab) {
             final String key = Tabs.key(tab);
             if (key != null) runOnUiThread(() -> MainActivity.this.appPage(key));

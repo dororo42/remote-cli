@@ -34,10 +34,23 @@ public final class Watcher extends Service {
     private static final String CHANNEL_TASKS = "tasks", STATE = "remote-cli-watch";
     private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor();
     private volatile boolean active, visible;
+    /** Android 8 以前没有通知渠道：老系统直接建通知，用优先级近似渠道的重要性。 */
+    private static Notification.Builder builder(Context context, String channel, int legacyPriority) {
+        if (android.os.Build.VERSION.SDK_INT >= 26) return new Notification.Builder(context, channel);
+        return new Notification.Builder(context).setPriority(legacyPriority);
+    }
+    private static void createChannels(NotificationManager manager) {
+        if (android.os.Build.VERSION.SDK_INT < 26) return;
+        manager.createNotificationChannel(new NotificationChannel(CHANNEL_TASKS, "任务提醒", NotificationManager.IMPORTANCE_HIGH));
+        manager.createNotificationChannel(new NotificationChannel("watch", "后台连接", NotificationManager.IMPORTANCE_LOW));
+    }
+    private static boolean notificationsAllowed(NotificationManager manager) {
+        return android.os.Build.VERSION.SDK_INT < 24 || manager.areNotificationsEnabled();
+    }
     static void test(Context context) {
         NotificationManager manager = context.getSystemService(NotificationManager.class);
-        manager.createNotificationChannel(new NotificationChannel(CHANNEL_TASKS, "任务提醒", NotificationManager.IMPORTANCE_HIGH));
-        manager.notify(14712, new Notification.Builder(context, CHANNEL_TASKS).setSmallIcon(R.drawable.ic_shell).setContentTitle("Remote AI 测试提醒")
+        createChannels(manager);
+        manager.notify(14712, builder(context, CHANNEL_TASKS, Notification.PRIORITY_HIGH).setSmallIcon(R.drawable.ic_shell).setContentTitle("Remote AI 测试提醒")
             .setContentText("通知已送达。锁屏和后台效果还受系统电池策略影响。").setAutoCancel(true).setContentIntent(open(context)).build());
     }
 
@@ -47,10 +60,12 @@ public final class Watcher extends Service {
     static void start(Context context, boolean visible) {
         try {
             if (!context.getSharedPreferences("remote-cli", MODE_PRIVATE).getBoolean("watch", false)) return;
-            if (!context.getSystemService(NotificationManager.class).areNotificationsEnabled()) {
+            if (!notificationsAllowed(context.getSystemService(NotificationManager.class))) {
                 context.getSharedPreferences(STATE, MODE_PRIVATE).edit().putString("error", "通知被系统关闭，请先允许通知").apply(); return;
             }
-            context.startForegroundService(new Intent(context, Watcher.class).putExtra("visible", visible));
+            Intent launch = new Intent(context, Watcher.class).putExtra("visible", visible);
+            if (android.os.Build.VERSION.SDK_INT >= 26) context.startForegroundService(launch);
+            else context.startService(launch);          // API 26 起后台启动才必须走 startForegroundService
         } catch (Exception refused) {
             context.getSharedPreferences(STATE, MODE_PRIVATE).edit().putString("error", "后台监听未启动，请重新打开应用并检查提醒权限").apply();
         }
@@ -67,11 +82,9 @@ public final class Watcher extends Service {
             getSharedPreferences("remote-cli", MODE_PRIVATE).edit().putBoolean("watch", false).apply(); stopSelf(); return START_NOT_STICKY;
         }
         if (!getSharedPreferences("remote-cli", MODE_PRIVATE).getBoolean("watch", false)) { stopSelf(); return START_NOT_STICKY; }
-        NotificationManager manager = getSystemService(NotificationManager.class);
-        manager.createNotificationChannel(new NotificationChannel(CHANNEL_TASKS, "任务提醒", NotificationManager.IMPORTANCE_HIGH));
-        manager.createNotificationChannel(new NotificationChannel("watch", "后台连接", NotificationManager.IMPORTANCE_LOW));
+        createChannels(getSystemService(NotificationManager.class));
         PendingIntent stop = PendingIntent.getService(this, 0, new Intent(this, Watcher.class).setAction("stop"), PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-        startForeground(ONGOING, new Notification.Builder(this, "watch").setSmallIcon(R.drawable.ic_shell).setContentTitle("Remote AI 正在接收任务提醒")
+        startForeground(ONGOING, builder(this, "watch", Notification.PRIORITY_LOW).setSmallIcon(R.drawable.ic_shell).setContentTitle("Remote AI 正在接收任务提醒")
             .setContentText("等待确认或任务完成时通知 · 点此打开应用").setContentIntent(open(this)).setOngoing(true)
             .addAction(new Notification.Action.Builder(null, "关闭提醒", stop).build()).build());
         if (!active) {
@@ -86,7 +99,11 @@ public final class Watcher extends Service {
         }
         return START_STICKY;
     }
-    @Override public void onDestroy() { active = false; worker.shutdownNow(); stopForeground(STOP_FOREGROUND_REMOVE); super.onDestroy(); }
+    @Override public void onDestroy() {
+        if (android.os.Build.VERSION.SDK_INT >= 24) stopForeground(STOP_FOREGROUND_REMOVE);
+        else stopForeground(true);                      // 带标志的重载 API 24 才有
+        active = false; worker.shutdownNow(); super.onDestroy();
+    }
 
     private static PendingIntent open(Context context) {
         Intent intent = new Intent(context, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
@@ -148,8 +165,12 @@ public final class Watcher extends Service {
             List<Watch.Alert> alerts = Watch.news(tasks, before);
             if (!active) return;
             NotificationManager manager = context.getSystemService(NotificationManager.class);
-            for (String id : old.keySet()) if ((old.get(id).startsWith("confirm") && !before.getOrDefault(id, "").startsWith("confirm"))
-                || before.getOrDefault(id, "").startsWith("busy|") || !before.containsKey(id)) manager.cancel((url + id).hashCode());
+            createChannels(manager);
+            for (String id : old.keySet()) {
+                String was = before.containsKey(id) ? before.get(id) : "";       // getOrDefault 是 API 24
+                if ((old.get(id).startsWith("confirm") && !was.startsWith("confirm"))
+                    || was.startsWith("busy|") || !before.containsKey(id)) manager.cancel((url + id).hashCode());
+            }
             if (!visible) for (Watch.Alert alert : alerts) tell(context, url, name, alert);
             now.put(url, new JSONObject(before));
         }
@@ -161,11 +182,11 @@ public final class Watcher extends Service {
         String title = alert.title.isEmpty() ? alert.dir : alert.title;
         try {
             NotificationManager manager = context.getSystemService(NotificationManager.class);
-            manager.createNotificationChannel(new NotificationChannel(CHANNEL_TASKS, "任务提醒", NotificationManager.IMPORTANCE_HIGH));
+            createChannels(manager);
             Intent target = new Intent(context, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP)
                 .setData(android.net.Uri.parse("remotecli://task/" + (url + alert.id).hashCode())).putExtra("computer", url).putExtra("task", alert.id).putExtra("project", alert.dir);
             PendingIntent tap = PendingIntent.getActivity(context, (url + alert.id).hashCode(), target, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-            Notification notification = new Notification.Builder(context, CHANNEL_TASKS).setSmallIcon(R.drawable.ic_shell)
+            Notification notification = builder(context, CHANNEL_TASKS, Notification.PRIORITY_HIGH).setSmallIcon(R.drawable.ic_shell)
                 .setContentTitle((asks ? "等你确认 · " : "本轮回复结束 · ") + computer)
                 .setContentText(title + (alert.dir.isEmpty() || alert.dir.equals(title) ? "" : " · " + alert.dir))
                 .setAutoCancel(true).setContentIntent(tap).build();

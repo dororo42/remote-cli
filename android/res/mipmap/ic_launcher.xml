@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 7.1 以下读不到 anydpi-v26 的自适应图标：同一设计的矢量层在这里作为普通 drawable 叠加，
+     高版本仍由 mipmap-anydpi-v26 接管。 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@drawable/ic_launcher_background" />
+    <item android:drawable="@drawable/ic_launcher_foreground" />
+</layer-list>

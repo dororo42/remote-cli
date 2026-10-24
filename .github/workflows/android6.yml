@@ -1,0 +1,33 @@
+# Personal-build workflow for the android6 branch: the APK for Android 6 (API 23) phones, signed
+# with the branch's own key from repository secrets. It never publishes a release — the APK lands
+# in the run's artifacts and is installed by hand (or adb). Not offered upstream: Android 6 support
+# is this fork's own use, and the official release model keeps app updates tied to one signing key.
+name: Android 6 build (android6 branch)
+on:
+  push:
+    branches: [android6]
+    paths: ["android/**", ".github/workflows/android6.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install the SDK pieces the runner may miss
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;36.0.0" "platforms;android-36" >/dev/null
+      - name: Build the APK
+        env:
+          ANDROID6_KEYSTORE_B64: ${{ secrets.ANDROID6_KEYSTORE_B64 }}
+          ANDROID6_KEY_PASSWORD: ${{ secrets.ANDROID6_KEY_PASSWORD }}
+        run: bash android/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RemoteCli-Android-android6
+          path: dist/RemoteCli-Android-android6.apk
+          if-no-files-found: error
