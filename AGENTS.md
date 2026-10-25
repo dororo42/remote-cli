@@ -9,8 +9,8 @@
 
 ## Current Handoff
 
-- Latest: `handoffs/2026-10-19-182341-pr6-green-fork-synced/HANDOFF.md`
-- Branch: tools-on-upstream @ fd84b64
+- Latest: `handoffs/2026-10-25-180849-upstream-merged-sync/HANDOFF.md`
+- Branch: main @ 225c68b
 - Status: [TODO: 进行中 / 等待决策 / …]
 
 任何 agent 开始工作前，先读上面的 HANDOFF.md。这份指针由 orbital_handoff 维护，手工交接时请同步更新。
