@@ -3232,7 +3232,10 @@ class Chains:
             if "updated" not in seen:
                 seen.update(updated=updated, armed=None)        # first sight: a baseline, nothing to pass on
             elif seen["updated"] != updated:
-                seen.update(updated=updated, armed=updated)     # the record grew: a turn is under way
+                # any stamp change — forward or back (a tool rebuilding its store, clock skew) —
+                # is a record this computer has not passed on yet: arm for it. It fires once, and
+                # only a further change can arm it again, so a back-dated stamp cannot repeat one.
+                seen.update(updated=updated, armed=updated)
             elif seen["armed"] is not None and updated and now - updated / 1000.0 >= CHAIN_QUIET:
                 seen["armed"] = None                            # quiet after growing: the turn is over
                 yield item, source
