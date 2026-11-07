@@ -1,0 +1,62 @@
+# Builds the main-line APK for installing on a phone. The official Windows
+# build stays android/build.ps1; this is the Linux twin for CI, signed with
+# the same repository key as the android6 personal build so a test phone can
+# be re-flashed without changing identity. No release, no publishing: the APK
+# only lands in the run's artifacts.
+name: Android app build (main)
+
+on:
+  push:
+    branches: [main]
+    paths: ["android/**", ".github/workflows/android-apk.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install the SDK pieces the runner may miss
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;36.0.0" "platforms;android-36" >/dev/null
+      - name: Build and sign the main APK
+        env:
+          ANDROID6_KEYSTORE_B64: ${{ secrets.ANDROID6_KEYSTORE_B64 }}
+          ANDROID6_KEY_PASSWORD: ${{ secrets.ANDROID6_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          tools="$ANDROID_HOME/build-tools/36.0.0"
+          jar="$ANDROID_HOME/platforms/android-36/android.jar"
+          java_bin="${JAVA_HOME:+$JAVA_HOME/bin/}java"
+          build="$(mktemp -d)"
+          mkdir -p "$build/classes" "$build/generated" "$build/dex" .cache dist
+          zxing=".cache/zxing-core-3.5.3.jar"
+          curl -fsSL --retry 2 -o "$zxing" 'https://repo1.maven.org/maven2/com/google/zxing/core/3.5.3/core-3.5.3.jar'
+          echo '8d8064c1636fdaef7189dd9055c7d59950a8940a12f2293956446ec3c109fd82  '"$zxing" | sha256sum -c - >/dev/null
+          (cd android && "$tools/aapt2" compile --dir res -o "$build/resources.zip")
+          (cd android && "$tools/aapt2" link -o "$build/unsigned.apk" -I "$jar" --manifest AndroidManifest.xml --java "$build/generated" "$build/resources.zip")
+          mapfile -t sources < <(find android/src "$build/generated" -name '*.java')
+          javac -J-Duser.language=en -Xlint:-options --release 8 -encoding UTF-8 -classpath "$jar:$zxing" -d "$build/classes" "${sources[@]}"
+          jar cf "$build/classes.jar" -C "$build/classes" .
+          "$java_bin" -cp "$tools/lib/d8.jar" com.android.tools.r8.D8 --lib "$jar" --min-api 26 --output "$build/dex" "$build/classes.jar" "$zxing"
+          (cd "$build/dex" && zip -q -j "$build/unsigned.apk" classes.dex)
+          printf '%s' "$ANDROID6_KEYSTORE_B64" | base64 -d > "$build/signing.p12"
+          export REMOTECLI_SIGN_PASSWORD="$ANDROID6_KEY_PASSWORD"
+          "$tools/zipalign" -f -p 4 "$build/unsigned.apk" "$build/aligned.apk"
+          "$java_bin" -jar "$tools/lib/apksigner.jar" sign --ks "$build/signing.p12" --ks-key-alias remotecli \
+            --ks-pass env:REMOTECLI_SIGN_PASSWORD --out dist/RemoteCli-Android-main.apk "$build/aligned.apk"
+          "$java_bin" -jar "$tools/lib/apksigner.jar" verify dist/RemoteCli-Android-main.apk
+          "$tools/zipalign" -c 4 dist/RemoteCli-Android-main.apk
+          grep -o 'android:versionName="[^"]*"' android/AndroidManifest.xml | head -1
+          ls -l dist/RemoteCli-Android-main.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RemoteCli-Android-main
+          path: dist/RemoteCli-Android-main.apk
+          if-no-files-found: error
