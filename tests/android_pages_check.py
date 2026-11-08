@@ -1,5 +1,6 @@
 """Check the APK's UI bundle and native URL resolver against public-relay and direct routes."""
 import argparse
+import os
 import subprocess
 import tempfile
 import zipfile
@@ -27,10 +28,14 @@ def main():
             assert entries[name] == 'image/png', name
     manifest_path = out / 'web-assets.properties'
     manifest_path.write_text(manifest, encoding='utf-8')
+    # The Windows build machine uses .exe; CI runs Linux. Name the JDK tools for the host.
+    suffix = '.exe' if os.name == 'nt' else ''
+    javac = Path(args.jdk) / ('bin/javac' + suffix)
+    java = Path(args.jdk) / ('bin/java' + suffix)
     with tempfile.TemporaryDirectory(prefix='java-', dir=out) as classes:
-        subprocess.run([str(Path(args.jdk) / 'bin/javac.exe'), '-J-Duser.language=en', '-Xlint:-options', '--release', '8', '-encoding', 'UTF-8', '-d', classes,
+        subprocess.run([str(javac), '-J-Duser.language=en', '-Xlint:-options', '--release', '8', '-encoding', 'UTF-8', '-d', classes,
                         str(root / 'android/src/io/github/kangwang42/remotecli/PageAssets.java'), str(root / 'tests/PageAssetsCheck.java')], check=True)
-        subprocess.run([str(Path(args.jdk) / 'bin/java.exe'), '-cp', classes, 'io.github.kangwang42.remotecli.PageAssetsCheck', str(manifest_path)], check=True)
+        subprocess.run([str(java), '-cp', classes, 'io.github.kangwang42.remotecli.PageAssetsCheck', str(manifest_path)], check=True)
     print('APK page sources match the workspace; theme modules, fonts, viewers and license are included.')
 
 if __name__ == '__main__':

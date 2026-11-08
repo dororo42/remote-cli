@@ -3,9 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
-    paths: ["relay/**", "agent-linux/**", "agent-rust/**", "android/**", "tools/**", "tests/tunnel_download_check.py", "tests/claude_permissions_cases.json", "tests/workbench_ui_check.py", "tests/android_update_check.py", "tests/android_aggregate_check.py", ".github/workflows/ci.yml"]
+    paths: ["relay/**", "agent-linux/**", "agent-rust/**", "android/**", "web/**", "tools/**", "tests/tunnel_download_check.py", "tests/claude_permissions_cases.json", "tests/workbench_ui_check.py", "tests/android_update_check.py", "tests/android_aggregate_check.py", "tests/android_pages_check.py", "tests/test_page_assets.py", ".github/workflows/ci.yml"]
   pull_request:
-    paths: ["relay/**", "agent-linux/**", "agent-rust/**", "android/**", "tools/**", "tests/tunnel_download_check.py", "tests/claude_permissions_cases.json", "tests/workbench_ui_check.py", "tests/android_update_check.py", "tests/android_aggregate_check.py", ".github/workflows/ci.yml"]
+    paths: ["relay/**", "agent-linux/**", "agent-rust/**", "android/**", "web/**", "tools/**", "tests/tunnel_download_check.py", "tests/claude_permissions_cases.json", "tests/workbench_ui_check.py", "tests/android_update_check.py", "tests/android_aggregate_check.py", "tests/android_pages_check.py", "tests/test_page_assets.py", ".github/workflows/ci.yml"]
   workflow_dispatch:
 
 jobs:
@@ -23,6 +23,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: relay unit tests
         run: python -m unittest discover -s relay -p "test_*.py"
+      - name: embedded page bundle unit tests
+        run: python -m unittest discover -s tests -p "test_*.py"
       - name: tunnel download integrity
         run: python tests/tunnel_download_check.py
       - name: build the Rust agent

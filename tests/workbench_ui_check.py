@@ -44,3 +44,7 @@ assert "dp(44)" not in kit and "COMPLEX_UNIT_DIP, .7f * root()" not in tabs, \
 print("Android UI guards passed: one WebView, inline retry, state restore, 48dp and SP text")
 assert (ROOT / "android/res/mipmap/ic_launcher.xml").is_file(), \
     "the launcher icon needs a default configuration, not only mipmap-anydpi-v26"
+apk_workflow = (ROOT / ".github/workflows/android-apk.yml").read_text(encoding="utf-8")
+assert "tools/page_assets.py" in apk_workflow and "android_pages_check.py" in apk_workflow, \
+    "the APK must bundle the embedded pages and verify the manifest, or it crashes on a terminal page"
+print("APK workflow guards passed: embedded pages bundled and verified")

@@ -8,7 +8,7 @@ name: Android app build (main)
 on:
   push:
     branches: [main]
-    paths: ["android/**", ".github/workflows/android-apk.yml"]
+    paths: ["android/**", "web/**", "tools/page_assets.py", "tests/android_pages_check.py", "tests/test_page_assets.py", ".github/workflows/android-apk.yml"]
   workflow_dispatch:
 
 permissions:
@@ -46,6 +46,11 @@ jobs:
           jar cf "$build/classes.jar" -C "$build/classes" .
           "$java_bin" -cp "$tools/lib/d8.jar" com.android.tools.r8.D8 --lib "$jar" --min-api 26 --output "$build/dex" "$build/classes.jar" "$zxing"
           (cd "$build/dex" && zip -q -j "$build/unsigned.apk" classes.dex)
+          # Since 1.7.4 the app serves its own copy of the web UI. Without this
+          # manifest and the files, EmbeddedPages throws "应用页面清单缺失" on
+          # the first terminal page. Same bundle as android/build.ps1 produces.
+          python3 tools/page_assets.py web "$build/payload/assets"
+          (cd "$build/payload" && zip -q -r "$build/unsigned.apk" assets)
           printf '%s' "$ANDROID6_KEYSTORE_B64" | base64 -d > "$build/signing.p12"
           export REMOTECLI_SIGN_PASSWORD="$ANDROID6_KEY_PASSWORD"
           "$tools/zipalign" -f -p 4 "$build/unsigned.apk" "$build/aligned.apk"
@@ -53,6 +58,7 @@ jobs:
             --ks-pass env:REMOTECLI_SIGN_PASSWORD --out dist/RemoteCli-Android-main.apk "$build/aligned.apk"
           "$java_bin" -jar "$tools/lib/apksigner.jar" verify dist/RemoteCli-Android-main.apk
           "$tools/zipalign" -c 4 dist/RemoteCli-Android-main.apk
+          python3 tests/android_pages_check.py --jdk "$JAVA_HOME" --apk dist/RemoteCli-Android-main.apk --output "$build/pages-check"
           grep -o 'android:versionName="[^"]*"' android/AndroidManifest.xml | head -1
           ls -l dist/RemoteCli-Android-main.apk
       - uses: actions/upload-artifact@v4
