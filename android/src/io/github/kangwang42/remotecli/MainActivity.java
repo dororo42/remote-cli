@@ -72,6 +72,7 @@ public final class MainActivity extends Activity {
             for (int i = 0; i < Kit.NAMES.length; i++) {
                 labels[i + extra] = Kit.TITLES[i];
                 notes[i + extra] = Kit.NAMES[i].equals(own ? terminal : app) ? "当前使用" : null;
+                if (Kit.NAMES[i].equals("pond")) notes[i + extra] = (notes[i + extra] == null ? "" : "当前使用 · ") + "对话和终端显示动态锦鲤，可暂停";
             }
             kit.sheet(own ? "终端外观" : "App 外观", own ? "只用于终端画面。" : "用于工作台和每台电脑的列表；终端跟随时也用它。", labels, notes, -1, picked -> {
                 if (own && picked == 0) prefs.edit().remove("look-termskin").apply();
@@ -576,7 +577,11 @@ public final class MainActivity extends Activity {
         bars(kit.BG);
         WebView view = ensureWeb();
         final String origin = address;
+        final EmbeddedPages pages = new EmbeddedPages(getAssets(), origin);
         view.setWebViewClient(new WebViewClient() {
+            @Override public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                return pages.intercept(request);
+            }
             @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 return !request.getUrl().toString().startsWith(origin + "/");       // the pages of this computer only
             }

@@ -20,12 +20,13 @@
   if (!sizes.includes(fontSize)) fontSize = 13;
   const term = new Terminal({ fontSize, fontFamily: FAMILY, cursorBlink: false, lineHeight: SPACING[spacing][1],
     // No per-row accessibility tree: on a phone it is rebuilt on every refresh and makes typing stutter.
-    scrollback: 5000, screenReaderMode: false, allowProposedApi: false, theme: SKINS[skin].t, ...window.RemoteCliLook });
+    scrollback: 5000, screenReaderMode: false, allowProposedApi: false, allowTransparency: skin === 'pond', theme: SKINS[skin].t, ...window.RemoteCliLook });
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(holder);
   // Drawing on the graphics card keeps a busy screen smooth; a phone that cannot do it falls back to plain elements.
   let drawing = 'dom';
+  let resetThemeScroll = null;
   if (window.WebglAddon && !(bridge && bridge.renderer() === 'dom')) {
     try {
       const gl = new WebglAddon.WebglAddon();
@@ -37,8 +38,12 @@
   function applySkin(name) {
     if (!SKINS[name]) return;
     skin = name;
+    if (resetThemeScroll) resetThemeScroll();
     const s = window.RemoteCliPaint(name);
-    term.options.theme = s.t;
+    term.options.allowTransparency = name === 'pond';
+    // xterm halves this threshold for SGR dim text; keep that text readable on light surfaces too.
+    term.options.minimumContrastRatio = s.light ? 9 : 4.5;
+    term.options.theme = name === 'pond' ? { ...s.t, background: '#10191b66' } : s.t;
     if (bridge) bridge.chrome(s.t.background);
   }
   applySkin(skin);
@@ -134,8 +139,12 @@
   // That row is no row of the conversation any more: the rows above it are shown a row lower, over it (TerminalSlide,
   // `hole`), so that nothing stands between the conversation and the program's message box. Where there is no strip
   // to show them from, the row is covered instead.
-  let offered = '', hole = -1, pinAfter = 0;
+  let offered = '', hole = -1, pinAfter = 0, followFrame = 0;
   function follow() {
+    if (!followFrame) followFrame = requestAnimationFrame(updateFollow);
+  }
+  function updateFollow() {
+    followFrame = 0;
     const buffer = term.buffer.active, row = scrollRouter.offered(), now = row + ' ' + term.rows;
     hole = row;
     if (now !== offered) {
@@ -152,7 +161,6 @@
   }
   function covered() { const hidden = hole < 0 || strip.shown; if (offer.hidden !== hidden) offer.hidden = hidden; }
   term.onScroll(follow);
-  term.onRender(follow);
   const scrollRouter = new TerminalScrollRouter(term, send, () => tool);
   latest.addEventListener('click', () => {
     scroller.stop(); unslide();
@@ -167,7 +175,15 @@
   const over = document.createElement('div');
   over.id = 'slid'; over.hidden = true;
   holder.querySelector('.xterm-screen').appendChild(over);
-  const strip = new TerminalStrip(over, TerminalSlide.KEPT, () => (term.options.theme && term.options.theme.background) || '#000');
+  // An opaque surface under the moving rows hides the original text even when the live terminal is translucent.
+  const strip = new TerminalStrip(over, TerminalSlide.KEPT, () => SKINS[skin].t.background);
+  // A paint notification is not necessarily new content. Reuse the last copied pixels until data,
+  // selection or viewport changes; ANSI-only writes still invalidate through the parser event.
+  let pictureRevision = 0;
+  term.onWriteParsed(() => { pictureRevision++; });
+  term.onSelectionChange(() => { pictureRevision++; });
+  window.addEventListener('focus', () => { pictureRevision++; });
+  window.addEventListener('blur', () => { pictureRevision++; });
   // the picture the terminal draws on the graphics card; drawn as plain elements, it has none to copy from
   const picture = () => drawing === 'webgl' ? holder.querySelector('.xterm-screen > canvas:not(.xterm-link-layer)') : null;
   let slideFrame = 0;
@@ -181,7 +197,10 @@
       return rows;
     },
     draw() { if (!picture()) return false; term.refresh(0, term.rows - 1); return true; },
-    keep(row, place, rows) { const source = picture(); return !!source && strip.keep(source, term.rows, row, place, rows); },
+    keep(row, place, rows) {
+      const source = picture(), buffer = term.buffer.active;
+      return !!source && strip.keep(source, term.rows, row, place, rows, `${pictureRevision}:${buffer.type}:${buffer.viewportY}`);
+    },
     show(place, top, bottom, first, last) { if (place === null) strip.hide(); else strip.show(place, top, bottom, first, last); covered(); },
     hole: () => hole,
     nudge: rows => scroller.nudge(rows)
@@ -190,7 +209,12 @@
   function sliding(at) { slideFrame = slide.frame(at, resting()) ? requestAnimationFrame(sliding) : 0; }
   // (a hole that is still there has the picture shown over it again at the next frame)
   function unslide() { if (slideFrame) cancelAnimationFrame(slideFrame); slideFrame = 0; slide.cancel(); pinAfter = 0; requestAnimationFrame(follow); }
-  term.onRender(() => slide.drawn());
+  term.onRender(() => {
+    // The strip must see the current offer row before copying the newly drawn text.
+    if (followFrame) cancelAnimationFrame(followFrame);
+    updateFollow();
+    slide.drawn();
+  });
   // Touch movement scrolls local history or the program's fullscreen view, according to the active terminal mode.
   const scroller = new TerminalScroller({
     request: callback => requestAnimationFrame(callback), cancel: id => cancelAnimationFrame(id),
@@ -201,6 +225,7 @@
     owing: () => scrollRouter.owing(),
     slide: pixels => slide.moved(pixels),
     scroll(lines, mode) {
+      if (skin === 'pond') document.dispatchEvent(new Event('rcli-terminal-motion'));
       const moved = scrollRouter.scroll(lines, mode);
       slide.ask(scrollRouter.asked, performance.now());
       follow(); return moved;
@@ -617,6 +642,7 @@
     terminal: term,
     slide, strip          // for the checks
   };
+  resetThemeScroll = () => { scroller.stop(); unslide(); slide.forget(); strip.forget(); };
   grow();
   layout();
   if (bridge) bridge.ready();
