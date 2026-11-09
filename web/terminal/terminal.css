@@ -34,6 +34,8 @@ button:disabled { opacity: .45; cursor: default; }
 /* The terminal's own layers are ordered among themselves only (isolation): the layer for links has a z-index, and
    would otherwise lie over what is laid over the terminal here, and take the taps meant for "回到最新". */
 #terminal { position: absolute; left: 0; right: 0; bottom: 0; padding: 0 10px; isolation: isolate; }
+/* DOM rows are replaced while scrolling. Keep a touch anchored to the stable screen instead of a removed span. */
+@media (pointer: coarse) { .xterm-rows { pointer-events: none; } }
 /* While a finger scrolls, the rows that move are shown here, over the terminal's picture (terminal-strip.js): a canvas
    that is moved by a transform, which costs a frame no painting, and is shown pixel for pixel, never smoothed, so
    its text stays sharp wherever it is moved to. Above the terminal's layer for links. */
@@ -124,3 +126,17 @@ header .who #status { grid-column: 1 / -1; }
   .keys, #composer { display: none; }
   #screen { padding-bottom: 8px; }
 }
+
+/* 自定义按键：条上追加的按钮与编辑器面板。 */
+#custom-keys { display: contents; }
+.keys button.custom { border: 1px dashed var(--line); user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; touch-action: manipulation; }
+/* 钉在滚动条右缘：条内静态键已超出一屏，滚动条又不可见，「＋」不钉住就无从发现。 */
+#key-add { position: sticky; right: 0; min-width: 34px; color: var(--muted); font-size: 15px; background: var(--bg); box-shadow: -10px 0 8px -8px var(--bg); }
+#key-editor { display: grid; gap: 6px; padding: 8px 10px 10px; background: var(--panel); border-top: 1px solid var(--line); }
+#key-editor[hidden] { display: none; }
+.key-row { display: flex; gap: 6px; align-items: center; }
+.key-row button { background: var(--raised); color: var(--ink); border: 0; border-radius: 8px; padding: 7px 12px; font-size: 12.5px; white-space: nowrap; }
+.key-row button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
+.key-row input, .key-row select { flex: 1; min-width: 0; background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; font-size: 13px; }
+.key-enter { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+#key-error { color: #f7768e; font-size: 12px; }
