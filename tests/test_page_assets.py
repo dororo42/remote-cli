@@ -37,6 +37,18 @@ class EmbeddedPages(unittest.TestCase):
             with self.assertRaises(ValueError):
                 page_assets.page_assets(web, Path(folder) / "assets")
 
+    def test_a_second_build_does_not_keep_files_the_workspace_dropped(self):
+        with tempfile.TemporaryDirectory() as folder:
+            web = Path(folder) / "web"
+            web.mkdir()
+            (web / "index.html").write_text("<p>hello", encoding="utf-8")
+            (web / "gone.js").write_text("x", encoding="utf-8")
+            assets = Path(folder) / "assets"
+            page_assets.page_assets(web, assets)
+            (web / "gone.js").unlink()
+            page_assets.page_assets(web, assets)
+            self.assertFalse((assets / "web" / "gone.js").exists(), "a stale asset must not survive a rebuild")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,6 +28,8 @@ def page_assets(web: Path, assets: Path) -> int:
     Returns the number of manifest entries. Every file is bundled, as the
     Windows build does; only the extensions PageAssets can serve are listed."""
     target = assets / "web"
+    if target.exists():
+        shutil.rmtree(target)          # a rebuild must not keep files the workspace has dropped
     target.mkdir(parents=True, exist_ok=True)
     entries = []
     for path in sorted(web.rglob("*")):
