@@ -3,9 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
-    paths: ["relay/**", "agent-linux/**", "agent-rust/**", "android/**", "web/**", "tools/**", "tests/tunnel_download_check.py", "tests/claude_permissions_cases.json", "tests/workbench_ui_check.py", "tests/android_update_check.py", "tests/android_aggregate_check.py", "tests/android_pages_check.py", "tests/test_page_assets.py", "tests/terminal_keys_check.py", ".github/workflows/ci.yml"]
+    paths: ["relay/**", "agent-linux/**", "agent-rust/**", "android/**", "web/**", "tools/**", "tests/tunnel_download_check.py", "tests/claude_permissions_cases.json", "tests/workbench_ui_check.py", "tests/android_update_check.py", "tests/android_aggregate_check.py", "tests/android_pages_check.py", "tests/test_page_assets.py", "tests/terminal_keys_check.py", "tests/terminal_keys_behaviour_check.js", ".github/workflows/ci.yml"]
   pull_request:
-    paths: ["relay/**", "agent-linux/**", "agent-rust/**", "android/**", "web/**", "tools/**", "tests/tunnel_download_check.py", "tests/claude_permissions_cases.json", "tests/workbench_ui_check.py", "tests/android_update_check.py", "tests/android_aggregate_check.py", "tests/android_pages_check.py", "tests/test_page_assets.py", "tests/terminal_keys_check.py", ".github/workflows/ci.yml"]
+    paths: ["relay/**", "agent-linux/**", "agent-rust/**", "android/**", "web/**", "tools/**", "tests/tunnel_download_check.py", "tests/claude_permissions_cases.json", "tests/workbench_ui_check.py", "tests/android_update_check.py", "tests/android_aggregate_check.py", "tests/android_pages_check.py", "tests/test_page_assets.py", "tests/terminal_keys_check.py", "tests/terminal_keys_behaviour_check.js", ".github/workflows/ci.yml"]
   workflow_dispatch:
 
 jobs:
