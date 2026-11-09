@@ -48,3 +48,8 @@ apk_workflow = (ROOT / ".github/workflows/android-apk.yml").read_text(encoding="
 assert "tools/page_assets.py" in apk_workflow and "android_pages_check.py" in apk_workflow, \
     "the APK must bundle the embedded pages and verify the manifest, or it crashes on a terminal page"
 print("APK workflow guards passed: embedded pages bundled and verified")
+assert "catch (IllegalStateException" in activity, \
+    "a missing page bundle must answer with a message, not crash the app"
+assert 'if (web == null || !"web".equals(screen)) return; bars(shade);' in activity, \
+    "a detached page's late chrome() must not recolour the app's own bars"
+print("Shell robustness guards passed: missing bundle degrades, late chrome is screened")
