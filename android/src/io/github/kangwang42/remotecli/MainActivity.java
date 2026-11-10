@@ -746,7 +746,7 @@ public final class MainActivity extends Activity {
         @JavascriptInterface public void chrome(String color) {
             if (color == null || !color.matches("#[0-9a-fA-F]{6}")) return;
             final int shade = Color.parseColor(color);
-            runOnUiThread(() -> { if (web == null) return; bars(shade); web.setBackgroundColor(shade); });
+            runOnUiThread(() -> { if (web == null || !"web".equals(screen)) return; bars(shade); web.setBackgroundColor(shade); });
         }
         /** Looks for a newer version of the app now; the answer comes as a short notice or a question. */
         @JavascriptInterface public boolean autoUpdate() { return updater != null && updater.automatic(); }
