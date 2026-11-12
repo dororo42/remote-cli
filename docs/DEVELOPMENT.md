@@ -12,6 +12,10 @@ Android 构建同时把 `web/` 打进 APK，`EmbeddedPages` 按 `PageAssets` 解
 
 给想读代码、自己构建或参与修改的人。
 
+Linux 终端和对话模式都在报告锁外执行延迟清理；进程身份使用 `/proc/<pid>/stat` 的第 22 项 `starttime`，不使用会变化的内存大小。`agent-linux/test_agent.py` 覆盖对话对象初始化、清理请求只取一次、PID 复用和进程内存变化。
+
+Android 复用 WebView，但每次打开或重试页面都建立新的 `ConnectionHealth`；离开页面后旧对象失效，延迟返回的网络检查和错误回调不能中断新页面。`tests/android_aggregate_check.py` 运行连接生命周期等 Java 检查，`tests/workbench_ui_check.py` 检查 Activity 中的调用连接。CI 的 Python 3.9、3.11、3.13 测试固定使用 Ubuntu 22.04，避免运行器升级后旧版 Python 无法安装。
+
 ## 组成
 
 ```
@@ -45,6 +49,8 @@ powershell -ExecutionPolicy Bypass -File android\build.ps1 -Jdk <JDK 目录> -Sd
 
 安卓构建默认要求已有签名密钥；用 `-SecretDir <密钥目录>` 指定包含 `signing.p12` 和 `signing-password.txt` 的目录。只有首次创建独立应用签名时才传 `-CreateSigningKey`，默认目录为仓库之外的 `~/.remote-cli-signing`。正式发版必须与上一版 APK 比对证书，不能用新密钥替代已有发布密钥。
 
+CI 的 `Windows session behavior` 作业在 Windows 上编译并运行会话归属、活动状态、操作能力和历史去重测试；Android 的界面源文件检查不依赖 Windows 实现中的具体调用文本。
+
 ```powershell
 # 测试
 python -m unittest discover -s relay -p "test_*.py"
@@ -59,6 +65,7 @@ python tests\android_aggregate_check.py --jdk <JDK 目录>  # 工作台的分组
 python tests\workbench_ui_check.py                         # 工作台默认折叠、最近两条和标题可读性
 python tests\android_update_check.py                      # App 更新器关闭安装流的顺序
 python tests\native_owner_check.py                        # 临时进程验证归属，不操作真实 Codex 会话
+python tests\claude_owners_check.py                       # 同一 Claude 对话多进程：编辑器忙碌状态、手机终端并存、进程退出和单进程回归；使用隔离记录和临时进程
 python tests\relay_check.py                               # 电脑端对自有中转的判断：密码对、密码错、地址不是中转、端口不通
 python tests\in_use_check.py                              # 把手机消息送进闲置对话：交给 Claude Code 转达会话的内容，是否送达按它的工具的回答判断（只说不做的会话要重来），只唤醒对话的消息不带用户的话，交给 Codex 程序的参数原样不变；文件夹由什么在用（终端、桌面版、编辑器；按对话文件里的记载或占着它的程序判断，桌面版没开时可以不列只有它用过的）；电脑上哪些对话算“正在使用”（在执行或等确认、命令行窗口、最近十分钟用过；桌面应用占着但闲置的不算），以及找到新版本后怎么处理（手机发起的直接装，窗口里点按钮当场询问；程序自己只在“自动检查更新”打开时才检查，查到只提示、不安装）；删除对话时文件整个移走而不销毁；窗口里添加的项目由窗口改名和移除
 python tests\marks_check.py                               # 对话的置顶和隐藏标记：按工具和对话记在电脑端数据目录里，重启后仍在，文件损坏时不影响使用，数量超限时最早的让位

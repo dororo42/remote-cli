@@ -7,7 +7,6 @@ kit = (ROOT / "android/src/io/github/kangwang42/remotecli/Kit.java").read_text(e
 web = (ROOT / "web/app.js").read_text(encoding="utf-8")
 index_html = (ROOT / "web/index.html").read_text(encoding="utf-8")
 css = (ROOT / "web/app.css").read_text(encoding="utf-8")
-agent = (ROOT / "agent-windows/RemoteCliAgent.cs").read_text(encoding="utf-8")
 activity = (ROOT / "android/src/io/github/kangwang42/remotecli/MainActivity.java").read_text(encoding="utf-8")
 app_pages = (ROOT / "android/src/io/github/kangwang42/remotecli/AppPages.java").read_text(encoding="utf-8")
 
@@ -19,8 +18,6 @@ assert "shown = 2" in web and "projectFolds = { active: false, live: false, hist
 assert 'id="p-ended"' in index_html and 'data-fold="ended"' in index_html and 'aria-expanded="false"' in index_html, "历史终端 folds away like 历史对话"
 assert "applyProjectFold('ended')" in web, "the ended fold is applied when the project page is drawn"
 assert ".section-head[data-fold].folded ~ :not(#hidden-history) { display: none; }" in css and "child.hidden = !open" not in web, "folding hides a section's body by style and leaves what draw() shows, the more buttons too, to draw()"
-# one rule for both tools says which of the conversations a program holds are in use now (tests/in_use_check.py checks the rule itself)
-assert "public static bool InUse(" in agent and "held.Now = InUse(held.Host, held.Origin, held.Status, Reach.Of(held.Tool, held.Id)" in agent, "Claude Code and Codex must share the rule for what is in use"
 print("Workbench UI checks passed: compact sections, two recent conversations, and two-line titles")
 assert 'if (list.length() == 1) open(' not in activity, "a single computer must not bypass the app workbench"
 assert 'shell.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1))' in activity, "app navigation must stay outside the scrolling content"
@@ -47,9 +44,14 @@ assert (ROOT / "android/res/mipmap/ic_launcher.xml").is_file(), \
 apk_workflow = (ROOT / ".github/workflows/android-apk.yml").read_text(encoding="utf-8")
 assert "tools/page_assets.py" in apk_workflow and "android_pages_check.py" in apk_workflow, \
     "the APK must bundle the embedded pages and verify the manifest, or it crashes on a terminal page"
-print("APK workflow guards passed: embedded pages bundled and verified")
+assert "reconnect(view, origin, health)" in activity and "reconnect(checked, origin, health)" in activity, \
+    "WebView errors and asynchronous checks must retain their own page's health state"
+assert 'if (!health.isActive() || web != failed || !"web".equals(screen)) return;' in activity, \
+    "a queued reconnect from a retired page cannot stop the current page"
+assert "again.setOnClickListener(v -> openPage(address, password, path))" in activity, \
+    "retry must restart connection monitoring as well as reload the page"
 assert "catch (IllegalStateException" in activity, \
     "a missing page bundle must answer with a message, not crash the app"
 assert 'if (web == null || !"web".equals(screen)) return; bars(shade);' in activity, \
     "a detached page's late chrome() must not recolour the app's own bars"
-print("Shell robustness guards passed: missing bundle degrades, late chrome is screened")
+print("Shell robustness guards passed: page health retained, missing bundle degrades, late chrome is screened")
