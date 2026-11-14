@@ -456,26 +456,40 @@
       // with a receipt that can be asked for again), or through its tool's hooks (before its next step). Where it
       // has neither, it can still be ended, if the computer can close its program: asked first, with the reason.
       let stopAttempt = null;
+      const stopNote = el('p', { className: 'stop-note', role: 'status', hidden: true });
+      const stopSays = text => { stopNote.textContent = text; stopNote.hidden = !text; };
       const stopping = el('button', { type: 'button', className: 'end halt', textContent: '停止回答', hidden: true, onclick: async () => {
-        if (stopping.disabled || !usable()) return;
-        const current = now(), way = stopAttempt ? APP : wayOf(current, 'stop');
-        if (!way) {
-          const why = whyNot(current, 'stop', '这段对话现在不能从手机停止');
-          if (!canEnd(current)) return toast(why);
-          if (await confirmEnd(current, true, why + '。')) endIt(current);
-          return;
-        }
-        if (way === APP && !stopAttempt && !current.turn) return;
-        const query = !!stopAttempt;
-        if (way === APP && !stopAttempt) stopAttempt = { id: newId(), session: current.id, action: 'stop', turn: current.turn, transport: APP };
+        if (stopping.disabled) return;
+        if (!usable()) { stopSays('电脑离线，停止请求尚未发送'); return; }
         stopping.disabled = true;
+        stopping.textContent = stopAttempt ? '正在查询…' : '正在停止…';
+        stopSays(stopAttempt ? '正在查询上次停止请求的结果…' : '正在请求停止回答…');
         try {
+          let current = now(), way = stopAttempt ? APP : wayOf(current, 'stop');
+          // A just-started turn may not yet be present in the overview. Refresh before deciding it cannot stop.
+          if (!stopAttempt && (!way || (way === APP && !current.turn))) {
+            await refresh();
+            current = now(); way = wayOf(current, 'stop');
+          }
+          if (!way) {
+            const why = whyNot(current, 'stop', '这段对话现在不能从手机停止，请在电脑上停止');
+            stopSays(why);
+            return;
+          }
+          if (way === APP && !stopAttempt && !current.turn) {
+            stopSays('尚未取得当前执行轮次，停止请求未发送。请稍后重试，或在电脑上停止');
+            return;
+          }
+          const query = !!stopAttempt;
+          if (way === APP && !stopAttempt) stopAttempt = { id: newId(), session: current.id, action: 'stop', turn: current.turn, transport: APP };
           const result = await api('api/conversation', way === APP ? { ...stopAttempt, receipt: query } : { id: newId(), session: current.id, action: 'stop', transport: way });
-          if (result.status === 'confirmed') { toast(result.goal_pause_error ? '本次回答已停止，但目标未暂停，请在电脑上检查' : '已停止本次回答，可以继续对话'); stopAttempt = null; }
-          else if (result.status === 'asked') toast('已告诉它停止：它会在下一步之前停下');
-          else toast('停止结果未知，请检查电脑上的原对话');
-        } catch (error) { toast(error.message); }
-        stopping.disabled = false; stopping.textContent = stopAttempt ? '查询停止结果' : '停止回答'; refresh(); show();
+          if (result.status === 'confirmed') { stopSays(result.goal_pause_error ? '本次回答已停止，但目标未暂停，请在电脑上检查' : '已停止本次回答，可以继续对话'); stopAttempt = null; }
+          else if (result.status === 'asked') stopSays('已请求停止，将在下一次工具操作前停下；当前输出可能仍会继续');
+          else stopSays('停止结果尚未确认，请查询停止结果或检查电脑上的原对话');
+        } catch (error) { stopSays('停止结果未确认：' + error.message); }
+        finally {
+          stopping.disabled = false; stopping.textContent = stopAttempt ? '查询停止结果' : '停止回答'; refresh(); show();
+        }
       } });
       // How it stands, in one line above the box, as a terminal says it at its foot: at work and for how long, asking,
       // waiting for what its user says, or stopped and since when. Beside it, the way to end it on the computer.
@@ -552,11 +566,13 @@
       // such word; it is asked when the lists say that the conversation changed.)
       const syncNote = el('p', { className: 'quiet sync-note', role: 'status', hidden: true });
       state.before(syncNote);
+      state.after(stopNote);
       const stateKey = current => JSON.stringify([current.updated, current.status, current.last, current.turn]);
       let stamp = '', seen = '', read = false, reading = false, sending = false, stands = null, standsAt = '', readError = '', quick = 0, asked = 0, changed = 0, sawBusy = 0;
       const pendingScope = pendingKey(session);
       const pending = desktopPending.get(pendingScope) || loadDesktopPending(pendingScope, session);
       desktopPending.set(pendingScope, pending);
+      const recordedIds = new Set();
       const savePending = () => saveDesktopPending(pendingScope, pending);
       const same = (messages, text) => messages.filter(m => m.role === 'user' && String(m.text || '').trim() === text).length;
       let record = [];
@@ -581,7 +597,18 @@
       const QUEUED = { queued: '排队中 · 它做完手头这一步后收到', sending: '正在送达 · 等待电脑确认', paused: '已暂停 · 请确认对话和发送情况后继续' };
       function waiting() {
         said.querySelectorAll('.turn.mine, .held').forEach(node => node.remove());
-        const kept = now().queued || [], shownIds = new Set();
+        // Reconcile on every delivery update, including when the transcript stamp stays unchanged.
+        // Occurrence counts keep repeated, identical prompts separate from earlier turns.
+        let removed = false;
+        for (let i = pending.length - 1; i >= 0; i--) {
+          if (same(record, pending[i].text) > pending[i].before) {
+            recordedIds.add(pending[i].payload.id);
+            pending.splice(i, 1); removed = true;
+          }
+        }
+        if (removed) savePending();
+        // The overview's queue can lag behind the transcript; do not resurrect an echoed message.
+        const kept = (now().queued || []).filter(item => !recordedIds.has(item.id)), shownIds = new Set();
         const line = (text, id, label, going) => {
           const state = kept.find(item => item.id === id);
           const row = el('div', { className: 'turn user mine' + (going ? ' going' : '') }, el('div', { className: 'plain', textContent: text }),
@@ -612,7 +639,7 @@
         try {
           const result = await api('api/conversation', receipt ? { ...mine.payload, receipt: query } : mine.payload);
           mine.uncertain = result.status !== 'accepted' || result.sent !== true; mine.sent = !mine.uncertain;
-          mine.settledAt = Date.now(); mine.delivery = deliveryText(result); savePending();
+          mine.delivery = deliveryText(result); savePending();
           return true;
         } catch (error) {
           toast(error.message);
@@ -633,12 +660,6 @@
             record = got.messages || [];
             if (typeof got.asked === 'number') asked = got.asked;
             if (typeof got.updated === 'number') changed = got.updated;
-            // A different message typed at the computer is not an acknowledgement of a phone message.
-            // Leave a confirmed phone turn visible briefly so its delivery state is readable before the transcript
-            // replaces the optimistic row. A subsequent poll removes it once the persisted record is stable.
-            let removed = false;
-            for (let i = pending.length - 1; i >= 0; i--) if (!pending[i].uncertain && same(record, pending[i].text) > pending[i].before && (!pending[i].settledAt || Date.now() - pending[i].settledAt > 1200)) { pending.splice(i, 1); removed = true; }
-            if (removed) savePending();
             const end = !read || atEnd(), was = said.scrollTop;
             const fresh = el('div');
             if (got.more) fresh.append(el('p', { className: 'earlier', textContent: '更早的内容在电脑上' }));
@@ -659,6 +680,7 @@
         const text = box.value.trim();
         if (send.disabled || !usable() || !can(now(), 'say') || now().ask) return;
         if (!text) return box.focus();
+        stopSays('');
         // what is written stands in the window at once, as what the user said, while it is on its way
         const mine = { text, before: same(record, text) + pending.filter(p => p.text === text).length, sent: false, createdAt: Date.now(), payload: { id: newId(), session: session.id, action: 'say', text } };
         if (wayOf(now(), 'say') === APP) mine.payload.transport = APP;
@@ -667,7 +689,7 @@
         waiting(); said.scrollTop = said.scrollHeight;
         sending = true; send.disabled = true; quick = Date.now() + 45000;
         // what was not sent goes back into the box, to be sent again or changed
-        if (!await deliver(mine)) { pending.splice(pending.indexOf(mine), 1); savePending(); phoneTexts.delete(text); if (!box.value) { box.value = text; box.dispatchEvent(new Event('input')); } }
+        if (!await deliver(mine)) { const index = pending.indexOf(mine); if (index >= 0) pending.splice(index, 1); savePending(); phoneTexts.delete(text); if (!box.value) { box.value = text; box.dispatchEvent(new Event('input')); } }
         sending = false; send.disabled = false; waiting(); refresh(); seen = ''; shown = ''; show();
       } });
       // a conversation that has stopped is most often told to go on: one press, beside what is typed
@@ -694,8 +716,12 @@
         standing.textContent = !current.live ? '已在电脑上关闭' : PHASE[kind][0];
         clock.textContent = !from ? '' : kind === 'busy' ? lasted(Date.now() - from) : ago(from);
         ending.hidden = !canEnd(current);
-        // while it works it can be told to stop, whatever its tool: the press says what happens where it cannot
-        stopping.hidden = !stopAttempt && kind !== 'busy' && !can(current, 'stop');
+        // A running CLI is not necessarily interruptible. Never present ending its process as stopping one turn.
+        const stoppable = !!wayOf(current, 'stop') && (wayOf(current, 'stop') !== APP || !!current.turn);
+        stopping.hidden = !stopAttempt && !stoppable;
+        if (kind === 'busy' && !stoppable && !stopAttempt && !stopping.disabled) {
+          stopSays(whyNot(current, 'stop', '当前对话不支持从手机单独中断本轮回答，请在电脑上停止'));
+        }
         goOn.hidden = !(can(current, 'say') && !current.ask && (kind === 'stopped' || kind === 'waiting') && record.length > 0);
         if (signature === shown) return;
         shown = signature;
@@ -711,7 +737,7 @@
         // what it is at (its application takes nothing meanwhile): the next thing can be written there already.
         const sayable = can(current, 'say') && !current.ask, later = !sayable && !current.ask && current.live && current.transport === APP;
         write.hidden = !sayable && !later;
-        send.disabled = sending || !sayable; box.placeholder = sayable ? '发消息' : '可以先写下一句，等待当前回答结束';
+        send.disabled = sending || !sayable; box.placeholder = sayable ? '发消息' : '先写草稿，稍后发送';
         below.textContent = '';
         // why nothing can be said to it now, where that is not said above already
         if (!sayable && !later && !current.ask && current.live && mode !== 'read' && whyNot(current, 'say', '')) below.append(el('p', { className: 'quiet', textContent: whyNot(current, 'say', '') }));
@@ -809,6 +835,7 @@
   const working = x => x.live && (x.phase === 'busy' || x.phase === 'starting');
   const byRank = (a, b) => a.rank - b.rank || b.at - a.at, byTime = (a, b) => b.at - a.at;
   const byOpen = (a, b) => (b.pinned - a.pinned) || byRank(a, b);
+  const byOpened = (a, b) => (b.pinned - a.pinned) || (Number(!!a.t) - Number(!!b.t)) || byTime(a, b);
   // by what it runs and where, in the words of the cards
   // Every card says it the same way: the tool, then where it runs. A terminal of the phone's; for a conversation
   // that a program has open, that program (a desktop app by its own name, which names the tool too; a command
@@ -1096,7 +1123,7 @@
         const listed = all.filter(x => !x.twice), needs = listed.filter(needsYou).sort(byOpen), rest = listed.filter(x => !needsYou(x));
         const pinned = rest.filter(x => x.pinned && !x.live).sort(byTime), free = rest.filter(x => !x.pinned || x.live);
         const active = free.filter(working).sort(byOpen);
-        const opened = free.filter(x => x.live && !working(x)).sort(byOpen);
+        const opened = free.filter(x => x.live && !working(x)).sort(byOpened);
         const recent = free.filter(x => !x.live && ((x.state === 'history' && !x.hidden) || x.state === 'ended')).sort(byTime);
         $('needs').hidden = !needs.length;
         show($('needs-list'), needs, tick);
@@ -1159,7 +1186,7 @@
     $('p-active').querySelector('p').textContent = own.length + ' 个';
     applyProjectFold('active');
     show($('p-active').querySelector('ul'), own, tick);
-    const here = inside.filter(x => !x.t), open2 = inside.filter(x => x.live && !working(x) && !needsYou(x)).sort(byOpen);
+    const here = inside.filter(x => !x.t), open2 = inside.filter(x => x.live && !working(x) && !needsYou(x)).sort(byOpened);
     $('p-live').hidden = !open2.length;
     $('p-live').querySelector('p').textContent = open2.length + ' 个';
     applyProjectFold('live');

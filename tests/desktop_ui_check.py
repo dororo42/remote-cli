@@ -33,6 +33,7 @@ def main():
         sessions = []
         native_requests = []
         lost_send = [True]
+        echo_send = [False]
         transcript = [{'role': 'user', 'text': '电脑上的第一句'}, {'role': 'assistant', 'text': '电脑回答，手机可以接着提问。'}]
 
         def report():
@@ -64,6 +65,8 @@ def main():
                 if self.path == '/api/conversation':
                     payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
                     if payload.get('action', 'read') == 'read':
+                        if payload.get('since') == str(len(transcript)):
+                            return self.reply({'same': True, 'status': sessions[0]['status'], 'stamp': str(len(transcript))})
                         return self.reply({'messages': transcript, 'status': sessions[0]['status'], 'stamp': str(len(transcript))})
                     native_requests.append(payload)
                     answers = {}
@@ -79,6 +82,9 @@ def main():
                     worker.join(6)
                     if 'error' in answers: return self.reply({'error': answers['error']}, 400)
                     if payload['action'] == 'say' and not payload.get('receipt'):
+                        if echo_send[0]:
+                            transcript.append({'role': 'user', 'text': payload['text']})
+                            sessions[0]['queued'] = [{'id': payload['id'], 'text': payload['text'], 'state': 'sending'}]
                         sessions[0].update(status='busy', reach=['stop'], turn='turn-1')
                         report()
                         if lost_send[0]:
@@ -221,9 +227,17 @@ def main():
             value("Array.from(document.querySelectorAll('#sheet .said button')).find(b=>b.textContent==='查询发送结果').click()")
             until("document.querySelector('#sheet .said').textContent.includes('工具已接收')")
             assert len(native_requests) == 2 and native_requests[0]['id'] == native_requests[1]['id'] and native_requests[1]['receipt'] is True, native_requests
-            value("Array.from(document.querySelectorAll('#sheet button')).find(b=>b.textContent==='停止回答').click()")
+            # Use pointer hit testing: HTMLElement.click() also activates covered controls.
+            ask('Emulation.setDeviceMetricsOverride', width=390, height=844, deviceScaleFactor=1, mobile=True)
+            value("window.RemoteCliPage.data.sessions[0].turn = ''")
+            stop_point = value("(() => { const b=document.querySelector('#sheet .halt'), r=b.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2; return {x,y,hit:b.contains(document.elementFromPoint(x,y)), disabled:b.disabled}; })()")
+            assert stop_point['hit'] and not stop_point['disabled'], stop_point
+            ask('Input.dispatchMouseEvent', type='mousePressed', x=stop_point['x'], y=stop_point['y'], button='left', clickCount=1)
+            ask('Input.dispatchMouseEvent', type='mouseReleased', x=stop_point['x'], y=stop_point['y'], button='left', clickCount=1)
             until("!document.querySelector('#sheet .write button.solid').disabled")
             assert native_requests[-1]['action'] == 'stop' and native_requests[-1]['turn'] == 'turn-1'
+            assert value("document.querySelector('#sheet .stop-note').textContent") == '已停止本次回答，可以继续对话'
+            assert value("document.querySelector('#sheet .stop-note').getClientRects().length > 0")
             assert value("document.querySelector('#sheet .write textarea').value") == '等回答结束后再问'
             assert value("document.querySelector('#sheet').open") is True
             transcript.append({'role': 'assistant', 'text': '电脑上继续回答后的新内容'})
@@ -247,6 +261,66 @@ def main():
             ask('Page.navigate', url='http://127.0.0.1:%d/?take=%s' % (port, sid))
             until("document.querySelector('#sheet .said')?.textContent.includes('电脑上的第一句')")
             assert not value("document.querySelector('#sheet .said .mine')") and value("sessionStorage.getItem(%s)" % json.dumps(pending_key)) is None
+            # A fast transcript echo replaces the temporary bubble even if all later polls return same.
+            echo_send[0] = True
+            for occurrence in [1, 2]:
+                sessions[0].update(status='waiting', reach=['say'], turn='', queued=[])
+                report()
+                ask('Emulation.setDeviceMetricsOverride', width=390, height=844, deviceScaleFactor=1, mobile=True)
+                ask('Page.navigate', url='http://127.0.0.1:%d/?take=%s' % (port, sid))
+                until("document.querySelector('#sheet .said')?.textContent.includes('电脑上的第一句') && !document.querySelector('#sheet .write button.solid').disabled")
+                value("document.querySelector('#sheet .write textarea').value='重复发送同一句'; document.querySelector('#sheet .write button.solid').click()")
+                until("Array.from(document.querySelectorAll('#sheet .said .turn.user:not(.mine) .md')).filter(n=>n.textContent.trim()==='重复发送同一句').length === %d && !document.querySelector('#sheet .said .mine')" % occurrence)
+                time.sleep(1.5)
+                assert value("Array.from(document.querySelectorAll('#sheet .said .turn.user .md, #sheet .said .turn.user .plain')).filter(n=>n.textContent.trim()==='重复发送同一句').length") == occurrence
+            transcript.extend({'role': 'assistant', 'text': '滚动阅读内容 %d\n' % i + '这段内容用于验证正文滚动，不遮挡输入区。' * 6} for i in range(12))
+            until("document.querySelector('#sheet .said').textContent.includes('滚动阅读内容 11')")
+            value("document.querySelector('#sheet .said').scrollTop = 0")
+            until("!document.querySelector('#sheet .latest').hidden")
+            assert value("document.querySelector('#sheet .said').scrollHeight > document.querySelector('#sheet .said').clientHeight")
+            picture('native-scroll-390.png')
+            value("document.querySelector('#sheet .latest').click()")
+            until("document.querySelector('#sheet .latest').hidden")
+            assert value("document.querySelector('#sheet .write').getBoundingClientRect().bottom <= innerHeight")
+            picture('native-reconciled-390.png')
+            ask('Emulation.setDeviceMetricsOverride', width=390, height=460, deviceScaleFactor=1, mobile=True)
+            value("document.querySelector('#sheet .write textarea').focus(); document.querySelector('#sheet .write textarea').value='键盘打开时保留草稿'")
+            assert value("document.querySelector('#sheet .write').getBoundingClientRect().bottom <= innerHeight")
+            assert value("document.querySelector('#sheet .said').clientHeight > 100")
+            picture('native-keyboard-390.png')
+            sessions[0].update(status='busy', reach=[], turn='', queued=[],
+                               ways={'say': '', 'stop': '', 'answer': '', 'end': ''},
+                               why={'stop': '当前执行目标只能在电脑上停止'})
+            report()
+            ask('Page.navigate', url='http://127.0.0.1:%d/?take=%s' % (port, sid))
+            until("document.querySelector('#sheet .halt') && document.querySelector('#sheet .halt').hidden && document.querySelector('#sheet .stop-note')?.textContent === '当前执行目标只能在电脑上停止'")
+            before_stop = len(native_requests)
+            assert len(native_requests) == before_stop, 'unsupported stop must not kill the application or dispatch an invalid turn'
+            assert value("document.querySelector('#sheet .stop-note').getClientRects().length > 0")
+            picture('native-stop-unavailable-390.png')
+            sessions[0].update(reach=['stop'], ways={'say': '', 'stop': 'codex-desktop', 'answer': '', 'end': ''}, why={})
+            report()
+            value("window.RemoteCliPage.refresh()")
+            until("document.querySelector('#sheet .halt').hidden && !document.querySelector('#sheet .stop-note').hidden")
+            assert len(native_requests) == before_stop, 'missing turn must not dispatch an unscoped interruption'
+            # Positron's Codex CLI has no per-turn interruption channel, regardless of process ownership.
+            sessions[0].update(host='cli', origin='Positron', transport='', reach=['say'], turn='',
+                               ways={'say': 'hook', 'stop': '', 'answer': '', 'end': ''},
+                               why={'stop': 'Codex 命令行的回答不能从外面单独停止'})
+            for can_end in [False, True]:
+                sessions[0]['can_takeover'] = can_end
+                sessions[0]['ways']['end'] = 'process' if can_end else ''
+                report()
+                ask('Page.navigate', url='http://127.0.0.1:%d/?take=%s' % (port, sid))
+                until("document.querySelector('#sheet .stop-note')?.textContent === 'Codex 命令行的回答不能从外面单独停止'")
+                assert value("document.querySelector('#sheet .halt').hidden")
+                assert value("document.querySelector('#sheet .end:not(.halt)').hidden") == (not can_end)
+                if can_end:
+                    value("document.querySelector('#sheet .end:not(.halt)').click()")
+                    until("document.querySelector('#sheet .confirm')?.textContent.includes('结束电脑上的这段对话')")
+                    value("document.querySelector('#sheet .confirm button.see').click()")
+                assert len(native_requests) == before_stop, 'opening or cancelling end confirmation must not stop a process'
+                picture('positron-codex-%s.png' % ('owned' if can_end else 'unowned'))
             assert not any(e['method'] == 'Runtime.exceptionThrown' for e in events), events
             # The single injected 503 is intentional; no other error-level log is acceptable.
             errors = [e for e in events if e['method'] == 'Log.entryAdded' and e['params']['entry']['level'] == 'error']
