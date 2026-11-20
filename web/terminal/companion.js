@@ -3,7 +3,7 @@
 (() => {
   'use strict';
   const id = new URLSearchParams(location.search).get('id') || '';
-  const TOOLS = { claude: 'Claude Code', codex: 'Codex', shell: 'PowerShell' };
+  const TOOLS = { claude: 'Claude Code', codex: 'Codex', agy: 'Antigravity CLI', opencode: 'OpenCode', qoder: 'Qoder', cline: 'Cline', pi: 'Pi', shell: '终端' };
   const PHASE = { confirm: ['等你确认', 0], done: ['已完成', 1], busy: ['正在执行', 2], starting: ['正在启动', 3], idle: ['等待输入', 4] };
   const load = () => { try { return JSON.parse(localStorage.getItem('rcli-seen') || '{}') || {}; } catch (error) { return {}; } };
   const save = map => { try { localStorage.setItem('rcli-seen', JSON.stringify(map)); } catch (error) { /* private window */ } };
@@ -35,52 +35,55 @@
     bar.hidden = false;
   }
 
-  // ---- the sheet for switching
+  const agyShell = t => {
+    if (!t || t.tool !== 'shell') return false;
+    if (/^Antigravity CLI(?:\s|$|·)/.test(t.title || '')) return true;
+    try { const list = JSON.parse(sessionStorage.getItem('agy-shell-ids') || '[]'); return Array.isArray(list) && list.includes(t.id); } catch (error) { return false; }
+  };
+  const displayTool = t => agyShell(t) ? 'agy' : t.tool;
+  // ---- the sheet for switching (../ui/sheet.js)
   function switcher() {
-    let dialog = document.getElementById('rcli-switch');
-    if (!dialog) { dialog = document.createElement('dialog'); dialog.id = 'rcli-switch'; dialog.className = 'sheet'; document.body.append(dialog); dialog.onclick = event => { if (event.target === dialog) dialog.close(); }; }
-    dialog.textContent = '';
-    dialog.append(Object.assign(document.createElement('h2'), { textContent: '切换终端' }));
-    const list = others();
-    if (!list.length) dialog.append(Object.assign(document.createElement('p'), { textContent: '没有别的终端在运行。回到列表可以新建或继续一段对话。' }));
-    list.forEach(t => {
-      const row = document.createElement('button');
-      row.type = 'button'; row.className = 'row';
-      const text = document.createElement('span');
-      text.append(Object.assign(document.createElement('b'), { textContent: t.title }), Object.assign(document.createElement('small'), { textContent: t.dir + ' · ' + TOOLS[t.tool] }));
-      row.append(text, Object.assign(document.createElement('span'), { className: 'pill ' + t.shows, textContent: PHASE[t.shows][0] }));
-      row.onclick = () => go(t.id);
-      dialog.append(row);
-    });
-    const all = Object.assign(document.createElement('button'), { type: 'button', className: 'cancel', textContent: '全部项目' });
-    all.onclick = () => location.replace('../');
-    dialog.append(all);
-    dialog.showModal();
+    if (!window.RemoteSheet) return;
+    const kit = window.RemoteSheet.ui;
+    window.RemoteSheet.open({ title: '切换终端', build(p) {
+      const list = others();
+      if (!list.length) p.body.append(kit.empty('没有别的终端在运行'));
+      else p.body.append(kit.group(...list.map(t => {
+        const shown = displayTool(t);
+        const icon = shown === 'claude' || shown === 'codex' || shown === 'agy' ? shown : t.form === 'chat' ? 'chat' : 'term';
+        const tint = shown === 'claude' ? 'claude' : shown === 'agy' ? 'agy' : shown === 'shell' ? 'good' : 'codex';
+        return kit.row({ icon, tint,
+          label: t.title, detail: (t.dir ? t.dir + ' · ' : '') + (TOOLS[shown] || shown), end: Object.assign(document.createElement('span'), { className: 'pill ' + t.shows, textContent: PHASE[t.shows][0] }),
+          act: () => { p.sheet.close(null, true); go(t.id); } });
+      })));
+      p.foot.append(kit.go('全部项目', async () => { p.sheet.close(null, true); location.replace('../'); }, { kind: 'quiet', id: 'switch-all' }).button);
+    } }, '切换终端');
   }
 
   async function poll() {
-    clearTimeout(timer);
-    if (!document.hidden) {
-      try {
-        const reply = await fetch('../api/terminal', { credentials: 'same-origin' });
-        if (reply.ok) {
-          data = await reply.json();
-          // What is on screen now counts as seen: this terminal is no longer "done" in the lists.
-          const mine = (data.terminals || []).find(t => t.id === id), seen = load();
-          if (mine && mine.phase_at && seen[id] !== mine.phase_at) {
-            seen[id] = mine.phase_at;
-            if (native && native.seen) native.seen(id, String(mine.phase_at));      // the app's workbench keeps the same record
-            const alive = new Set((data.terminals || []).map(t => t.id));
-            Object.keys(seen).forEach(key => { if (!alive.has(key)) delete seen[key]; });
-            save(seen);
-          }
-          drawBar();
-          const count = others().length, mark = document.getElementById('others');
-          if (mark) { mark.textContent = count ? String(count) : ''; mark.hidden = !count; }
+    clearTimeout(timer); timer = 0;
+    if (document.hidden) return;
+    let count = 0;
+    try {
+      const reply = await fetch('../api/terminal', { credentials: 'same-origin' });
+      if (reply.ok) {
+        data = await reply.json();
+        // What is on screen now counts as seen: this terminal is no longer "done" in the lists.
+        const mine = (data.terminals || []).find(t => t.id === id), seen = load();
+        if (mine && mine.phase_at && seen[id] !== mine.phase_at) {
+          seen[id] = mine.phase_at;
+          if (native && native.seen) native.seen(id, String(mine.phase_at));      // the app's workbench keeps the same record
+          const alive = new Set((data.terminals || []).map(t => t.id));
+          Object.keys(seen).forEach(key => { if (!alive.has(key)) delete seen[key]; });
+          save(seen);
         }
-      } catch (error) { /* the terminal itself reports connection trouble */ }
-    }
-    timer = setTimeout(poll, 4000);
+        drawBar();
+        count = others().length;
+        const mark = document.getElementById('others');
+        if (mark) { mark.textContent = count ? String(count) : ''; mark.hidden = !count; }
+      }
+    } catch (error) { /* the terminal itself reports connection trouble */ }
+    if (!document.hidden) timer = setTimeout(poll, count ? 6000 : 12000);
   }
 
   document.addEventListener('DOMContentLoaded', () => {
@@ -89,11 +92,11 @@
     who.setAttribute('role', 'button'); who.setAttribute('tabindex', '0'); who.setAttribute('aria-label', '切换终端');
     const mark = Object.assign(document.createElement('span'), { id: 'others', hidden: true });
     who.querySelector('h1').after(mark);
-    who.addEventListener('click', switcher);
-    who.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); switcher(); } });
+    who.addEventListener('click', () => { poll(); switcher(); });
+    who.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); poll(); switcher(); } });
     screen.before(bar);
     bar.addEventListener('contextmenu', event => { event.preventDefault(); const urgent = others()[0]; dismissed = urgent ? urgent.id + urgent.phase_at : ''; bar.hidden = true; });
     poll();
   });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) { clearTimeout(timer); timer = 0; } else poll(); });
 })();

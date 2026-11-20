@@ -48,6 +48,25 @@ public abstract class Chat : IRunning {
     readonly Dictionary<string, int> printed = new Dictionary<string, int>();     // step -> how much of its output was passed on
     protected readonly Dictionary<string, Asked> asks = new Dictionary<string, Asked>();
     protected bool stopping;
+    /// Where what the tool tells of its account's usage limits is kept (Quotas.cs); none where nobody keeps it.
+    protected Quotas quotas;
+    /// Optional local MCP server attached to this conversation (Peers.cs); disposed when the conversation ends.
+    protected McpServer mcp;
+
+    public sealed class McpServer : IDisposable {
+        readonly Action onDispose;
+        int disposed;
+        public string Name { get; private set; }
+        public string Command { get; private set; }
+        public string[] Args { get; private set; }
+        public string ConfigFile { get; private set; }
+        public McpServer(string name, string command, string[] args, string configFile, Action onDispose = null) {
+            Name = name ?? ""; Command = command ?? ""; Args = args ?? new string[0]; ConfigFile = configFile ?? ""; this.onDispose = onDispose;
+        }
+        public void Dispose() {
+            if (Interlocked.Exchange(ref disposed, 1) == 0 && onDispose != null) try { onDispose(); } catch (Exception) { }
+        }
+    }
 
     public string Tool { get; private set; }
     public string Folder { get; private set; }
@@ -57,6 +76,8 @@ public abstract class Chat : IRunning {
     public string Status { get; private set; }
     /// What it said last, one line, for the lists.
     public string Said { get; private set; }
+    /// What went wrong in the last failed turn, or "" when it did not fail.
+    public string LastError { get; private set; }
     /// What it asks now, for the lists: its words, or "" when it asks nothing.
     public string Asking { get { lock (gate) return asks.Count == 0 ? "" : asks.Values.First().Text; } }
 
@@ -73,18 +94,19 @@ public abstract class Chat : IRunning {
     }
 
     protected Chat(string tool, string folder, Action<string> emit) {
-        Tool = tool; Folder = folder; this.emit = emit; Status = "starting"; Said = ""; Session = "";
+        Tool = tool; Folder = folder; this.emit = emit; Status = "starting"; Said = ""; Session = ""; LastError = "";
         flusher = new Timer(_ => { lock (gate) Flush(); }, null, 120, 120);
     }
 
     /// Starts the conversation: the saved one `session` gone on with (`resume`), else a new one (named `session`
     /// where the tool lets its id be chosen). `mode` is the computer's widest allowed way of working (full, edit,
     /// read), as for its terminals.
-    public static Chat Open(string tool, string launcher, string folder, string session, bool resume, string mode, Action<string> emit) {
-        Chat chat;
-        if (tool == "claude") chat = new ClaudeChat(folder, emit);
-        else if (tool == "codex") chat = new CodexChat(folder, emit);
-        else throw new ArgumentException("这个工具不支持对话");
+    public static Chat Open(string tool, string launcher, string folder, string session, bool resume, string mode, Action<string> emit, Quotas quotas = null, McpServer mcp = null) {
+        Tool kind = RemoteCli.Tool.Of(tool);
+        if (kind == null || !kind.Chats) { if (mcp != null) mcp.Dispose(); throw new ArgumentException("这个工具不支持对话"); }
+        Chat chat = kind.CreateChat(folder, emit);
+        chat.quotas = quotas;
+        chat.mcp = mcp;
         try { chat.Begin(launcher, session ?? "", resume, mode ?? ""); }
         catch { chat.Dispose(); throw; }
         return chat;
@@ -115,7 +137,7 @@ public abstract class Chat : IRunning {
     protected abstract void Reply(Asked asked, string decision);
 
     // ---- the tool's program
-    protected void Run(string launcher, string args) {
+    protected void Run(string launcher, string args, IDictionary<string, string> extraEnv = null) {
         var info = new ProcessStartInfo { UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true, WorkingDirectory = Folder, StandardOutputEncoding = new UTF8Encoding(false), StandardErrorEncoding = new UTF8Encoding(false) };
         if (launcher.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase)) {
             info.FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe");
@@ -123,6 +145,11 @@ public abstract class Chat : IRunning {
         } else { info.FileName = launcher; info.Arguments = args; }
         // the owner's setup, but never a coding session this program itself may have been started from
         foreach (string key in new[] { "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT" }) info.EnvironmentVariables.Remove(key);
+        if (extraEnv != null) foreach (var pair in extraEnv) info.EnvironmentVariables[pair.Key] = pair.Value;
+        // In .NET Framework 4.x under a UTF-8 console (CP 65001), Process.Start creates StandardInput with
+        // Console.InputEncoding (which carries a 3-byte UTF-8 BOM) and flushes that BOM onto stdin before our first
+        // JSON line, corrupting `initialize`. Ensure a BOM-less encoding before starting the child.
+        try { if (Console.InputEncoding.GetPreamble().Length > 0) Console.InputEncoding = new UTF8Encoding(false); } catch (IOException) { }
         process = Process.Start(info);
         input = process.StandardInput.BaseStream;       // (written as UTF-8 here, whatever the console's code page)
         Task.Run(() => {
@@ -147,22 +174,42 @@ public abstract class Chat : IRunning {
         byte[] bytes = new UTF8Encoding(false).GetBytes(json.Serialize(message) + "\n");
         lock (input) { if (Closed || disposed) throw new IOException("对话已结束"); input.Write(bytes, 0, bytes.Length); input.Flush(); }
     }
+    protected virtual void OnEnded() { }
     void Ended() {
         try { process.WaitForExit(5000); exit = process.ExitCode; } catch { }
+        Action<string, string> notify = null;
+        string crashNote = "";
         lock (gate) {
+            OnEnded();
             foreach (var asked in asks.Keys.ToArray()) Event(new Dictionary<string, object> { { "t", "answered" }, { "id", asked }, { "decision", "gone" } });
             asks.Clear();
-            if (!disposed && exit.HasValue && exit.Value != 0) Note("工具已退出（代码 " + exit.Value + "）" + (lastErrors.Length > 0 ? "：" + lastErrors : ""));
+            bool midTurn = !disposed && (Status == "busy" || Status == "confirm");
+            if (!disposed && exit.HasValue && exit.Value != 0) {
+                string err = "工具已退出（代码 " + exit.Value + "）" + (lastErrors.Length > 0 ? "：" + lastErrors : "");
+                LastError = err;
+                Note(err);
+            }
+            if (midTurn) {
+                notify = Turned;
+                crashNote = !String.IsNullOrEmpty(LastError) ? LastError : !String.IsNullOrEmpty(lastErrors) ? lastErrors : "工具进程意外退出";
+                string partial = words.ToString().Trim();
+                if (partial.Length > 0 && partial.IndexOf(crashNote, StringComparison.OrdinalIgnoreCase) < 0) crashNote = partial + "\n" + crashNote;
+            }
             State("ended");
             Flush();
             Closed = true; Drained = true;
         }
+        var seat = Interlocked.Exchange(ref mcp, null);
+        if (seat != null) seat.Dispose();
+        if (notify != null) ThreadPool.QueueUserWorkItem(_ => { try { notify("failed", crashNote); } catch (Exception) { } });
     }
     public void Write(string text) { throw new InvalidOperationException("对话不接受终端输入"); }
     public void Resize(int cols, int rows) { }
     public void Dispose() {
         lock (gate) { if (disposed) return; disposed = true; Flush(); }
         flusher.Dispose();
+        var seat = Interlocked.Exchange(ref mcp, null);
+        if (seat != null) seat.Dispose();
         try { if (process != null && !process.HasExited) using (Process kill = Process.Start(new ProcessStartInfo("taskkill.exe", "/PID " + process.Id + " /T /F") { UseShellExecute = false, CreateNoWindow = true })) kill.WaitForExit(10000); } catch { }
         if (process == null) { Closed = true; Drained = true; }
     }
@@ -191,6 +238,8 @@ public abstract class Chat : IRunning {
         lock (gate) Event(new Dictionary<string, object> { { "t", "history" }, { "messages", messages }, { "more", more } });
     }
     protected void Item(string id, string kind, string text, Dictionary<string, object> more = null) {
+        if (kind == "text") { wordsId = id; words.Clear().Append(text ?? ""); }
+        else if (kind == "user") { wordsId = ""; words.Clear(); }
         var item = new Dictionary<string, object> { { "t", "item" }, { "id", id }, { "kind", kind }, { "text", text ?? "" }, { "at", Now() } };
         if (more != null) foreach (var pair in more) item[pair.Key] = pair.Value;
         Event(item);
@@ -205,6 +254,7 @@ public abstract class Chat : IRunning {
             if (had + text.Length > OutputMost) text = text.Substring(0, OutputMost - had) + "\n…";
             printed[id] = had + text.Length;
         }
+        if (kind == "more" && id == wordsId) words.Append(text);
         if (gathered.Length > 0 && (gatherKind != kind || gatherId != id)) Flush();
         gatherKind = kind; gatherId = id; gathered.Append(text);
         if (gathered.Length > 8000) Flush();
@@ -217,13 +267,42 @@ public abstract class Chat : IRunning {
         Event(done);
     }
     /// The whole of a text once it is written, where the tool says it: it replaces what came in pieces.
-    protected void Settled(string id, string text) { Event(new Dictionary<string, object> { { "t", "set" }, { "id", id }, { "text", text } }); Spoken(text); }
+    protected void Settled(string id, string text) {
+        if (id == wordsId || !String.IsNullOrEmpty(text)) { wordsId = id; words.Clear().Append(text ?? ""); }
+        Event(new Dictionary<string, object> { { "t", "set" }, { "id", id }, { "text", text } }); Spoken(text);
+    }
+    // what it said last in this turn, whole: given with the end of the turn to whoever listens (Teams.cs)
+    string wordsId = "";
+    readonly StringBuilder words = new StringBuilder();
+    /// A turn has ended: how ("done", "stopped", "failed"), and what it said last in it. Told on a thread of its own,
+    /// outside the conversation's lock, so that whoever listens may tell this or another conversation something.
+    /// A turn that ends while commands it started still run in the background is not told: the tool goes on by
+    /// itself when they end, and what it says at the end of that is the turn's outcome ("I am running the tests,
+    /// I will report" is not).
+    public event Action<string, string> Turned;
+    /// A permission request arrived (id, kind, title, text); told on a thread of its own outside the lock so an
+    /// automated listener (such as a read-only peer consultant) can call Answer immediately.
+    public event Action<string, string, string, string> AskedFor;
+    int background;
+    /// How many commands the tool now runs in the background of this conversation, as the tool says it.
+    protected void Background(int running) { background = Math.Max(0, running); }
     protected void Note(string text) { Event(new Dictionary<string, object> { { "t", "note" }, { "text", text }, { "at", Now() } }); }
     protected void TurnEnded(string how, string error) {
+        LastError = error ?? "";
         var turn = new Dictionary<string, object> { { "t", "turn" }, { "end", how }, { "at", Now() } };
         if (!String.IsNullOrEmpty(error)) turn["error"] = error;
         Event(turn);
         stopping = false;
+        if (how == "done" && background > 0) return;
+        var turned = Turned;
+        if (turned != null) {
+            string said = words.ToString();
+            if (how == "failed" && !String.IsNullOrEmpty(error)) {
+                if (String.IsNullOrWhiteSpace(said)) said = error;
+                else if (said.IndexOf(error, StringComparison.OrdinalIgnoreCase) < 0) said = said + "\n" + error;
+            }
+            ThreadPool.QueueUserWorkItem(_ => { try { turned(how, said); } catch (Exception) { } });
+        }
     }
     protected string Ask(object request, string kind, string title, string text, bool always, IList<string> choices = null) {
         var asked = new Asked { Id = Guid.NewGuid().ToString("N").Substring(0, 16), Request = request, Kind = kind, Text = (title + (text.Length > 0 ? "\n" + text : "")).Trim(), Always = always };
@@ -239,6 +318,8 @@ public abstract class Chat : IRunning {
         asks[asked.Id] = asked;
         Event(new Dictionary<string, object> { { "t", "ask" }, { "id", asked.Id }, { "kind", kind }, { "title", title }, { "text", Cut(text, 4000) }, { "options", options } });
         State("confirm");
+        var askedFor = AskedFor;
+        if (askedFor != null) { string aid = asked.Id, ak = kind ?? "", at = title ?? "", ax = text ?? ""; ThreadPool.QueueUserWorkItem(_ => { try { askedFor(aid, ak, at, ax); } catch (Exception) { } }); }
         return asked.Id;
     }
     void Spoken(string whole, string more = null) {
@@ -279,16 +360,19 @@ public sealed class ClaudeChat : Chat {
     readonly Queue<KeyValuePair<string, string>> said = new Queue<KeyValuePair<string, string>>();   // what the phone said, and its number, until it is given back
     int requests;
 
-    public static string Arguments(string session, bool resume, string mode) {
+    public static string Arguments(string session, bool resume, string mode, string mcpConfig = null) {
         return "-p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --replay-user-messages --permission-prompt-tool stdio"
             + (resume ? " --resume " : " --session-id ") + session
-            + (mode == "read" ? " --permission-mode plan" : mode == "edit" ? " --permission-mode acceptEdits" : "");
+            + (mode == "read" ? " --permission-mode plan" : mode == "edit" ? " --permission-mode acceptEdits" : "")
+            + (!String.IsNullOrEmpty(mcpConfig) ? " --mcp-config \"" + mcpConfig + "\"" : "");
     }
     protected override void Begin(string launcher, string session, bool resume, string mode) {
         if (session.Length == 0) { if (resume) throw new ArgumentException("对话编号无效"); session = Guid.NewGuid().ToString(); }
         if (!Regex.IsMatch(session, @"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z")) throw new ArgumentException("对话编号无效");
         lock (gate) Known(session);
-        Run(launcher, Arguments(session, resume, mode));
+        string cfg = mcp != null && !String.IsNullOrEmpty(mcp.ConfigFile) ? mcp.ConfigFile : null;
+        var extraEnv = cfg != null ? new Dictionary<string, string> { { "MCP_TOOL_TIMEOUT", "300000" } } : null;
+        Run(launcher, Arguments(session, resume, mode, cfg), extraEnv);
         Send(new Dictionary<string, object> { { "type", "control_request" }, { "request_id", "init-" + (++requests) }, { "request", new Dictionary<string, object> { { "subtype", "initialize" } } } });
         lock (gate) State("idle");
     }
@@ -305,6 +389,9 @@ public sealed class ClaudeChat : Chat {
         if (type == "system") {
             if (Text(m, "subtype") == "init") Known(Text(m, "session_id"));
             else if (Text(m, "subtype") == "status" && Text(m, "status") == "requesting" && Status == "idle") State("busy");
+            // the commands it runs in the background (Claude Code 2.1.322: the whole list, each time it changes); when
+            // one ends it goes on by itself, in a turn of its own
+            else if (Text(m, "subtype") == "background_tasks_changed") { var tasks = At(m, "tasks") as System.Collections.ICollection; Background(tasks == null ? 0 : tasks.Count); }
             return;
         }
         if (type == "stream_event") { Streamed(At(m, "event")); return; }
@@ -312,6 +399,8 @@ public sealed class ClaudeChat : Chat {
         if (type == "user") { Came(m); return; }
         if (type == "control_request") { Permission(m); return; }
         if (type == "control_cancel_request") { Withdrawn(Text(m, "request_id")); return; }
+        // with each turn, how much of the account's limits is used (Claude Code 2.1.322)
+        if (type == "rate_limit_event") { if (quotas != null) quotas.Note("claude", Quotas.FromClaudeEvent(At(m, "rate_limit_info"))); return; }
         if (type == "result") {
             string subtype = Text(m, "subtype");
             bool ok = subtype == "success" && !true.Equals(At(m, "is_error"));
@@ -349,12 +438,21 @@ public sealed class ClaudeChat : Chat {
                 string use = Text(part, "id"), item = "step-" + use;
                 if (steps.ContainsKey(use)) continue;
                 steps[use] = item;
+                string toolName = Text(part, "name");
                 var input = At(part, "input");
-                var more = new Dictionary<string, object> { { "name", Text(part, "name") }, { "state", "run" } };
-                string command = Text(input, "command");
-                if (command.Length > 0) more["detail"] = Cut(command, 2000);
-                else if (Text(part, "name") == "Edit" || Text(part, "name") == "Write" || Text(part, "name") == "MultiEdit") more["detail"] = Text(input, "file_path");
-                Item(item, "step", Brief(At(part, "name"), input), more);
+                var more = new Dictionary<string, object> { { "name", toolName }, { "state", "run" } };
+                string title;
+                if (toolName == "mcp__" + Peers.ServerName + "__" + Peers.ToolName || toolName.EndsWith("__" + Peers.ToolName, StringComparison.Ordinal)) {
+                    string question = Text(input, "question");
+                    title = Peers.StepTitle(Text(input, "tool"), question);
+                    if (question.Length > 0) more["detail"] = Cut(question, 2000);
+                } else {
+                    title = Brief(At(part, "name"), input);
+                    string command = Text(input, "command");
+                    if (command.Length > 0) more["detail"] = Cut(command, 2000);
+                    else if (toolName == "Edit" || toolName == "Write" || toolName == "MultiEdit") more["detail"] = Text(input, "file_path");
+                }
+                Item(item, "step", title, more);
             } else if (kind == "text" && !streamed.Contains(id) && Text(part, "text").Trim().Length > 0) {
                 Item(id + ":t" + Guid.NewGuid().ToString("N").Substring(0, 6), "text", Text(part, "text"));
             }
@@ -395,6 +493,11 @@ public sealed class ClaudeChat : Chat {
         }
         string name = Text(request, "tool_name"), shown = Text(request, "display_name");
         var input = At(request, "input");
+        // Built-in read-only peer consultation runs without asking the phone for permission each time.
+        if (mcp != null && name == "mcp__" + mcp.Name + "__" + Peers.ToolName) {
+            Respond(id, new Dictionary<string, object> { { "behavior", "allow" }, { "updatedInput", input ?? new Dictionary<string, object>() } }, null);
+            return;
+        }
         if (name == "AskUserQuestion") {
             var questions = Many(input, "questions").ToList();
             if (questions.Count == 1 && !true.Equals(At(questions[0], "multiSelect"))) {
@@ -447,41 +550,100 @@ public sealed class ClaudeChat : Chat {
     }
 }
 
+/// Shared JSON-RPC-over-stdio transport for structured chat drivers (Codex `app-server`, ACP servers like `agy acp`).
+/// Handles request numbering, response routing, cleanup on send failure/exit, and server request replies.
+public abstract class JsonRpcChat : Chat {
+    int next;
+    readonly Dictionary<int, Action<Dictionary<string, object>>> waiting = new Dictionary<int, Action<Dictionary<string, object>>>();
+
+    protected JsonRpcChat(string tool, string folder, Action<string> emit) : base(tool, folder, emit) { }
+    protected virtual bool UseJsonRpcVersion { get { return false; } }
+
+    Dictionary<string, object> Envelope() {
+        var m = new Dictionary<string, object>();
+        if (UseJsonRpcVersion) m["jsonrpc"] = "2.0";
+        return m;
+    }
+    protected void Call(string method, object given, Action<Dictionary<string, object>> answered) {
+        int id;
+        lock (gate) { id = ++next; waiting[id] = answered; }
+        var m = Envelope(); m["id"] = id; m["method"] = method; m["params"] = given;
+        try { Send(m); }
+        catch { lock (gate) waiting.Remove(id); throw; }
+    }
+    protected void Notify(string method, object given) {
+        var m = Envelope(); m["method"] = method; m["params"] = given;
+        Send(m);
+    }
+    protected void RespondResult(object id, object result) {
+        var m = Envelope(); m["id"] = id; m["result"] = result;
+        Send(m);
+    }
+    protected void Refuse(object id, string why) {
+        var m = Envelope(); m["id"] = id; m["error"] = new Dictionary<string, object> { { "code", -32601 }, { "message", why } };
+        Send(m);
+    }
+    protected override void OnEnded() { waiting.Clear(); }
+    protected override void Received(Dictionary<string, object> m) {
+        object id = At(m, "id"); string method = Text(m, "method");
+        if (id != null && method.Length == 0) {
+            int number; Action<Dictionary<string, object>> answered;
+            if (Int32.TryParse(Convert.ToString(id), out number) && waiting.TryGetValue(number, out answered)) { waiting.Remove(number); answered(m); }
+            return;
+        }
+        var p = At(m, "params");
+        if (id != null) { Requested(id, method, p); return; }
+        Notified(method, p);
+    }
+    protected abstract void Requested(object id, string method, object p);
+    protected abstract void Notified(string method, object p);
+}
+
 /// Codex through `codex app-server`: JSON-RPC on its standard input and output, one conversation ("thread") a
 /// program here. What is said starts a turn (`turn/start`), or joins the one at work (`turn/steer`); a stop is
 /// `turn/interrupt`; the steps it wants to run and the files it wants to change are asked of this program as
 /// requests, answered with the decision. Run on Codex 0.163.0 (docs/PROTOCOL.md, "Chats").
-public sealed class CodexChat : Chat {
+public sealed class CodexChat : JsonRpcChat {
     public CodexChat(string folder, Action<string> emit) : base("codex", folder, emit) { }
-    int next;
-    readonly Dictionary<int, Action<Dictionary<string, object>>> waiting = new Dictionary<int, Action<Dictionary<string, object>>>();
     string turn = "";
     string mode = "";
     readonly List<KeyValuePair<string, string>> early = new List<KeyValuePair<string, string>>();     // said before the conversation was there
 
+    static string TomlString(string value) {
+        value = value ?? "";
+        if (value.IndexOf('\'') < 0 && value.IndexOf('\n') < 0 && value.IndexOf('\r') < 0) return "'" + value + "'";
+        return "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", "\\r").Replace("\n", "\\n") + "\"";
+    }
+    public static string Arguments(McpServer mcp) {
+        if (mcp == null || String.IsNullOrEmpty(mcp.Command)) return "app-server";
+        string prefix = "mcp_servers." + mcp.Name + ".";
+        string argsArray = "[" + String.Join(",", mcp.Args.Select(TomlString)) + "]";
+        return "app-server"
+            + " -c \"" + prefix + "command=" + TomlString(mcp.Command).Replace("\"", "\\\"") + "\""
+            + " -c \"" + prefix + "args=" + argsArray.Replace("\"", "\\\"") + "\""
+            + " -c \"" + prefix + "tool_timeout_sec=300\""
+            + " -c \"" + prefix + "startup_timeout_sec=20\"";
+    }
     protected override void Begin(string launcher, string session, bool resume, string mode) {
         this.mode = mode;
         if (!resume) session = "";
-        if (session.Length > 0 && !Regex.IsMatch(session, @"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z")) throw new ArgumentException("对话编号无效");
-        Run(launcher, "app-server");
-        Call("initialize", new Dictionary<string, object> { { "clientInfo", new Dictionary<string, object> { { "name", "remote-ai" }, { "title", "Remote AI" }, { "version", "1" } } } }, _ => { });
-        Send(new Dictionary<string, object> { { "method", "initialized" }, { "params", new Dictionary<string, object>() } });
+        if (session.Length > 0 && !SessionLocks.IsUuid(session)) throw new ArgumentException("对话编号无效");
+        Run(launcher, Arguments(mcp));
         var given = new Dictionary<string, object> { { "cwd", Folder } };
         if (mode == "read") given["sandbox"] = "read-only"; else if (mode == "edit") given["sandbox"] = "workspace-write";
         if (session.Length > 0) given["threadId"] = session;
-        Call(session.Length > 0 ? "thread/resume" : "thread/start", given, answer => {
-            string thread = Text(At(At(answer, "result"), "thread"), "id");
-            if (thread.Length == 0) { Note("Codex 没有打开这段对话：" + Text(At(answer, "error"), "message")); State("ended"); return; }
-            Known(thread);
-            State(Status == "busy" ? "busy" : "idle");
-            foreach (var one in early.ToArray()) Start(one.Key, one.Value);
-            early.Clear();
+        Call("initialize", new Dictionary<string, object> { { "clientInfo", new Dictionary<string, object> { { "name", "remote-ai" }, { "title", "Remote AI" }, { "version", "1" } } } }, initAnswer => {
+            if (At(initAnswer, "error") != null) { Note("Codex 初始化失败：" + Text(At(initAnswer, "error"), "message")); State("ended"); return; }
+            Notify("initialized", new Dictionary<string, object>());
+            Call(session.Length > 0 ? "thread/resume" : "thread/start", given, answer => {
+                string thread = Text(At(At(answer, "result"), "thread"), "id");
+                if (thread.Length == 0) { Note("Codex 没有打开这段对话：" + Text(At(answer, "error"), "message")); State("ended"); return; }
+                Known(thread);
+                State(Status == "busy" ? "busy" : "idle");
+                foreach (var one in early.ToArray()) Start(one.Key, one.Value);
+                early.Clear();
+            });
         });
-    }
-    void Call(string method, object given, Action<Dictionary<string, object>> answered) {
-        int id;
-        lock (gate) { id = ++next; waiting[id] = answered; }
-        Send(new Dictionary<string, object> { { "id", id }, { "method", method }, { "params", given } });
     }
     static List<object> Words(string text) { return new List<object> { new Dictionary<string, object> { { "type", "text" }, { "text", text }, { "text_elements", new object[0] } } }; }
     public override void Say(string text, string id) {
@@ -514,15 +676,7 @@ public sealed class CodexChat : Chat {
             Call("turn/interrupt", new Dictionary<string, object> { { "threadId", Session }, { "turnId", turn } }, _ => { });
         }
     }
-    protected override void Received(Dictionary<string, object> m) {
-        object id = At(m, "id"); string method = Text(m, "method");
-        if (id != null && method.Length == 0) {
-            int number; Action<Dictionary<string, object>> answered;
-            if (Int32.TryParse(Convert.ToString(id), out number) && waiting.TryGetValue(number, out answered)) { waiting.Remove(number); answered(m); }
-            return;
-        }
-        var p = At(m, "params");
-        if (id != null) { Requested(id, method, p); return; }
+    protected override void Notified(string method, object p) {
         switch (method) {
             case "turn/started": turn = Text(At(p, "turn"), "id"); State(asks.Count > 0 ? "confirm" : "busy"); break;
             case "turn/completed": {
@@ -548,6 +702,7 @@ public sealed class CodexChat : Chat {
                 break;
             }
             case "error": Note(Text(At(p, "error"), "message").Length > 0 ? Text(At(p, "error"), "message") : "Codex 出错"); break;
+            case "account/rateLimits/updated": if (quotas != null) quotas.Note("codex", Quotas.FromCodex(At(p, "rateLimits"))); break;
         }
     }
     readonly HashSet<string> thoughts = new HashSet<string>();
@@ -575,7 +730,20 @@ public sealed class CodexChat : Chat {
             var names = Many(item, "changes").Select(one => Text(one, "path")).Where(one => one.Length > 0).Select(one => one.Substring(one.LastIndexOfAny(new[] { '/', '\\' }) + 1)).ToList();
             Item(id, "step", "修改：" + (names.Count > 0 ? String.Join("、", names.Take(3)) + (names.Count > 3 ? " 等 " + names.Count + " 个文件" : "") : "文件"), new Dictionary<string, object> { { "name", "edit" }, { "state", "run" } });
         }
-        else if (type == "mcpToolCall") Item(id, "step", Text(item, "server") + "：" + Text(item, "tool"), new Dictionary<string, object> { { "name", "mcp" }, { "state", "run" } });
+        else if (type == "mcpToolCall") {
+            string toolName = Text(item, "tool");
+            var more = new Dictionary<string, object> { { "name", "mcp" }, { "state", "run" } };
+            string title;
+            if (toolName == Peers.ToolName) {
+                var argsObj = At(item, "arguments");
+                string question = Text(argsObj, "question");
+                title = Peers.StepTitle(Text(argsObj, "tool"), question);
+                if (question.Length > 0) more["detail"] = Cut(question, 2000);
+            } else {
+                title = Text(item, "server") + "：" + toolName;
+            }
+            Item(id, "step", title, more);
+        }
         else if (type == "webSearch") Item(id, "step", "搜索：" + Text(item, "query"), new Dictionary<string, object> { { "name", "search" }, { "state", "run" } });
         else if (type == "dynamicToolCall" || type == "collabAgentToolCall") Item(id, "step", Text(item, "tool"), new Dictionary<string, object> { { "name", "tool" }, { "state", "run" } });
     }
@@ -591,7 +759,11 @@ public sealed class CodexChat : Chat {
             var diffs = Many(item, "changes").Select(one => Text(one, "path") + "\n" + Text(one, "diff")).ToList();
             Done(id, Text(item, "status") == "completed", String.Join("\n", diffs));
         }
-        else if (type == "mcpToolCall") Done(id, Text(item, "status") == "completed", At(item, "error") != null ? Text(At(item, "error"), "message") : json.Serialize(At(item, "result") ?? ""));
+        else if (type == "mcpToolCall") {
+            bool ok = Text(item, "status") == "completed" && At(item, "error") == null && !true.Equals(At(At(item, "result"), "isError"));
+            string back = At(item, "error") != null ? Text(At(item, "error"), "message") : McpText(At(item, "result"));
+            Done(id, ok, back);
+        }
         else if (type == "webSearch" || type == "dynamicToolCall" || type == "collabAgentToolCall") Done(id, Text(item, "status") != "failed", "");
         else if (type == "agentMessage") Settled(id, Text(item, "text"));
         else if (type == "reasoning" && !thoughts.Contains(id)) {
@@ -599,7 +771,7 @@ public sealed class CodexChat : Chat {
             if (summary.Length > 0) { thoughts.Add(id); Item(id, "thought", summary); }
         }
     }
-    void Requested(object id, string method, object p) {
+    protected override void Requested(object id, string method, object p) {
         var request = new Dictionary<string, object> { { "id", id }, { "method", method }, { "params", p } };
         if (method == "item/commandExecution/requestApproval" || method == "execCommandApproval") {
             string command = Text(p, "command"); var actions = Many(p, "commandActions").Select(one => Text(one, "command")).Where(one => one.Length > 0).ToList();
@@ -616,10 +788,16 @@ public sealed class CodexChat : Chat {
             if (labels.Count > 0) Ask(request, "question", Text(questions[0], "question"), "", false, labels);
             else Refuse(id, "手机上不能回答这个问题");
         }
+        else if (mcp != null && method.IndexOf("mcp", StringComparison.OrdinalIgnoreCase) >= 0 && Text(p, "server") == mcp.Name) {
+            RespondResult(id, new Dictionary<string, object> { { "decision", "accept" } });
+        }
         else Refuse(id, "Remote AI 不支持这个请求");
     }
-    void Refuse(object id, string why) {
-        Send(new Dictionary<string, object> { { "id", id }, { "error", new Dictionary<string, object> { { "code", -32601 }, { "message", why } } } });
+    string McpText(object result) {
+        if (result == null) return "";
+        if (result is string) return (string)result;
+        var parts = Many(result, "content").Select(one => Text(one, "text")).Where(t => t.Length > 0).ToList();
+        return parts.Count > 0 ? String.Join("\n", parts) : json.Serialize(result);
     }
     protected override void Reply(Asked asked, string decision) {
         var request = (Dictionary<string, object>)asked.Request;
@@ -632,7 +810,7 @@ public sealed class CodexChat : Chat {
         else if (method == "item/tool/requestUserInput") result = new Dictionary<string, object> { { "answers", new Dictionary<string, object>() } };
         else if (method == "execCommandApproval" || method == "applyPatchApproval") result = new Dictionary<string, object> { { "decision", decision == "deny" ? "denied" : decision == "always" ? "approved_for_session" : "approved" } };
         else result = new Dictionary<string, object> { { "decision", decision == "deny" ? "decline" : decision == "always" ? "acceptForSession" : "accept" } };
-        Send(new Dictionary<string, object> { { "id", At(request, "id") }, { "result", result } });
+        RespondResult(At(request, "id"), result);
     }
 }
 }

@@ -7,7 +7,7 @@
   'use strict';
   const $ = id => document.getElementById(id);
   // The plain terminal is called what the computer calls it: PowerShell on Windows, the person's shell elsewhere.
-  const TOOLS = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode', qoder: 'Qoder', cline: 'Cline', pi: 'Pi', shell: '终端' };
+  const TOOLS = { claude: 'Claude Code', codex: 'Codex', agy: 'Antigravity CLI', opencode: 'OpenCode', qoder: 'Qoder', cline: 'Cline', pi: 'Pi', shell: '终端' };
   const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
   const native = window.RemoteCliNative || null;
   // The look belongs to the app, not to one computer: inside the app it is kept there, so every computer's pages
@@ -23,6 +23,7 @@
     try { localStorage.setItem('rcli-' + key, value); } catch (error) { /* private window */ }
   };
   let data = null, project = '', timer = 0, shown = 2, endedShown = 8, toastTimer = 0;
+  let relayVersion = '';
   // The tabs at the foot. The one last used is kept while the app is open (a terminal's page leads back to it);
   // ?tab=<name> opens one by a link. A project in detail belongs to 项目: `project` is set only there.
   const TABS = { tasks: '任务', projects: '项目', together: '协作', me: '我的' };
@@ -41,6 +42,7 @@
   // ---- drawing helpers
   const svg = (path, size) => `<svg viewBox="0 0 24 24" width="${size || 22}" height="${size || 22}" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${path}</svg>`;
   const ICON = {
+    agy: svg('<path d="M3 17c5 0 6-11 9-11s4 11 9 11M8 18l4-4 4 4"/>'),
     back: svg('<path d="M15 5l-7 7 7 7"/>'),
     // a wheel with eight teeth: the ring of teeth is one circle drawn in dashes
     gear: svg('<circle cx="12" cy="12" r="2.8"/><circle cx="12" cy="12" r="6.3"/><circle cx="12" cy="12" r="8.4" stroke-width="2.4" stroke-linecap="butt" stroke-dasharray="2.64 3.957"/>'),
@@ -82,7 +84,7 @@
   const TEXT = { small: '14px', normal: '15.5px', large: '17px', larger: '19px' };
   // ?skin=<name> chooses a skin from a link, for example when showing the app to someone.
   const asked = new URLSearchParams(location.search).get('skin');
-  if (asked && window.RemoteCliSkins[asked]) keep('skin', asked);
+  if (asked && (asked === 'auto' || window.RemoteCliSkins[asked])) keep('skin', asked);
   // How a conversation is read in its window: the type, its size beside the page's own, and the spacing of the lines.
   const READ = {
     readfont: ['字体', { sans: ['默认', 'inherit'], serif: ['衬线', '"Noto Serif SC", "Source Han Serif SC", "Songti SC", SimSun, serif'], mono: ['等宽', 'ui-monospace, "Cascadia Mono", Consolas, monospace'] }, 'sans', '--read-font'],
@@ -95,11 +97,13 @@
     const skin = window.RemoteCliPaint(saved('skin', 'paper'));
     typeset();
     document.documentElement.style.fontSize = TEXT[saved('text', 'normal')] || TEXT.normal;
+    const shade = skin.bg || skin.t.background;
     const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.content = skin.t.background;
-    if (native) native.chrome(skin.t.background);
+    if (meta) meta.content = shade;
+    if (native) native.chrome(shade);
   }
   paint();
+  if (window.RemoteCliOnSystemTheme) window.RemoteCliOnSystemTheme(paint);
   $('back').innerHTML = ICON.back; $('settings').innerHTML = ICON.gear; $('new-task').innerHTML = svg('<path d="M12 5v14M5 12h14"/>', 24);
   document.querySelectorAll('#tabs button').forEach(button => {
     button.querySelector('.glyph').innerHTML = button.dataset.tab === 'projects' ? svg(ICON.folder.replace(/^<svg[^>]*>|<\/svg>$/g, ''), 24) : ICON[button.dataset.tab];
@@ -145,24 +149,49 @@
     }));
   }
   // A question with a few answers, optionally with fields to fill in; resolves with the answer, or null when dismissed.
+  // It rises as the sheet of ui/sheet.js: a single answer that ends or saves something is its one button at the foot;
+  // several are rows with a mark for what each does, those that end or delete something apart at the end.
+  const MARK = { pin: 'pin', hide: 'hide', finish: 'stop', end: 'stop', handoff: 'hand', add: 'folder', enter: 'enter', delete: 'trash', remove: 'trash', rename: 'pen',
+    resume: 'term', chat: 'chat', 'chat-close': 'chat', close: 'term', copy: 'copy' };
   function ask(title, text, choices, fields) {
-    return openSheet((form, finish) => {
-      form.append(el('h3', { textContent: title }), text ? el('p', { textContent: text }) : '');
+    const kit = window.RemoteSheet.ui;
+    return window.RemoteSheet.open({ title, build(p) {
       const inputs = {};
+      const answer = c => p.sheet.close(fields ? Object.assign({ choice: c.value }, ...Object.keys(inputs).map(k => ({ [k]: inputs[k].value.trim() }))) : c.value);
+      const single = choices.length === 1 && (fields || choices[0].kind === 'danger' || choices[0].kind === 'solid');
+      if (text || (single && !fields)) p.body.append(kit.summary(text || title, choices.some(c => c.kind === 'danger') ? 'bad' : '', choices.some(c => c.kind === 'danger') ? 'stop' : 'spark'));
       (fields || []).forEach(f => {
-        inputs[f.key] = el('input', { id: 'field-' + f.key, value: f.value || '', placeholder: f.placeholder || '', maxLength: f.max || 240, autocapitalize: 'off', spellcheck: false });
-        form.append(el('label', { htmlFor: 'field-' + f.key, textContent: f.label }), inputs[f.key]);
+        inputs[f.key] = kit.input({ id: 'field-' + f.key, value: f.value || '', placeholder: f.placeholder || '', max: f.max || 240, label: f.label });
+        inputs[f.key].addEventListener('keydown', event => { if (event.key === 'Enter' && single) { event.preventDefault(); answer(choices[0]); } });
+        p.body.append(kit.section(f.label, inputs[f.key]));
+        setTimeout(() => { inputs[f.key].focus(); inputs[f.key].select(); }, 280);
       });
-      choices.forEach(c => form.append(el('button', { type: 'button', className: 'choice ' + (c.kind || ''), onclick: () =>
-        finish(fields ? Object.assign({ choice: c.value }, ...Object.keys(inputs).map(k => ({ [k]: inputs[k].value.trim() }))) : c.value) },
-        el('span', null, c.label, c.sub ? el('small', { textContent: c.sub }) : ''))));
-    });
+      if (single) { p.foot.append(kit.go(choices[0].label, async () => answer(choices[0]), { kind: choices[0].kind === 'danger' ? 'danger' : '', id: 'ask-go' }).button); return; }
+      const row = c => kit.row({ icon: MARK[c.value] || 'chev', tint: c.kind === 'danger' ? '' : MARK[c.value] === 'hand' ? 'claude' : 'muted', label: c.label, detail: c.sub || '', danger: false, act: () => answer(c) });
+      const plain = choices.filter(c => c.kind !== 'danger'), danger = choices.filter(c => c.kind === 'danger');
+      if (plain.length) p.body.append(kit.group(...plain.map(row)));
+      if (danger.length) p.body.append(kit.group(...danger.map(c => { const node = row(c); node.classList.add('warn'); return node; })));
+    } }, title).result;
   }
   function showLogin() {
     clearTimeout(timer);
     $('home').hidden = true; $('tabs').hidden = true; $('login').hidden = false;
+    const native = window.RemoteCliNative;
+    const box = $('login-native');
+    if (box) {
+      box.hidden = !native;
+      if ($('login-forget')) $('login-forget').hidden = !(native && native.forgetCurrent);
+    }
     $('password').focus();
   }
+  if ($('login-back')) $('login-back').addEventListener('click', () => {
+    const native = window.RemoteCliNative;
+    if (native && native.home) native.home();
+  });
+  if ($('login-forget')) $('login-forget').addEventListener('click', () => {
+    const native = window.RemoteCliNative;
+    if (native && native.forgetCurrent) native.forgetCurrent();
+  });
   $('login-form').addEventListener('submit', async event => {
     event.preventDefault();
     $('login-error').textContent = '';
@@ -285,10 +314,32 @@
     if (result) open(result.terminal);
     return !!result;
   }
+  const agyShellTitle = dir => 'Antigravity CLI' + (dir ? ' · ' + dir : '');
+  const isAgyShell = t => !!t && t.tool === 'shell' && (/^Antigravity CLI(?:\s|$|·)/.test(t.title || '') || agyShellIds().includes(t.id));
+  function agyShellIds() {
+    try { const list = JSON.parse(sessionStorage.getItem('agy-shell-ids') || '[]'); return Array.isArray(list) ? list : []; } catch (error) { return []; }
+  }
+  function rememberAgyShell(id) {
+    try {
+      const ids = agyShellIds().filter(one => one !== id);
+      ids.push(id);
+      sessionStorage.setItem('agy-shell-ids', JSON.stringify(ids.slice(-16)));
+    } catch (error) { /* title rename still identifies it */ }
+  }
+  async function startAgyShell(dir) {
+    const result = await run({ action: 'start', tool: 'shell', dir, history: false }, '正在电脑上启动 agy…');
+    if (!result) return false;
+    rememberAgyShell(result.terminal);
+    try { sessionStorage.setItem('agy-shell-run', result.terminal); } catch (error) { /* command can be entered manually */ }
+    try { await api('api/terminal', { id: newId(), action: 'rename', terminal: result.terminal, title: agyShellTitle(dir) }); } catch (error) { /* best-effort title update */ }
+    open(result.terminal);
+    return true;
+  }
   // A conversation that the computer runs through its tool's structured mode, shown on the phone as a conversation
   // (web/chat/): a new one, or a saved one gone on with (`session`). The computer says whether it can (`chat`).
-  const CHAT_TOOLS = ['claude', 'codex'];
-  const chatOk = tool => !!data && (data.device.features || []).includes('chat') && CHAT_TOOLS.includes(tool) && (data.device.tools || []).includes(tool);
+  // the tools the computer runs as a conversation, and what it says of itself where it does (Antigravity CLI: by ACP)
+  const CHAT_TOOLS = { claude: 'chat', codex: 'chat', agy: 'chat-agy' };
+  const chatOk = tool => !!data && (data.device.features || []).includes('chat') && !!CHAT_TOOLS[tool] && (data.device.features || []).includes(CHAT_TOOLS[tool]) && (data.device.tools || []).includes(tool);
   async function chat(tool, dir, session, takeover) {
     const payload = { action: 'start', tool, dir, history: false, form: 'chat' };
     if (session) Object.assign(payload, { session, takeover: !!takeover });
@@ -389,19 +440,22 @@
     const script = el('script', { src: 'files/vendor/' + name, onload: done, onerror: failed });
     document.head.append(script);
   }));
-  async function writeSaid(box, messages, toolName, phoneTexts) {
+  async function writeSaid(box, messages, toolName, phoneTexts, cache) {
     let rich = false;
     try { await Promise.all([need('marked.min.js'), need('purify.min.js')]); rich = !!(window.marked && window.DOMPurify); } catch (error) { /* plain text then */ }
     const set = text => {
+      if (cache.has(text)) return cache.get(text).cloneNode(true);
       if (!rich) return el('div', { className: 'plain', textContent: text });
       // nothing that could act or load: no links to follow, no pictures, no forms, no styles of its own
       const html = DOMPurify.sanitize(marked.parse(text, { gfm: true, breaks: true }),
         { FORBID_TAGS: ['style', 'form', 'button', 'textarea', 'select', 'input', 'img', 'a', 'iframe', 'video', 'audio'], FORBID_ATTR: ['style', 'href', 'src'] });
       const body = el('div', { className: 'md', html });
       body.querySelectorAll('table').forEach(table => { const wrap = el('div', { className: 'wide' }); table.replaceWith(wrap); wrap.append(table); });
+      cache.set(text, body.cloneNode(true));
       return body;
     };
     let run = null, last = '';
+    const keyed = (node, value) => { node.readKey = JSON.stringify(value); return node; };
     messages.forEach(m => {
       if (m.role === 'tool') {
         // The steps stand open, each as a terminal would show it: what it is, the command itself where it is told
@@ -411,23 +465,27 @@
           m.detail ? el('code', { className: 'ran', textContent: m.detail }) : '', m.result ? el('pre', { className: 'got', textContent: m.result }) : ''));
         run.count++;
         run.box.firstChild.textContent = '做了 ' + run.count + ' 个操作';
+        run.rows = (run.rows || []).concat(m);
+        keyed(run.box, run.rows);
         return;
       }
       run = null;
       // what the tool said of its work between its steps: a quieter line of its own, under the tool's name like its answers
       if (m.role === 'thought') {
-        box.append(el('div', { className: 'turn assistant thought' }, last !== 'assistant' ? el('b', { textContent: toolName }) : '', el('div', { className: 'plain', textContent: m.text }), m.truncated ? el('small', { className: 'quiet', textContent: '这段内容超长，剩余部分请在电脑上查看' }) : ''));
+        box.append(keyed(el('div', { className: 'turn assistant thought' }, last !== 'assistant' ? el('b', { textContent: toolName }) : '', el('div', { className: 'plain', textContent: m.text }), m.truncated ? el('small', { className: 'quiet', textContent: '这段内容超长，剩余部分请在电脑上查看' }) : ''), [m, last]));
         last = 'assistant';
         return;
       }
       const mine = m.role === 'user';
       const fromPhone = mine && phoneTexts && phoneTexts.has(String(m.text || '').trim());
-      box.append(el('div', { className: 'turn ' + (mine ? 'user' : 'assistant') },
+      box.append(keyed(el('div', { className: 'turn ' + (mine ? 'user' : 'assistant') },
         !mine && last !== 'assistant' ? el('b', { textContent: toolName }) : '', set(m.text),
         m.truncated ? el('small', { className: 'quiet', textContent: '这条消息超长，剩余部分请在电脑上查看' }) : '',
-        fromPhone ? el('small', { className: 'phone-delivery', textContent: '手机消息' }) : ''));
+        fromPhone ? el('small', { className: 'phone-delivery', textContent: '手机消息' }) : ''), [m, last, !!fromPhone]));
       last = m.role;
     });
+    const texts = new Set(messages.map(m => m.text));
+    for (const key of cache.keys()) if (!texts.has(key)) cache.delete(key);
   }
   // For how long: 0:07, 3:25, 1:02:10.
   const lasted = ms => { const s = Math.max(0, Math.floor(ms / 1000)), two = n => String(n).padStart(2, '0'); return s >= 3600 ? Math.floor(s / 3600) + ':' + two(Math.floor(s / 60) % 60) + ':' + two(s % 60) : Math.floor(s / 60) + ':' + two(s % 60); };
@@ -446,10 +504,15 @@
   async function takeOver(session) {
     if (!usable()) return false;
     const canPeek = (data.device.features || []).includes('peek');
-    let watch = 0;
+    let watch = 0, readingView;
     const choice = await openSheet((form, finish) => {
       const now = () => (data.sessions || []).find(s => s.id === session.id && s.tool === session.tool) || session;
-      const head = el('p', { className: 'stands' }), said = el('div', { className: 'said' }), asks = el('div'), write = el('div', { className: 'write' }), below = el('div', { className: 'below' });
+      const headDot = el('span', { className: 'head-dot', ariaHidden: 'true' }), headText = el('span', { className: 'stands-text' });
+      const head = el('p', { className: 'stands' }, headDot, headText), said = el('div', { className: 'said' }), asks = el('div', { className: 'asks-host', hidden: true }), write = el('div', { className: 'write' }), below = el('div', { className: 'below' });
+      const reader = readingView = new RemoteConversation.Reader(said), textCache = new Map();
+      const draft = new RemoteConversation.Draft(pendingKey(session));
+      said.style.overflowAnchor = 'none';
+      said.setAttribute('aria-label', '对话内容'); said.tabIndex = 0;
       const control = el('div', { className: 'control-mode', role: 'status' });
       const phoneTexts = new Set();
       // Stopping what it is at, the same for every tool: by its application's channel (the one turn that is named,
@@ -660,14 +723,12 @@
             record = got.messages || [];
             if (typeof got.asked === 'number') asked = got.asked;
             if (typeof got.updated === 'number') changed = got.updated;
-            const end = !read || atEnd(), was = said.scrollTop;
             const fresh = el('div');
             if (got.more) fresh.append(el('p', { className: 'earlier', textContent: '更早的内容在电脑上' }));
-            await writeSaid(fresh, record, TOOLS[session.tool], phoneTexts);
-            said.replaceChildren(...fresh.childNodes);
-            waiting();
-            said.scrollTop = end ? said.scrollHeight : was;      // what was said last is what one came to see; someone reading further up is left there
-            latest.hidden = atEnd();
+            await writeSaid(fresh, record, TOOLS[session.tool], phoneTexts, textCache);
+            if (!said.isConnected) return;
+            const initial = !read;
+            reader.paint(said, () => reader.change(() => { reader.replace(fresh); waiting(); latest.hidden = atEnd(); }, initial));
           }
           stamp = typeof got.stamp === 'string' ? got.stamp : null; seen = listed; read = true;
         } catch (error) { stands = null; readError = '对话同步中断，正在重试：' + error.message; if (!read) said.replaceChildren(el('p', { className: 'quiet', textContent: error.message })); }
@@ -675,23 +736,32 @@
       }
       // ---- how it stands, what it asks, and the box
       const box = el('textarea', { rows: 1, maxLength: 8000, placeholder: '发消息', autocapitalize: 'off', spellcheck: false, ariaLabel: '消息' });
-      box.addEventListener('input', () => { box.style.height = 'auto'; box.style.height = Math.min(140, box.scrollHeight + 2) + 'px'; });
+      box.value = draft.get();
+      box.addEventListener('input', () => {
+        draft.set(box.value);
+        const prevScroll = box.scrollTop;
+        box.style.height = 'auto';
+        box.style.height = Math.min(144, box.scrollHeight + 2) + 'px';
+        if (prevScroll && box.scrollTop !== prevScroll) box.scrollTop = prevScroll;
+      });
       const send = el('button', { type: 'button', className: 'solid', textContent: '发送', onclick: async () => {
-        const text = box.value.trim();
+        const original = box.value, text = original.trim();
         if (send.disabled || !usable() || !can(now(), 'say') || now().ask) return;
         if (!text) return box.focus();
         stopSays('');
         // what is written stands in the window at once, as what the user said, while it is on its way
         const mine = { text, before: same(record, text) + pending.filter(p => p.text === text).length, sent: false, createdAt: Date.now(), payload: { id: newId(), session: session.id, action: 'say', text } };
         if (wayOf(now(), 'say') === APP) mine.payload.transport = APP;
-        pending.push(mine); savePending(); box.value = ''; box.style.height = 'auto';
+        pending.push(mine); savePending(); draft.set(original);
         phoneTexts.add(text);
         waiting(); said.scrollTop = said.scrollHeight;
         sending = true; send.disabled = true; quick = Date.now() + 45000;
         // what was not sent goes back into the box, to be sent again or changed
-        if (!await deliver(mine)) { const index = pending.indexOf(mine); if (index >= 0) pending.splice(index, 1); savePending(); phoneTexts.delete(text); if (!box.value) { box.value = text; box.dispatchEvent(new Event('input')); } }
+        if (!await deliver(mine)) { const index = pending.indexOf(mine); if (index >= 0) pending.splice(index, 1); savePending(); phoneTexts.delete(text); }
+        else { draft.clear(original); if (box.value === original) { box.value = ''; box.style.height = 'auto'; } }
         sending = false; send.disabled = false; waiting(); refresh(); seen = ''; shown = ''; show();
       } });
+      box.addEventListener('keydown', event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing) { event.preventDefault(); send.click(); } });
       // a conversation that has stopped is most often told to go on: one press, beside what is typed
       const goOn = el('button', { type: 'button', className: 'go', textContent: '继续', hidden: true, onclick: () => { if (!box.value.trim()) { box.value = '继续'; send.click(); } else box.focus(); } });
       write.append(goOn, box, send);
@@ -713,6 +783,7 @@
         sawBusy = kind !== 'busy' ? 0 : sawBusy || Date.now();
         const from = kind === 'busy' ? (asked && asked <= Date.now() ? asked : sawBusy) : kind === 'stopped' || kind === 'waiting' ? changed || current.updated : 0;
         state.className = 'state ' + kind;
+        headDot.className = 'head-dot ' + (!current.live ? 'off' : kind === 'busy' ? 'busy' : kind === 'confirm' ? 'confirm' : 'on');
         standing.textContent = !current.live ? '已在电脑上关闭' : PHASE[kind][0];
         clock.textContent = !from ? '' : kind === 'busy' ? lasted(Date.now() - from) : ago(from);
         ending.hidden = !canEnd(current);
@@ -726,9 +797,10 @@
         if (signature === shown) return;
         shown = signature;
         waiting();
-        head.textContent = whereOf({ s: current, tool: current.tool, live: current.live }) + ' · ' + (current.dir || base(current.folder));      // (how it stands is said in the line above the box)
+        headText.textContent = whereOf({ s: current, tool: current.tool, live: current.live }) + ' · ' + (current.dir || base(current.folder));      // (how it stands is said in the line above the box)
         // what it asks is answered here, under what was said
         asks.textContent = '';
+        asks.hidden = !current.ask;
         if (current.ask) {
           const answers = approvalActions(current, show);
           asks.append(el('div', { className: 'card asking' }, el('div', { className: 'ask' }, el('pre', { textContent: current.ask.text }), answers)));
@@ -753,6 +825,7 @@
       watch = setInterval(() => { if ($('sheet').open && (++ticks % 2 === 0 || Date.now() < quick)) show(); }, 500);
     }, true);
     clearInterval(watch);
+    if (readingView) readingView.dispose();
     if (choice && choice.handoff) { await views.together.handoff(choice.handoff); return false; }
     return choice ? into(choice.session, choice.value) : false;
   }
@@ -819,9 +892,9 @@
     const sessions = data.sessions || [], saved = {};
     sessions.forEach(s => { saved[s.tool + ':' + s.id] = s; });
     const out = (data.terminals || []).map(t => {
-      const s = t.session ? saved[t.tool + ':' + t.session] || null : null, phase = phaseOf(t), live = running(t);
+      const s = t.session ? saved[t.tool + ':' + t.session] || null : null, phase = phaseOf(t), live = running(t), tool = isAgyShell(t) ? 'agy' : t.tool;
       // an ended terminal whose conversation is listed is found there, to be gone on with: it is not listed twice
-      return { t, s, tool: t.tool, title: t.title, place: t.dir || base(t.folder), project: t.dir, apart: !t.dir, live, phase, rank: PHASE[phase][1], at: t.phase_at || t.created,
+      return { t, s, tool, title: t.title, place: t.dir || base(t.folder), project: t.dir, apart: !t.dir, live, phase, rank: PHASE[phase][1], at: t.phase_at || t.created,
         source: t.form === 'chat' ? 'app' : 'term', pinned: !!(s && s.pinned), hidden: false, state: live ? 'active' : 'ended', twice: !live && !!s && !s.terminal };
     });
     sessions.filter(s => !s.terminal).forEach(s => {
@@ -877,9 +950,14 @@
     box.hidden = !offered.length && !places.length;
     if (box.dataset.signature === signature) return;
     box.dataset.signature = signature;
-    const chip = (text, on, act) => el('button', { type: 'button', className: on ? 'on' : '', ariaPressed: String(on), textContent: text, onclick: act });
+    const MONO = { claude: 'CC', codex: 'CX', agy: 'AG', opencode: 'OC', qoder: 'QD', cline: 'CL', pi: 'PI' };
+    const chip = (text, on, act, toolKey) => {
+      const btn = el('button', { type: 'button', className: on ? 'on' : '', ariaPressed: String(on), textContent: text, onclick: act });
+      if (toolKey && MONO[toolKey]) { btn.dataset.tool = toolKey; btn.dataset.mono = MONO[toolKey]; }
+      return btn;
+    };
     const row = [chip('全部', !filter.tool && !filter.source, () => choose({ tool: '', source: '' }))];
-    offered.forEach(tool => row.push(chip(TOOLS[tool], filter.tool === tool, () => choose({ tool: filter.tool === tool ? '' : tool }))));
+    offered.forEach(tool => row.push(chip(TOOLS[tool], filter.tool === tool, () => choose({ tool: filter.tool === tool ? '' : tool }), tool)));
     if (offered.length && places.length) row.push(el('i'));
     places.forEach(source => row.push(chip(SOURCE[source], filter.source === source, () => choose({ source: filter.source === source ? '' : source }))));
     box.replaceChildren(...row);
@@ -992,7 +1070,7 @@
     const peek = el('span', { className: 'peek', hidden: true });
     peek.dataset.peek = t.id;
     const made = el('li', { className: 'card ' + phase }, el('button', { type: 'button', className: 'open', onclick: () => open(t.id, t.form) },
-      el('span', { className: 'tool ' + t.tool, html: ICON[t.tool] }), el('span', { className: 'text' }, named(x), meta, peek)));
+      el('span', { className: 'tool ' + x.tool, html: ICON[x.tool] || ICON.shell }), el('span', { className: 'text' }, named(x), meta, peek)));
     // A terminal that waits on a question is answered below, where the question is read: Enter would say yes to it.
     if (t.state === 'running' && phase !== 'confirm') made.append(el('button', { type: 'button', className: 'side say', ariaLabel: '给这个终端发消息', html: ICON.say, onclick: () => say(t) }));
     if (running(t)) made.append(el('button', { type: 'button', className: 'side', ariaLabel: '结束这个终端', html: ICON.stop, onclick: () => endTerminal(t) }));
@@ -1101,7 +1179,20 @@
     const waiting = stands(everything, 'confirm'), busy = everything.filter(working).length, opened = everything.filter(x => x.live && !needsYou(x) && !working(x)).length;
     // (inside the app, which lists several computers, the line says first which one this is)
     $('device-text').textContent = (computerName ? computerName + ' · ' : '') + (!ready ? (device.online ? '已暂停访问' : '电脑离线')
-      : project || !lists ? '电脑在线' : [waiting ? waiting + ' 个等你确认' : '', busy ? busy + ' 个正在运行' : '', opened ? opened + ' 个已打开' : ''].filter(Boolean).join(' · ') || '电脑在线');
+      : '电脑在线');
+    $('monitor').hidden = !!project || tab !== 'tasks';
+    $('metric-needs').textContent = ready ? waiting : '—';
+    $('metric-active').textContent = ready ? busy : '—';
+    $('metric-open').textContent = ready ? opened : '—';
+    $('metric-needs').toggleAttribute('data-active', ready && waiting > 0);
+    $('metric-active').toggleAttribute('data-active', ready && busy > 0);
+    const external = $('external-agy'), starts = ready ? device.agy_external || [] : [];
+    external.hidden = !starts.length;
+    if (external.dataset.starts !== starts.join(',')) {
+      external.dataset.starts = starts.join(',');
+      external.querySelector('summary').textContent = '电脑上的 Antigravity CLI · ' + starts.length + ' 个进程';
+      external.querySelector('ul').replaceChildren(...starts.map(at => el('li', { textContent: new Date(at).toLocaleString() + ' 启动' })));
+    }
     // what waits for an answer is counted on its tab, whichever tab is open
     $('tab-count').hidden = !waiting; $('tab-count').textContent = waiting > 9 ? '9+' : waiting;
     if (!lists) { if (views[tab]) views[tab].draw(); return; }
@@ -1160,8 +1251,9 @@
         if (work) { const c = el('span', { className: 'count', textContent: work + ' 个正在运行' }); c.prepend(el('i')); c.style.setProperty('--c', 'var(--busy)'); c.style.color = 'var(--busy)'; meta.append(c); }
         if (opened) meta.append(el('span', { textContent: opened + ' 个已打开' }));
         meta.append(el('span', { textContent: (source ? source + ' · ' : '') + (count ? count + ' 段对话' : '还没有对话') }));
+        const folderTone = need ? ' confirm' : work ? ' busy' : opened ? ' active' : '';
         const made = held(el('li', { className: 'card' }, el('button', { type: 'button', className: 'open', onclick: () => enter(name) },
-          el('span', { className: 'tool folder', html: ICON.folder }), el('span', { className: 'text' }, el('b', { textContent: name }), meta), el('span', { className: 'chev', html: ICON.chev }))),
+          el('span', { className: 'tool folder' + folderTone, html: ICON.folder }), el('span', { className: 'text' }, el('b', { textContent: name }), meta), el('span', { className: 'chev', html: ICON.chev }))),
           () => manageProject(name, folder));
         return { name, card: made, sign: [name, need, opened, work, own.length, count, folder.path, source] };
       });
@@ -1296,6 +1388,7 @@
   window.RemoteCliPage = {
     $, el, svg, ICON, TOOLS, api, newId, toast, openSheet, ask, ago, base, things, whereOf, wayOf, usable, running, phaseOf, go, takeOver, open, start, chat, chatOk, held, saved, keep,
     get data() { return data; },
+    get relayVersion() { return relayVersion; }, startAgyShell,
     get tab() { return tab; },
     has: feature => !!data && (data.device.features || []).includes(feature),
     refresh: () => refresh(),
@@ -1315,6 +1408,7 @@
       }
       if (!/^[a-f0-9]{32}$/.test(wanted)) early = fetch('api/terminal', { credentials: 'same-origin' }).then(reply => reply.ok ? reply.json() : null).catch(() => null);
       const session = await (await fetch('api/session', { credentials: 'same-origin' })).json();
+      relayVersion = session.version || '';
       if (!session.signed_in) return showLogin();
       // ?open=<terminal> goes straight to that terminal: the computer's own window opens the one that was picked.
       if (/^[a-f0-9]{32}$/.test(wanted)) return location.replace('terminal/?id=' + wanted);

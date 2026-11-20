@@ -8,7 +8,7 @@
   const native = window.RemoteCliNative || null;
   // Inside the app the look is the app's own, the same for every computer; a browser keeps it per address.
   // The terminal may have a skin of its own there ("termskin"); without one it follows the app's.
-  const LOOK = { skin: 'termskin', font: 'font', spacing: 'spacing', renderer: 'renderer' };
+  const LOOK = { skin: 'termskin', font: 'font', spacing: 'spacing', cursor: 'cursor', renderer: 'renderer' };
   const store = {
     get(key, fallback) {
       if (native && native.pref && LOOK[key]) { const chosen = native.pref(LOOK[key]) || (key === 'skin' ? native.pref('skin') : ''); if (chosen) return chosen; }
@@ -20,13 +20,17 @@
     } };
   const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
   const ui = () => window.TerminalUI;
+  function inputState(state, op, message = '') {
+    if (typeof ui().inputState === 'function') ui().inputState(state, op, message);
+    else if (message) ui().inputError(message, state === 'retrying' ? '' : op.data || '', op);
+  }
   const home = () => { location.replace('../'); };      // the list is one step back, not one more page
   // Opened from the app's workbench, the back arrow leads there again rather than to this computer's list.
   const fromBench = new URLSearchParams(location.search).get('from') === 'bench';
   const leave = () => { if (fromBench && native && native.home) native.home(); else home(); };
   // Quick tunnels buffer SSE; a held JSON response is delivered without that delay.
   let after = 0, terminal = null, loaded = false, streamed = !location.hostname.endsWith('.trycloudflare.com'), failures = 0, reader = null, run = 0, fetching = false, gone = false;
-  let socketMode = typeof WebSocket === 'function', socket = null, socketTimer = null;
+  let socketMode = typeof WebSocket === 'function', everSocket = false, socket = null, socketTimer = null;
   const link = { transport: socketMode ? 'websocket' : streamed ? 'sse' : 'http', state: 'connecting', reconnects: 0, lastLatency: null, everConnected: false };
   let lastLinkReport = '', latencyTimer = null, latencyReader = null, latencyRun = 0;
 
@@ -108,7 +112,7 @@
     ui().receive(item);
   }
   function resetPending() {
-    for (const op of queue) { clearTimeout(op.timer); op.inFlight = false; }
+    for (const op of queue) { clearTimeout(op.timer); op.inFlight = false; if (op.sent) inputState('retrying', op); }
   }
   function connectSocket() {
     if (gone || !loaded || document.hidden || socket) return;
@@ -139,7 +143,7 @@
       if (mine !== run) return;
       let item;
       try { item = JSON.parse(event.data); } catch (error) { channel.close(); return; }
-      if (item.t === 'out') { got = true; clearTimeout(socketTimer); connectedLink('websocket'); receive(item, true); }
+      if (item.t === 'out') { got = true; everSocket = true; clearTimeout(socketTimer); connectedLink('websocket'); receive(item, true); }
       else if (item.t === 'ack') {
         const at = queue.findIndex(op => op.id === item.id);
         if (at < 0) return;
@@ -148,6 +152,7 @@
         if (item.status >= 500) { socketMode = false; channel.close(); return; }
         queue.splice(at, 1);
         if (item.status !== 200 || item.state === 'error') ui().inputError(item.error || '操作没有执行', op.data || '', op);
+        else inputState('accepted', op);
         flush();
       }
     };
@@ -219,7 +224,18 @@
     if (reader) { reader.abort(); reader = null; }
     if (document.hidden) { link.state = 'paused'; reportLink(); }
   }
-  document.addEventListener('visibilitychange', () => { if (document.hidden) hangUp(); else read(); });
+  function resume() {
+    if (gone || !loaded || document.hidden) return;
+    // A brief outage during backgrounding or Wi-Fi/5G handoff should not lock the session off WebSocket forever.
+    if (everSocket && !socketMode) socketMode = true;
+    read();
+  }
+  document.addEventListener('visibilitychange', () => { if (document.hidden) hangUp(); else resume(); });
+  if (typeof addEventListener === 'function') addEventListener('online', () => {
+    if (gone || !loaded || document.hidden) return;
+    if (everSocket && !socketMode) socketMode = true;
+    if (link.state !== 'connected' || (everSocket && link.transport !== 'websocket')) { hangUp(); read(); }
+  });
 
   // ---- input: ordered WebSocket messages; HTTP fallback sends one request at a time
   const queue = [];
@@ -238,7 +254,7 @@
       if (!socket || socket.readyState !== WebSocket.OPEN) return;
       for (const op of [...queue]) {
         if (op.inFlight) continue;
-        if (Date.now() - op.at > 110000) { queue.splice(queue.indexOf(op), 1); ui().inputError('发送超时，请确认终端画面后重试', op.data || '', op); continue; }
+        if (Date.now() - op.at > 110000) { queue.splice(queue.indexOf(op), 1); inputState(op.sent ? 'unknown' : 'rejected', op, '发送超时，请确认终端画面后重试'); continue; }
         op.sent = true; op.inFlight = true;
         const { at, sent, inFlight, timer, ...payload } = op;
         const channel = socket;
@@ -249,7 +265,7 @@
       return;
     }
     const op = queue[0];
-    if (Date.now() - op.at > 110000) { queue.shift(); ui().inputError('发送超时，请确认终端画面后重试', op.data || '', op); return flush(); }
+    if (Date.now() - op.at > 110000) { queue.shift(); inputState(op.sent ? 'unknown' : 'rejected', op, '发送超时，请确认终端画面后重试'); return flush(); }
     sending = true; op.sent = true;
     let message = '', again = false;
     try {
@@ -259,33 +275,20 @@
     } catch (error) { again = true; message = '发送失败，正在重连'; }
     sending = false;
     if (!again) queue.shift();
-    if (message) ui().inputError(message, again ? '' : op.data || '', op);
+    if (again) inputState('retrying', op, message);
+    else if (message) ui().inputError(message, op.data || '', op);
+    else inputState('accepted', op);
     if (again) setTimeout(flush, 1000); else flush();
   }
 
-  // ---- menu
-  // fill adds what belongs between the title and the choices: a line of text, or a box to type in.
-  function sheet(title, choices, fill) {
-    let dialog = document.getElementById('rcli-menu');
-    if (!dialog) { dialog = document.createElement('dialog'); dialog.id = 'rcli-menu'; document.body.append(dialog); dialog.onclick = event => { if (event.target === dialog) dialog.close(); }; }
-    dialog.textContent = '';
-    const heading = document.createElement('h2'); heading.textContent = title; dialog.append(heading);
-    if (fill) fill(dialog);
-    choices.forEach(([label, act, current, kind]) => {
-      const button = document.createElement('button');
-      button.type = 'button'; button.textContent = label;
-      if (kind) button.className = kind;
-      if (current) button.setAttribute('aria-current', 'true');
-      button.onclick = () => { dialog.close(); act(); };
-      dialog.append(button);
-    });
-    const cancel = document.createElement('button');
-    cancel.type = 'button'; cancel.className = 'cancel'; cancel.textContent = '取消'; cancel.onclick = () => dialog.close();
-    dialog.append(cancel);
-    dialog.showModal();
-  }
+  // ---- menu: what the terminal is, what is done with its conversation (handed to another AI, asked at a time), its
+  // name, and how it is shown. Each opens as a page of the same sheet (../ui/sheet.js, ../ui/work.js).
+  const TOOLS = { claude: 'Claude Code', codex: 'Codex', agy: 'Antigravity CLI', opencode: 'OpenCode', qoder: 'Qoder', cline: 'Cline', pi: 'Pi', shell: '终端' };
+  let work = null;
+  const say = text => { const t = ui(); if (t && t.notice) t.notice(text); else if (t) t.error(text); };
+  const worker = () => work || (work = window.RemoteWork.forPage('../', say));
   async function again() {
-    if (!terminal || terminal.state !== 'closed' || terminal.tool === 'shell') return;
+    if (!terminal || terminal.state !== 'closed' || ['shell', 'agy'].includes(terminal.tool)) return;
     const start = { action: 'start', id: newId(), tool: terminal.tool, dir: terminal.dir };
     if (terminal.session) start.session = terminal.session;
     start.history = false;
@@ -299,36 +302,87 @@
   // The files of the project this terminal works in. The terminal goes on running on the computer; the back arrow
   // of the file pages, or the phone's back key, leads here again.
   function files() { if (terminal) location.href = '../files/?dir=' + encodeURIComponent(terminal.dir) + '&from=terminal'; }
+  const agyShell = t => {
+    if (!t || t.tool !== 'shell') return false;
+    if (/^Antigravity CLI(?:\s|$|·)/.test(t.title || '')) return true;
+    try { const list = JSON.parse(sessionStorage.getItem('agy-shell-ids') || '[]'); return Array.isArray(list) && list.includes(t.id); } catch (error) { return false; }
+  };
+  const displayTool = t => !t ? 'shell' : agyShell(t) ? 'agy' : t.tool;
+  const of = () => ({ id: terminal.session || '', tool: terminal.tool, title: terminal.title || TOOLS[displayTool(terminal)], dir: terminal.dir || '', terminal: id });
+  // a conversation of a tool the computer knows how to hand over and ask: Claude Code and Codex (and on Linux a few more)
+  const talks = () => !!terminal && !['shell', 'agy'].includes(displayTool(terminal));
+  function menuPage() {
+    const kit = window.RemoteSheet.ui;
+    return { title: '终端', build(p) {
+      const shown = displayTool(terminal);
+      const closed = terminal.state === 'closed', glyph = shown === 'claude' || shown === 'codex' || shown === 'agy' ? shown : 'term';
+      const tint = shown === 'claude' ? 'claude' : shown === 'agy' ? 'agy' : shown === 'shell' ? 'good' : 'codex';
+      const transportLabels = { websocket: 'WebSocket', sse: 'SSE', http: 'HTTP' };
+      const connSummary = closed ? '已结束' : link.state === 'connected'
+        ? ('已连接 · ' + (transportLabels[link.transport] || link.transport) + (Number.isFinite(link.lastLatency) ? ' ' + Math.round(Math.max(0, link.lastLatency)) + 'ms' : '') + (link.reconnects > 0 ? ' · 重连 ' + link.reconnects + ' 次' : ''))
+        : link.state === 'reconnecting' ? '正在重连' : link.state === 'offline' ? '已断开' : '正在连接';
+      p.body.append(kit.who({ icon: glyph, tint, title: terminal.title || TOOLS[shown] || '终端',
+        line: (TOOLS[shown] || shown) + (terminal.dir ? ' · ' + terminal.dir : '') + ' · ' + connSummary, state: closed ? 'var(--muted)' : link.state === 'connected' ? 'var(--good)' : link.state === 'offline' ? 'var(--bad)' : 'var(--busy)' }));
+      const why = !talks() ? '终端里没有 AI 对话' : !terminal.session ? '对话开始后才能使用' : '';
+      p.body.append(kit.tiles([
+        { id: 'menu-handoff', icon: 'hand', tint: 'claude', label: '交给 AI', why, say, act: () => worker().handoff(p.sheet, of()) },
+        { id: 'menu-schedule', icon: 'clock', tint: 'time', label: '定时提问', why: why || (closed ? '终端已结束，先继续这个对话' : ''), say, act: () => worker().schedules(p.sheet, of()) },
+        { id: 'menu-files', icon: 'folder', tint: 'file', label: '项目文件', say, act: () => { p.sheet.close(null, true); files(); } },
+        { id: 'menu-copy', icon: 'copy', tint: 'copy', label: '复制画面', say, act: async () => { const text = ui().screenText(); p.sheet.close(null); if (!await window.RemoteSheet.copy(text)) ui().error('没能复制，请长按选择文字'); } }]));
+      const rows = [kit.row({ icon: 'pen', tint: 'muted', label: '重命名', value: terminal.title || '', go: () => p.sheet.push(renamePage()) })];
+      if (closed && talks()) rows.push(kit.row({ icon: 'play', tint: 'good', label: terminal.session ? '继续这个对话' : '重新新建对话', act: () => { p.sheet.close(null, true); again(); } }));
+      p.body.append(kit.section('终端', kit.group(...rows)));
+      const skins = window.RemoteCliSkins, follows = !!(native && native.pref && native.setPref) && !native.pref('termskin');
+      const storedSkin = store.get('skin', 'paper');
+      const skin = skins[storedSkin] || skins.paper, dom = store.get('renderer', 'webgl') === 'dom';
+      const skinLabel = follows ? '跟随 App' : storedSkin === 'auto' ? '跟随系统' : skin.name;
+      const t = ui(), sizes = t.fontSizes ? t.fontSizes() : [];
+      const show = [kit.row({ icon: 'look', tint: 'look', label: '外观', value: skinLabel, go: () => p.sheet.push(lookPage()) })];
+      if (sizes.length) show.push(kit.row({ label: '字号', end: kit.stepper(t.fontSize(), { min: sizes[0], max: sizes[sizes.length - 1], step: sizes[1] - sizes[0], label: '字号' }, size => t.setFontSize(size)) }));
+      show.push(kit.row({ label: '行距', end: kit.seg(t.spacings().map(s => [s.key, s.name]), (t.spacings().find(s => s.current) || {}).key, key => { store.set('spacing', key); t.setSpacing(key); }, { label: '行距' }) }));
+      if (t.cursors && t.setCursorStyle) show.push(kit.row({ label: '光标', end: kit.seg(t.cursors().map(c => [c.key, c.name]), (t.cursors().find(c => c.current) || {}).key, key => t.setCursorStyle(key), { label: '光标' }) }));
+      show.push(kit.row({ label: '兼容绘制', detail: '画面空白或花屏时打开', end: kit.toggle(dom, on => { store.set('renderer', on ? 'dom' : 'webgl'); setTimeout(() => location.reload(), 220); }, '兼容绘制') }));
+      p.body.append(kit.section('显示', kit.group(...show)));
+      if (!closed) p.body.append(kit.group(kit.row({ label: '结束终端', danger: true, act: () => p.sheet.push(kit.confirm({ title: '结束终端', text: '正在运行的任务会被中断。对话保存在电脑上，可以从历史对话继续。', label: '结束终端', kind: 'danger', act: sheet => { sheet.close(null); enqueue({ action: 'close' }); } })) })));
+    } };
+  }
+  function renamePage() {
+    const kit = window.RemoteSheet.ui;
+    return { title: '重命名', build(p) {
+      const box = kit.input({ id: 'terminal-name', value: terminal.title || '', max: 60, label: '终端名称' });
+      setTimeout(() => { box.focus(); box.select(); }, 280);
+      const save = kit.go('保存', async () => {
+        const title = box.value.trim();
+        if (!title) throw new Error('请写下名称');
+        const { status, body } = await post({ action: 'rename', id: newId(), terminal: id, title });
+        if (status !== 200) throw new Error(body.error || '没有保存');
+        terminal.title = title;
+        p.sheet.goBack();
+      }, { busy: '正在保存…', id: 'rename-save' });
+      box.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); save.button.click(); } });
+      p.body.append(box);
+      p.foot.append(...save.nodes);
+    } };
+  }
+  function lookPage() {
+    const kit = window.RemoteSheet.ui;
+    return { title: '终端外观', build(p) {
+      const skins = window.RemoteCliSkins, canFollow = !!(native && native.pref && native.setPref), follows = canFollow && !native.pref('termskin');
+      const currentKey = store.get('skin', 'paper');
+      const list = Object.keys(skins).map(key => ({ key, name: skins[key].name, bg: skins[key].t.background, ink: skins[key].t.foreground, muted: skins[key].muted, accent: skins[key].accent, current: !follows && key === currentKey }));
+      list.unshift({ key: 'auto', name: '跟随系统', follow: true, current: !follows && currentKey === 'auto' });
+      if (canFollow) list.unshift({ key: 'app', name: '跟随 App', follow: true, current: follows });
+      p.body.append(kit.swatches(list, key => {
+        if (key === 'app') { native.setPref('termskin', 'app'); ui().setSkin(store.get('skin', 'paper')); return; }
+        store.set('skin', key); ui().setSkin(key);
+      }));
+    } };
+  }
   function menu() {
     if (!terminal) return;
-    const closed = terminal.state === 'closed', dom = store.get('renderer', 'webgl') === 'dom', choices = [];
-    if (closed && terminal.tool !== 'shell') choices.push([terminal.session ? '继续这个对话' : '重新新建对话', again]);
-    choices.push(['更换外观', () => {
-      const follows = !!(native && native.pref && native.setPref) && !native.pref('termskin');
-      const looks = ui().skins().map(s => [s.name, () => { store.set('skin', s.key); ui().setSkin(s.key); }, s.current && !follows]);
-      if (native && native.pref && native.setPref) looks.unshift(['跟随 App 外观', () => { native.setPref('termskin', 'app'); ui().setSkin(store.get('skin', 'paper')); }, follows]);
-      sheet('终端外观', looks);
-    }]);
-    choices.push(['行距', () => sheet('行距', ui().spacings().map(s => [s.name, () => { store.set('spacing', s.key); ui().setSpacing(s.key); }, s.current]))]);
-    // Questions are asked on the same sheet: the system's own dialogs look foreign, and not every app shows them.
-    choices.push(['重命名', () => {
-      const box = document.createElement('input');
-      box.value = terminal.title; box.maxLength = 60; box.spellcheck = false; box.setAttribute('aria-label', '终端名称');
-      sheet('终端名称', [['保存', async () => {
-        const title = box.value.trim();
-        if (!title) return;
-        try { const { status, body } = await post({ action: 'rename', id: newId(), terminal: id, title }); if (status !== 200) ui().error(body.error || '没有保存'); }
-        catch (error) { ui().error('没有保存，请重试'); }
-      }, false, 'solid']], dialog => dialog.append(box));
-      box.focus(); box.select();
-    }]);
-    choices.push(['查看项目文件', files]);
-    choices.push(['复制终端画面', async () => { try { await navigator.clipboard.writeText(ui().screenText()); } catch (error) { ui().error('浏览器不允许复制，请长按选择文字'); } }]);
-    choices.push([dom ? '画面卡顿时：改用显卡绘制' : '画面空白或花屏时：改用兼容绘制', () => { store.set('renderer', dom ? 'webgl' : 'dom'); location.reload(); }]);
-    if (!closed) choices.push(['结束终端', () => sheet('结束这个终端？', [['结束终端', () => enqueue({ action: 'close' }), false, 'danger']], dialog => {
-      const text = document.createElement('p'); text.textContent = '正在运行的任务会被中断。对话保存在电脑上，可以从历史对话继续。'; dialog.append(text);
-    }), false, 'danger']);
-    sheet('终端选项', choices);
+    if (!window.RemoteSheet) return;
+    if (talks()) worker().ensure();
+    window.RemoteSheet.open(menuPage(), '终端选项');
   }
 
   // ---- speech: the app's system recognizer, else the browser's where it has one
@@ -352,6 +406,8 @@
     skin: () => store.get('skin', 'paper'),
     renderer: () => store.get('renderer', 'webgl'),
     spacing: () => store.get('spacing', 'cozy'),
+    cursor: () => store.get('cursor', 'block'),
+    saveCursor(style) { if (['block', 'bar', 'underline'].includes(style)) store.set('cursor', style); },
     chrome(color) {
       if (!/^#[0-9a-fA-F]{6}$/.test(color)) return;
       let meta = document.querySelector('meta[name="theme-color"]');

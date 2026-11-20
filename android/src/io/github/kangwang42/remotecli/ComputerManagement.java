@@ -1,9 +1,11 @@
 package io.github.kangwang42.remotecli;
 
-import android.app.AlertDialog;
+import android.graphics.drawable.GradientDrawable;
 import android.os.SystemClock;
+import android.view.Gravity;
 import android.view.View;
 import android.webkit.CookieManager;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import java.io.ByteArrayOutputStream;
@@ -21,69 +23,120 @@ import org.json.JSONObject;
 
 /** Native computer management, reachable without opening its web workbench. */
 final class ComputerManagement {
+    private static final int TINT_AGY = 0xff5536c9, TINT_WARN = 0xff9a5b00;
+
     private final MainActivity activity;
     private final Kit kit;
     private final Workbench bench;
     private final Map<String, ComputerUpdate> states = new HashMap<>();
     private final Set<String> loading = new HashSet<>();
-    private String current = "";
+    private String current = "", currentName = "";
     private LinearLayout details;
     private final Runnable tick = this::refresh;
 
     ComputerManagement(MainActivity activity, Kit kit, Workbench bench) {
         this.activity = activity; this.kit = kit; this.bench = bench;
     }
+
     View build(String url, String name) {
-        stop(); current = url;
+        stop(); current = url; currentName = name;
         if (!states.containsKey(url)) states.put(url, new ComputerUpdate());
-        LinearLayout page = kit.page(14);
-        page.addView(kit.button("‹ 返回", 2, () -> activity.home("")));
-        page.addView(kit.head(name, kit.text(MainActivity.host(url), 13, kit.MUTED)), kit.below(12));
-        details = kit.settingGroup(page, "电脑版本与更新");
+        LinearLayout page = kit.page(12);
+        View refreshIcon = kit.circleAction(R.drawable.ic_refresh, "刷新电脑版本", false, this::refresh);
+        page.addView(kit.navBar(name, () -> activity.home(""), refreshIcon));
+
+        details = kit.column();
+        page.addView(details, kit.below(14));
         draw();
+
         LinearLayout access = kit.settingGroup(page, "使用这台电脑");
-        kit.setting(access, "打开工作台", "查看这台电脑上的对话、终端和项目", "", () -> activity.open(url, ""));
-        kit.setting(access, "远程桌面", "关联 UU 远程、打开桌面或小窗；终端离线时也可使用", "", () -> activity.desktop(url));
-        kit.setting(access, "电脑设置", "连接线路、远程访问与工具", "", () -> activity.computerSettings(url));
+        kit.setting(access, R.drawable.ic_computer, kit.accentInk(), "打开工作台", "查看这台电脑上的对话、终端和项目", "", kit.MUTED, () -> activity.open(url, ""));
+        kit.setting(access, R.drawable.ic_chart, TINT_AGY, "工作统计", "查看今日与近 30 天使用趋势", "", kit.MUTED, () -> activity.computerPage(url, "me"));
+        kit.setting(access, R.drawable.ic_desktop, TINT_WARN, "远程桌面", "通过 UU 远程打开桌面或小窗", "", kit.MUTED, () -> activity.desktop(url));
+        kit.setting(access, R.drawable.ic_settings, kit.MUTED, "电脑设置", "连接线路、远程访问与工具", "", kit.MUTED, () -> activity.computerSettings(url));
+
         LinearLayout saved = kit.settingGroup(page, "连接管理");
-        kit.setting(saved, "名称与连接", "改名、重新扫码登录或从手机移除", "", () -> activity.manageConnection(url));
+        kit.setting(saved, R.drawable.ic_link, kit.MUTED, "名称与连接", "改名或重新扫码登录", "", kit.MUTED, () -> activity.manageConnection(url));
+        kit.setting(saved, R.drawable.ic_stop, kit.BAD, "从手机移除这台电脑", "不需要电脑在线或密码，仅从手机列表删除", "", kit.BAD, () -> activity.confirmRemoveComputer(url));
         return page;
     }
+
     private void draw() {
         ComputerUpdate state = states.get(current);
         details.removeAllViews();
-        LinearLayout body = kit.column(); body.setPadding(kit.dp(16), kit.dp(16), kit.dp(16), kit.dp(16));
-        details.addView(body);
-        TextView standing = kit.standing(state.connection);
-        kit.stands(standing, state.connection, kit.MUTED, state.online && state.enabled ? kit.GOOD : kit.BUSY);
-        body.addView(standing);
-        body.addView(kit.bold(state.version.isEmpty() ? "版本暂不可用" : "v" + state.version, 28, kit.INK), kit.below(12));
-        body.addView(kit.text("Remote AI · 电脑端" + (!state.online && !state.version.isEmpty() ? " · 上次读取" : ""), 13, kit.MUTED), kit.below(4));
-        String hint = !state.online ? "请保持电脑开机并运行 Remote AI，连接后可读取版本和发起更新。"
+        boolean ready = state.online && state.enabled;
+        LinearLayout hero = kit.column();
+        hero.setPadding(kit.dp(16), kit.dp(16), kit.dp(16), kit.dp(16));
+        hero.setBackground(kit.shape(kit.heroBg(), kit.heroBorder(), 22));
+        kit.elevate(hero, 1.5f);
+
+        LinearLayout top = kit.row();
+        FrameLayout iconWrap = new FrameLayout(activity);
+        iconWrap.setBackground(kit.shape(kit.accentSoft(), 0, 14));
+        iconWrap.addView(kit.icon(R.drawable.ic_computer, kit.accentInk(), 22), new FrameLayout.LayoutParams(kit.dp(22), kit.dp(22), Gravity.CENTER));
+        View dot = new View(activity);
+        GradientDrawable dotShape = kit.shape(ready ? kit.goodDot() : state.online ? kit.busyDot() : kit.BAD, 0, 6);
+        dotShape.setStroke(kit.dp(2.5f), kit.heroBg());
+        dot.setBackground(dotShape);
+        FrameLayout.LayoutParams dotLp = new FrameLayout.LayoutParams(kit.dp(12), kit.dp(12), Gravity.BOTTOM | Gravity.END);
+        dotLp.setMargins(0, 0, -kit.dp(1), -kit.dp(1));
+        iconWrap.addView(dot, dotLp);
+        LinearLayout.LayoutParams wrapLp = new LinearLayout.LayoutParams(kit.dp(44), kit.dp(44));
+        wrapLp.rightMargin = kit.dp(12);
+        top.addView(iconWrap, wrapLp);
+
+        LinearLayout meta = kit.column();
+        LinearLayout titleRow = kit.row();
+        titleRow.addView(kit.line(currentName, 16, kit.heroFg(), true));
+        int tagFg = ready ? kit.goodInk() : state.online ? kit.busyInk() : kit.BAD;
+        int tagBg = ready ? kit.goodSoft() : state.online ? kit.busySoft() : kit.badSoft();
+        TextView onlineTag = kit.statusPill(state.connection, tagFg, tagBg, 0);
+        LinearLayout.LayoutParams tagLp = new LinearLayout.LayoutParams(-2, -2);
+        tagLp.leftMargin = kit.dp(8);
+        titleRow.addView(onlineTag, tagLp);
+        meta.addView(titleRow);
+        meta.addView(kit.line(MainActivity.host(current), 12.5f, kit.heroMuted(), false), kit.below(2));
+        top.addView(meta, new LinearLayout.LayoutParams(0, -2, 1));
+
+        String versionLabel = state.version.isEmpty() ? "版本未知" : "v" + state.version;
+        top.addView(kit.statusPill(versionLabel, kit.MUTED, kit.RAISED, 0));
+        hero.addView(top);
+
+        String hint = !state.online ? "保持电脑开机并运行 Remote AI 后，可查看版本并发起远程更新。"
             : !state.enabled ? "在电脑端恢复手机访问后可发起更新。"
-            : !state.supported ? "此电脑端暂不支持手机更新，请先在电脑上安装支持远程更新的版本。"
-            : state.version.isEmpty() ? "电脑未提供版本号，请刷新或在电脑端检查。"
-            : state.newer.isEmpty() ? "可让电脑检查新版；发现新版后会下载并安装。" : "发现新版本 v" + state.newer;
-        body.addView(kit.text(hint, 14, state.newer.isEmpty() ? kit.MUTED : kit.ACCENT), kit.below(14));
+            : !state.supported ? "此电脑端暂不支持手机更新，请先在电脑上安装新版。"
+            : state.version.isEmpty() ? "暂未读取到版本号，点右上角刷新重试。"
+            : state.newer.isEmpty() ? "电脑端版本正常，可随时检查更新。" : "发现新版本 v" + state.newer + "，可远程安装。";
+        hero.addView(kit.text(hint, 13, state.newer.isEmpty() ? kit.heroMuted() : kit.accentInk()), kit.below(12));
+        if (!state.note.isEmpty()) hero.addView(kit.text(state.note, 12.5f, kit.heroMuted()), kit.below(6));
+
         final String url = current;
-        TextView update = kit.button(state.busy() ? "正在等待电脑更新…" : state.newer.isEmpty() ? "检查并更新电脑端" : "更新电脑至 v" + state.newer, 0, () -> confirm(url));
-        update.setEnabled(state.canUpdate()); update.setAlpha(state.canUpdate() ? 1f : .45f);
-        body.addView(update, kit.below(16));
-        if (!state.note.isEmpty()) body.addView(kit.text(state.note, 13, kit.MUTED), kit.below(12));
-        TextView refresh = kit.button(loading.contains(url) ? "正在读取版本…" : "刷新电脑版本", 2, this::refresh);
-        refresh.setEnabled(!loading.contains(url)); body.addView(refresh, kit.below(6));
+        if (state.canUpdate() || state.busy()) {
+            String actionLabel = state.busy() ? "正在等待电脑更新…"
+                : state.newer.isEmpty() ? "检查电脑端更新" : "更新电脑至 v" + state.newer;
+            TextView cta = kit.semibold(loading.contains(url) ? "正在读取版本…" : actionLabel, 14, kit.onSolidInk());
+            cta.setGravity(Gravity.CENTER);
+            cta.setMinHeight(kit.dp(48));
+            cta.setBackground(kit.shape(kit.solidInk(), 0, 14));
+            kit.press(cta, () -> { if (state.canUpdate()) confirm(url); });
+            hero.addView(cta, kit.below(14));
+        }
+        details.addView(hero);
     }
+
     private void confirm(String url) {
         ComputerUpdate state = states.get(url);
         if (state == null || !state.canUpdate()) return;
-        new AlertDialog.Builder(activity).setTitle(state.newer.isEmpty() ? "检查并更新这台电脑？" : "更新电脑至 v" + state.newer + "？")
-            .setMessage("由这台电脑检查、下载并安装新版；已是最新版时不会重装。安装会重启 Remote AI，手机连接暂时中断，正在执行的终端任务可能被打断。建议先等任务完成。")
-            .setNegativeButton("取消", null).setPositiveButton("检查并更新", (d, w) -> {
-                state.begin(UUID.randomUUID().toString().replace("-", ""), SystemClock.elapsedRealtime());
-                if (url.equals(current) && activity.showing("computer")) { draw(); refresh(); }
-            }).show();
+        String title = state.newer.isEmpty() ? "检查并更新这台电脑？" : "更新电脑至 v" + state.newer + "？";
+        String note = "由这台电脑检查、下载并安装新版；已是最新版时不会重装。安装会重启 Remote AI，手机连接暂时中断，正在执行的终端任务可能被打断。建议先等任务完成。";
+        kit.confirmSheet(title, note, "检查并更新", false, () -> {
+            state.begin(UUID.randomUUID().toString().replace("-", ""), SystemClock.elapsedRealtime());
+            if (url.equals(current) && activity.showing("computer")) { draw(); refresh(); }
+        });
     }
+
     void stop() { activity.ticker.removeCallbacks(tick); }
+
     void refresh() {
         stop();
         if (!activity.showing("computer")) return;
@@ -115,6 +168,7 @@ final class ComputerManagement {
             });
         });
     }
+
     private void send(String url, String cookie, ComputerUpdate state) {
         final String id = state.request;
         activity.net.execute(() -> {
@@ -133,12 +187,14 @@ final class ComputerManagement {
             });
         });
     }
+
     private void finished(String url) {
         loading.remove(url);
         if (!url.equals(current) || !activity.showing("computer")) return;
         draw();
         activity.ticker.postDelayed(tick, 5000);
     }
+
     private JSONObject overview(String url, String cookie) throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL(url + "/api/terminal").openConnection();
         try {

@@ -1,12 +1,14 @@
-/* 我的: the owner's work with the tools in numbers, as the computer reads it from Claude Code's and Codex's own
-   records (docs/PROTOCOL.md, `/api/work`, "stats"): today, and the last days by day, by tool, by project and by
-   hour; and what program the computer runs. Numbers and names of folders only: nothing that was said. */
+/* 我的: how much of each tool's usage limits is used, as the computer reads it from the tools (device.quotas,
+   agent-windows/Quotas.cs); the owner's work with the tools in numbers, as the computer reads it from Claude Code's
+   and Codex's own records (docs/PROTOCOL.md, `/api/work`, "stats"): today, and the last days by day, by tool, by
+   project and by hour; and what program the computer runs. Numbers and names of folders only: nothing that was said. */
 (() => {
   'use strict';
   const page = window.RemoteCliPage, { $, el, TOOLS, api, newId } = page;
   const box = $('me'), kept = {};       // by how many days were asked for: when, and what the computer answered
   const METRIC = { prompts: '提问', active: '时长', tokens: 'token' }, WEEK = '日一二三四五六';
   let span = 7, metric = 'prompts', picked = -1, asking = 0, tried = 0, wanted = false, failed = '', drawn = '', expanded = new URLSearchParams(location.search).has('stats');
+  const expandedPools = {};
 
   // ---- numbers as they are read
   const trim = value => value >= 100 ? String(Math.round(value)) : value.toFixed(1).replace(/\.0$/, '');
@@ -82,6 +84,44 @@
     if (stats.hours.some(n => n > 0)) parts.push(head('时段', peak + ' 点最多'), hours(stats));
     return el('section', { id: 'period' }, ...parts);
   }
+  // ---- the limits: primary pool shown directly per tool; secondary pools expand on tap
+  const WINDOWS = { five_hour: '5 小时', seven_day: '本周' };
+  const windowName = name => WINDOWS[name] || (/_five_hour$/.test(name) ? '5 小时' : /_seven_day$/.test(name) ? '本周' : /^\d+m$/.test(name) ? (parseInt(name, 10) >= 1440 ? Math.round(parseInt(name, 10) / 1440) + ' 天' : Math.round(parseInt(name, 10) / 60) + ' 小时') : name);
+  function renews(seconds) {
+    if (!seconds) return '';
+    const left = seconds * 1000 - Date.now();
+    if (left <= 0) return '已重置';
+    const minutes = Math.round(left / 60000);
+    return (minutes < 60 ? minutes + ' 分钟' : minutes < 2880 ? Math.round(minutes / 60) + ' 小时' : Math.round(minutes / 1440) + ' 天') + '后重置';
+  }
+  function quotaRow(title, w) {
+    return el('li', { className: w.used >= 90 ? 'high' : '' },
+      el('div', { className: 'line' }, el('b', { textContent: title }),
+        el('span', { textContent: Math.round(w.used) + '%' + (w.resets ? ' · ' + renews(w.resets) : '') })),
+      el('div', { className: 'track', role: 'img', ariaLabel: '已用 ' + Math.round(w.used) + '%' }, el('i', { style: 'width:' + Math.max(2, Math.min(100, w.used)).toFixed(1) + '%' })));
+  }
+  function quotas() {
+    const known = (page.data.device.quotas || []).filter(q => q.windows.length || q.why);
+    if (!known.length) return '';
+    const lines = [];
+    known.forEach(q => {
+      if (!q.windows.length) { lines.push(el('li', null, el('div', { className: 'line' }, el('b', { textContent: TOOLS[q.tool] || q.tool }), el('span', { textContent: q.why })))); return; }
+      const main = q.windows.filter(w => !w.group), extra = main.length ? q.windows.filter(w => w.group) : [];
+      (main.length ? main : q.windows).forEach(w => lines.push(quotaRow((w.group || TOOLS[q.tool] || q.tool) + ' · ' + windowName(w.name), w)));
+      if (extra.length) {
+        const open = !!expandedPools[q.tool], pools = new Set(extra.map(w => w.group)).size, warn = !open && extra.some(w => w.used >= 90);
+        const toggle = el('button', { type: 'button', className: 'quota-more' + (warn ? ' warn' : ''), ariaExpanded: String(open),
+          onclick: () => { expandedPools[q.tool] = !open; draw(); } },
+          el('span', { textContent: '其他 ' + pools + ' 个池子' }),
+          el('b', { textContent: (warn ? '接近上限 · ' : '') + (open ? '收起 ▴' : '展开 ▾') }));
+        const wrap = el('li', { className: 'quota-extra-wrap' }, toggle);
+        if (open) wrap.append(el('ul', { className: 'quota-extra' }, ...extra.map(w => quotaRow(w.group + ' · ' + windowName(w.name), w))));
+        lines.push(wrap);
+      }
+    });
+    const newest = Math.max(...known.map(q => q.at));
+    return el('section', { id: 'quotas' }, head('额度', page.ago(newest) + '更新'), el('ul', { className: 'panel shares' }, ...lines));
+  }
   function computer() {
     const device = page.data.device, tools = (device.tools || []).map(tool => TOOLS[tool]).join(' · ');
     const row = (name, value, more) => el('li', { className: 'row' }, el('span', { className: 'text' }, el('b', { textContent: name })), el('span', { className: 'value', textContent: value }), more || '');
@@ -91,28 +131,37 @@
       tools ? row('工具', tools) : ''));
   }
 
+  const ICONS = {
+    bell: page.svg('<path d="M6.5 16.5h11l-1.3-2.2V10a4.2 4.2 0 1 0-8.4 0v4.3z"/><path d="M10 19a2 2 0 0 0 4 0"/>', 18),
+    look: page.svg('<circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 0 0 0 17c1.4 0 1.8-1 1.3-2-.6-1.2.2-2.5 1.6-2.5h2.1A3.5 3.5 0 0 0 20.5 12 8.5 8.5 0 0 0 12 3.5z"/><circle cx="8" cy="11" r="1.1"/><circle cx="11.5" cy="7.8" r="1.1"/><circle cx="15.5" cy="9" r="1.1"/>', 18),
+    computer: page.svg('<rect x="3.5" y="5" width="17" height="11.5" rx="2.2"/><path d="M8.5 19.5h7M12 16.5v3"/>', 18),
+    chart: page.svg('<path d="M5 19V11M10.5 19V6M16 19v-5M19.5 19H3.5"/>', 18),
+    update: page.svg('<path d="M12 4.5v10M8 10.5l4 4 4-4"/><path d="M5 18.5h14"/>', 18)
+  };
   function settings() {
     const native = window.RemoteCliNative, group = (title, ...rows) => el('section', { className: 'settings-section' }, head(title), el('div', { className: 'settings-group' }, ...rows));
-    const row = (label, description, value, action) => el('button', { type: 'button', className: 'setting-row', onclick: action },
-      el('span', { className: 'setting-copy' }, el('b', { textContent: label }), el('small', { textContent: description })),
-      el('span', { className: 'setting-value', textContent: value || '' }), el('span', { className: 'setting-chevron', ariaHidden: 'true', textContent: '›' }));
-    const groups = [];
-    if (native && native.reminders) groups.push(group('提醒与后台', row('提醒与权限', '通知、电池与后台联网', native.reminderStatus ? native.reminderStatus() : '', () => native.reminders())));
-    groups.push(group('使用偏好', row('外观与文字', '主题、字号与终端阅读方式', '', () => { location.href = 'computer/#part-look'; })));
-    groups.push(group('连接与设备', row('电脑设置', '连接线路、远程访问与工具', page.usable() ? '在线' : '离线', () => { location.href = 'computer/'; })));
-    if (native && native.update) groups.push(group('版本与更新', row('检查更新', 'Remote AI · ' + (native.version ? native.version() : ''), '', () => native.update())));
-    groups.push(group('工作记录', row('工作统计', '提问、对话与工作时长', expanded ? '收起' : '查看', () => { expanded = !expanded; draw(); })));
-    return el('div', { className: 'settings-grid' }, ...groups);
+    const row = (icon, tint, label, description, value, action, tone) => el('button', { type: 'button', className: 'setting-row', onclick: action },
+      el('span', { className: 'setting-glyph ' + tint, html: ICONS[icon] }),
+      el('span', { className: 'setting-copy' }, el('b', { textContent: label }), description ? el('small', { textContent: description }) : ''),
+      value ? el('span', { className: 'setting-value' + (tone ? ' ' + tone : ''), textContent: value }) : '',
+      el('span', { className: 'setting-chevron', ariaHidden: 'true', html: page.ICON.chev }));
+    const deviceRows = [];
+    if (native && native.reminders) deviceRows.push(row('bell', 't-warn', '提醒与权限', '通知、电池与后台联网', native.reminderStatus ? native.reminderStatus() : '', () => native.reminders()));
+    deviceRows.push(row('look', 't-look', '外观与文字', '主题、字号与终端阅读方式', '', () => { location.href = 'computer/#part-look'; }));
+    deviceRows.push(row('computer', 't-accent', '电脑设置', '连接线路、远程访问与工具', page.usable() ? '在线' : '离线', () => { location.href = 'computer/'; }, page.usable() ? 'on' : ''));
+    const dataRows = [row('chart', 't-agy', '工作统计', '提问、对话与工作时长', expanded ? '收起' : '查看', () => { expanded = !expanded; draw(); })];
+    if (native && native.update) dataRows.push(row('update', 't-muted', '检查更新', 'Remote AI 手机端', native.version ? 'v' + native.version() : '', () => native.update()));
+    return el('div', { className: 'settings-grid' }, group('偏好与设备', ...deviceRows), group('数据与版本', ...dataRows));
   }
   function draw() {
     const data = page.data, supported = page.has('work'), online = page.usable(), have = kept[span];
     // asked anew when the tab is opened, and once a minute while it stays open
     const old = have ? Date.now() - have.at : Infinity;
     if (expanded && supported && online && !asking && (old > 60000 || (wanted && old > 15000)) && Date.now() - tried > 8000) { load(span); return; }
-    const signature = JSON.stringify([expanded, span, metric, picked, have && have.at, asking, failed, supported, online, data.device.version, data.device.newer, data.device.tools]);
+    const signature = JSON.stringify([expanded, Object.keys(expandedPools).filter(k => expandedPools[k]).sort(), span, metric, picked, have && have.at, asking, failed, supported, online, data.device.version, data.device.newer, data.device.tools, data.device.quotas, Math.floor(Date.now() / 60000)]);
     if (signature === drawn) return;
     drawn = signature;
-    const parts = [el('p', { className: 'settings-intro', textContent: '设备连接与个人偏好' }), settings()];
+    const parts = [quotas(), el('p', { className: 'settings-intro', textContent: '设备连接与个人偏好' }), settings()];
     if (!expanded) { box.replaceChildren(...parts); return; }
     if (!supported) parts.push(el('section', { className: 'notice plain' }, el('b', { textContent: '需要更新电脑端' }), el('span', { textContent: '工作统计由电脑端读取，这台电脑的版本还没有这项功能。' })));
     else if (have) parts.push(today(have.stats), period(have.stats),

@@ -24,13 +24,19 @@ Android 复用 WebView，但每次打开或重试页面都建立新的 `Connecti
 
 ## 组成
 
+`web/conversation.js` 为两种对话界面提供阅读位置保持、未变化节点复用、文字选择保护和按对话保存的页面会话草稿。传输和工具控制仍由各自模块负责。`web/terminal/bridge.js` 向对话页报告排队、重试、提交、拒绝或超时未知状态；提交回执只清除匹配的旧草稿，不覆盖后续输入。中转排队回执不表示电脑或工具已收到，正式消息按 `op` 回显后合并。页面恢复后保留未确认消息，但不自动重新提交。
+
+主题颜色以 `web/terminal/skins.js` 为来源，修改后运行 `node tools/sync_palettes.js` 生成 Android 的 `Palettes.java`。`node tools/sync_palettes.js --check` 核对两端一致，CI 同样运行此检查。Android 原生控件和内嵌页面继续使用各自的渲染方式。
+
+对话交互检查使用 `tests/chat_ui_check.py`，覆盖成功步骤展开、发送回执、草稿刷新、文字选择及 320、390、430、1440 像素布局；`tests/bridge_check.js` 验证重连沿用原操作编号，且重试不会被显示为明确拒绝。
+
 ```
 手机 App  ──HTTP(S)──▶  中转 relay（电脑上自带，或你自己的服务器）  ◀──HTTP(S)──  电脑端程序（运行终端）
 ```
 
 | 目录 | 内容 |
 | --- | --- |
-| `agent-windows/` | 电脑端：`RemoteCliApp.cs`（窗口、托盘、连接方式）、`RemoteCliAgent.cs`（终端与对话扫描）、`Relays.cs`（公共中转清单和保存的中转）、`Remote.cs`（手机可以向电脑端程序本身提出的要求：读取和更改几项设置、切换连接线路）、`Controls.cs`（外观和控件）、`QrCode.cs`、`Setup.cs`（安装程序）。C#，用 Windows 自带的编译器构建 |
+| `agent-windows/` | 电脑端：`RemoteCliApp.cs`（窗口、托盘、连接方式）、`RemoteCliAgent.cs`（终端与对话扫描）、`Tools.cs`（各 AI 工具的统一适配：启动参数、记录文件、占用与接管、删除、结构化对话驱动、闲置唤醒；每个工具一个类，加工具时在这里加一个类）、`SessionLocks.cs`（Windows 锁文件探测、Restart Manager 进程归属核验与双检接管，供 Codex 和 Antigravity 共用）、`Transcripts.cs`（Claude Code、Codex、Antigravity 已保存记录的解析、标题提取与完成轮次识别）、`Chats.cs` / `AcpChat.cs`（`Chat`、`JsonRpcChat` 及各工具结构化对话驱动）、`Relays.cs`（公共中转清单和保存的中转）、`Remote.cs`（手机可以向电脑端程序本身提出的要求：读取和更改几项设置、切换连接线路）、`Controls.cs`（外观和控件）、`QrCode.cs`、`Setup.cs`（安装程序）。C#，用 Windows 自带的编译器构建 |
 | `agent-linux/` | Linux 电脑端：`agent.py`（终端、对话扫描、查看文件），一个文件，只用 Python 标准库；`install.sh` 一条命令装好中转和电脑端；`remote-cli-agent.service` 是 systemd 用户服务 |
 | `relay/` | 中转：`server.py`（登录、HTTP，以及公共中转里每台电脑各自的空间）、`relay.py`（终端状态与输出的转发：一台电脑一个 `Relay` 对象）。只用 Python 标准库；`install.sh` 把它装成服务器上的系统服务 |
 | `android/` | 安卓 App：`MainActivity`（各界面之间的跳转、扫码回调、语音识别）、`Tabs`（底部四个栏目，与电脑页面的底栏同样的图标和尺寸）、`Workbench`（“任务”和“项目”两页）、`AppPages`（“协作”和“我的”两页）、`Kit`（配色和界面部件）、`AggregateSessions`（任务分组与排序，不依赖 Android，可单独检查） |
@@ -103,6 +109,7 @@ python tests\history_check.py                          # 电脑端保留已交�
 chrome --headless=new --window-size=1480,520 --screenshot=skins.png tests\skin_code_check.html   # 各外观下代码、diff 和 16 色的显示
 python tests\setup_check.py dist\RemoteCli-Setup-x.y.z.exe      # 安装程序，沙盒方式，不碰已有安装
 python tests\tools_ui_check.py <chrome.exe> <输出文件夹>   # 六种工具的启动按钮、新工具终端与 Ctrl+P 输入，手机和桌面布局
+python tests\menus_ui_check.py <chrome.exe> <输出文件夹>   # 对话页和终端页右上角的底部面板（web/ui/sheet.js、work.js）：分步页面和返回键；把 Codex 对话交给新的 Claude Code（电脑整理的交接内容作为第一句）；按工作日的定时提问的设置和停用；外观、字号；终端菜单。真实中转，电脑由测试扮演；截图 menu-chat.png、menu-handoff.png、menu-schedule-editor.png 即 docs\images 的 menu*.png
 python tests\pages_check.py <chrome.exe> <输出文件夹>     # 用本机的中转和电脑端截取列表页和终端页；对话是编造的（tests\made_up.py），不会把本机真实的对话画进图里
 java -cp .cache\zxing-core-3.5.3.jar tests\QrDecodeCheck.java <二维码.png> <内容>   # 手机端的二维码识别
 ```

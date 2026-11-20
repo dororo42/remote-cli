@@ -1,30 +1,33 @@
 package io.github.kangwang42.remotecli;
 
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.app.NotificationManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.speech.RecognizerIntent;
 import android.text.InputType;
 import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.animation.DecelerateInterpolator;
 import android.view.inputmethod.EditorInfo;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
+import android.webkit.RenderProcessGoneDetail;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
-import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
@@ -58,17 +61,28 @@ public final class MainActivity extends Activity {
         decor.setSystemUiVisibility(light ? decor.getSystemUiVisibility() | flags : decor.getSystemUiVisibility() & ~flags);
         root.setBackgroundColor(shade);
     }
+    /** Resolves "auto" against Android's night mode into the concrete light or dark palette name. */
+    private String resolveSkin(String chosen) {
+        if (!"auto".equals(chosen)) return chosen == null || chosen.isEmpty() ? "paper" : chosen;
+        boolean night = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+        return night ? "night" : "paper";
+    }
     /** The app's own screens use the app's skin, whatever the page shown last looked like. */
-    private void repaint() { kit.palette(Kit.shade(prefs.getString("look-skin", "paper"))); }
+    private void repaint() { kit.palette(Kit.shade(resolveSkin(prefs.getString("look-skin", "paper")))); }
     /** The look: one skin for the app (workbench and lists), and for the terminal either the same or one of its own. */
     void look() {
         final String app = prefs.getString("look-skin", "paper"), terminal = prefs.getString("look-termskin", "");
+        String appShown = "auto".equals(app) ? "跟随系统" : Kit.title(app);
+        String termShown = terminal.isEmpty() ? "跟随 App" : "auto".equals(terminal) ? "跟随系统" : Kit.title(terminal);
         kit.sheet("外观", "对所有电脑生效。", new String[]{"App 外观", "终端外观"},
-            new String[]{"工作台和列表 · 当前：" + Kit.title(app), "当前：" + (terminal.isEmpty() ? "跟随 App" : Kit.title(terminal))}, -1, which -> {
+            new String[]{"工作台和列表 · 当前：" + appShown, "当前：" + termShown}, -1, which -> {
             final boolean own = which == 1;
-            int extra = own ? 1 : 0;
+            int extra = own ? 2 : 1;
             String[] labels = new String[Kit.NAMES.length + extra], notes = new String[labels.length];
-            if (own) { labels[0] = "跟随 App 外观"; notes[0] = terminal.isEmpty() ? "当前使用" : null; }
+            int idx = 0;
+            if (own) { labels[idx] = "跟随 App 外观"; notes[idx] = terminal.isEmpty() ? "当前使用" : null; idx++; }
+            labels[idx] = "跟随系统";
+            notes[idx] = ("auto".equals(own ? terminal : app) ? "当前使用 · " : "") + "深色时用夜航，浅色时用纸白";
             for (int i = 0; i < Kit.NAMES.length; i++) {
                 labels[i + extra] = Kit.TITLES[i];
                 notes[i + extra] = Kit.NAMES[i].equals(own ? terminal : app) ? "当前使用" : null;
@@ -76,6 +90,7 @@ public final class MainActivity extends Activity {
             }
             kit.sheet(own ? "终端外观" : "App 外观", own ? "只用于终端画面。" : "用于工作台和每台电脑的列表；终端跟随时也用它。", labels, notes, -1, picked -> {
                 if (own && picked == 0) prefs.edit().remove("look-termskin").apply();
+                else if (picked == (own ? 1 : 0)) prefs.edit().putString(own ? "look-termskin" : "look-skin", "auto").apply();
                 else prefs.edit().putString(own ? "look-termskin" : "look-skin", Kit.NAMES[picked - extra]).apply();
                 home("");
             });
@@ -91,7 +106,7 @@ public final class MainActivity extends Activity {
     private ComputerManagement computerManagement;
     private UuRemote uuRemote;
     private String pairingRecord = "";
-    private AppPages appPages;
+    AppPages appPages;          // (the workbench redraws the limits on 我的 when it has read them)
     private Tabs tabs;
     private String appTab = "home";                 // the tab the app's lists were left at
     private FrameLayout root;
@@ -173,7 +188,7 @@ public final class MainActivity extends Activity {
         String single = prefs.getString("server", "");
         if (!single.isEmpty() && computers().length() == 0) remember("", single);
         updater = new GithubUpdater(this, new GithubUpdater.Listener() {
-            @Override public void found(GithubUpdater.Release release) { new AlertDialog.Builder(MainActivity.this).setTitle("发现 Remote AI 新版本").setMessage("GitHub 上有 v" + release.version + "，现在下载并安装吗？").setPositiveButton("更新", (d, w) -> updater.install(release)).setNegativeButton("稍后", null).show(); }
+            @Override public void found(GithubUpdater.Release release) { kit.confirmSheet("发现 Remote AI 新版本", "GitHub 上有 v" + release.version + "，现在下载并安装吗？", "立即更新", false, () -> updater.install(release)); }
             @Override public void message(String text) {
                 if (text == null || text.isEmpty()) return;
                 // Inside a computer's pages there is no line of the app's own to write on.
@@ -274,6 +289,7 @@ public final class MainActivity extends Activity {
     }
 
     private void show(View content, String name) {
+        String previous = screen;
         ticker.removeCallbacks(watch);
         bench.stop();
         computerManagement.stop();
@@ -287,13 +303,26 @@ public final class MainActivity extends Activity {
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         scroll.addView(content, new ViewGroup.LayoutParams(-1, -2));
+        View incoming;
         if (Tabs.has(name)) {
             // the tabs stay at the foot while the list above them is scrolled
             LinearLayout shell = kit.column();
             shell.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
             shell.addView(tabs.build(name, this::appPage));
             root.addView(shell, new FrameLayout.LayoutParams(-1, -1));
-        } else root.addView(scroll, new FrameLayout.LayoutParams(-1, -1));
+            incoming = scroll;
+        } else {
+            root.addView(scroll, new FrameLayout.LayoutParams(-1, -1));
+            incoming = scroll;
+        }
+        if (!previous.isEmpty() && !previous.equals(name)) {
+            boolean secondary = !Tabs.has(name);
+            incoming.setAlpha(0f);
+            if (secondary) incoming.setTranslationX(kit.dp(18));
+            else incoming.setTranslationY(kit.dp(5));
+            incoming.animate().alpha(1f).translationX(0f).translationY(0f).setDuration(secondary ? 190 : 150)
+                .setInterpolator(new DecelerateInterpolator(2.0f)).start();
+        }
         screen = name;
     }
 
@@ -318,7 +347,7 @@ public final class MainActivity extends Activity {
     }
     /** One computer's own page of a tab: where what the app lists of it is seen whole and changed. */
     void computerPage(String url, String tab) { openPage(url, "", "/?tab=" + tab + ("me".equals(tab) ? "&stats=1" : "")); }
-    /** That computer's page of 协作 with one of its sheets open: "handoff", "many", "chain", "schedule" (web/together.js). */
+    /** That computer's page of 协作 with one of its sheets open: "team", "handoff", "many", "chain", "schedule" (web/together.js). */
     void together(String url, String what) { openPage(url, "", "/?tab=together&do=" + what); }
     void together(String url, String what, String item) { openPage(url, "", "/?tab=together&do=" + Uri.encode(what) + "&item=" + Uri.encode(item)); }
     boolean autoUpdate() { return updater != null && updater.automatic(); }
@@ -345,39 +374,64 @@ public final class MainActivity extends Activity {
         final int index = found;
         final String name = list.optJSONObject(index).optString("name");
         kit.sheet(name, host(url), new String[]{"打开这台电脑", "改名", "重新扫码登录", "从列表移除"},
-            new String[]{null, null, "地址变了或登录过期时使用", "只从这部手机移除，电脑上的终端和对话不受影响"}, 3, which -> {
+            new String[]{null, null, "地址变了或登录过期时使用", "只从这部手机移除，不需要电脑在线或密码"}, 3, which -> {
             if (which == 0) open(url, "");
             else if (which == 2) { pairingRecord = computers().optJSONObject(index).optString("id"); scan(); }
             else if (which == 1) {
-                final EditText box = new EditText(this);
-                box.setText(name); box.setSingleLine(true); box.setSelection(name.length());
-                new AlertDialog.Builder(this).setTitle("电脑名称").setView(box).setNegativeButton("取消", null).setPositiveButton("保存", (d, w) -> {
-                    String wanted = box.getText().toString().trim();
-                    if (wanted.isEmpty() || wanted.length() > 40) return;
+                kit.promptSheet("电脑名称", name, "输入电脑名称", "保存", wanted -> {
+                    if (wanted.length() > 40) return;
                     try { JSONArray now = computers(); now.getJSONObject(index).put("name", wanted); store(now); } catch (Exception ignored) { }
                     home("");
-                }).show();
+                });
             } else {
-                JSONArray now = computers();
-                JSONObject removed = now.optJSONObject(index);
-                if (removed != null) uuRemote.forget(removed.optString("id"));
-                now.remove(index); store(now); bench.forget(url);
-                home("");
+                confirmRemoveComputer(url);
             }
         });
     }
 
+    /** Removes a saved computer from this phone only — never needs the computer online or a password. */
+    void confirmRemoveComputer(String url) {
+        if (url == null || url.isEmpty()) return;
+        String label = host(url);
+        JSONArray list = computers();
+        for (int i = 0; i < list.length(); i++) {
+            JSONObject one = list.optJSONObject(i);
+            if (one != null && url.equals(one.optString("url"))) {
+                String given = one.optString("name");
+                if (!given.isEmpty()) label = given;
+                break;
+            }
+        }
+        kit.confirmSheet("从手机移除“" + label + "”？",
+            "只从这部手机的列表移除，不需要电脑在线或访问密码，也不会影响电脑上的程序和对话。",
+            "从手机移除", true, () -> removeComputer(url));
+    }
+
+    private void removeComputer(String url) {
+        JSONArray now = computers();
+        for (int i = now.length() - 1; i >= 0; i--) {
+            JSONObject item = now.optJSONObject(i);
+            if (item == null || !url.equals(item.optString("url"))) continue;
+            uuRemote.forget(item.optString("id"));
+            now.remove(i);
+        }
+        store(now);
+        bench.forget(url);
+        if (url.equals(currentOrigin)) currentOrigin = "";
+        home("已从手机移除");
+    }
+
     String versionName() { try { return getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Exception unknown) { return ""; } }
 
-    /** The top of a screen one step below the workbench: a title, a line about it, and the way back. */
+    /** The top of a screen one step below the workbench: a navigation bar and a concise subtitle. */
     private LinearLayout step(String title, String about) {
-        LinearLayout page = kit.page(14);
-        TextView back = kit.text("‹  返回", 15, kit.MUTED);
-        back.setGravity(Gravity.CENTER_VERTICAL); back.setMinHeight(kit.dp(48));
-        kit.press(back, () -> { endScan(); home(""); });
-        page.addView(back, new LinearLayout.LayoutParams(-2, -2));
-        page.addView(kit.bold(title, 23, kit.INK), kit.below(8));
-        page.addView(kit.text(about, 14.5f, kit.MUTED), kit.below(6));
+        LinearLayout page = kit.page(12);
+        page.addView(kit.navBar(title, () -> { endScan(); home(""); }));
+        if (about != null && !about.isEmpty()) {
+            TextView sub = kit.text(about, 13.5f, kit.MUTED);
+            sub.setPadding(kit.dp(4), 0, kit.dp(4), 0);
+            page.addView(sub, kit.below(4));
+        }
         return page;
     }
 
@@ -481,7 +535,10 @@ public final class MainActivity extends Activity {
         allowed &= channel == null || channel.getImportance() > NotificationManager.IMPORTANCE_NONE;
         return watching() && allowed ? "已开启" : allowed ? "未开启" : "需授权";
     }
-    String appearanceName() { return Kit.title(prefs.getString("look-skin", "paper")); }
+    String appearanceName() {
+        String chosen = prefs.getString("look-skin", "paper");
+        return "auto".equals(chosen) ? "跟随系统" : Kit.title(chosen);
+    }
     void toggleWatch() {
         boolean on = !watching();
         prefs.edit().putBoolean("watch", on).apply();
@@ -493,30 +550,56 @@ public final class MainActivity extends Activity {
     }
     /** A plain-language checklist for Android's controls that decide whether background reminders can arrive. */
     void reminderSettings() {
-        LinearLayout page = kit.page(22);
-        page.addView(kit.head("提醒与权限", kit.text("这些开关由 Android 系统管理，开启后提醒更稳定。", 13, kit.MUTED)), kit.below(18));
+        repaint();
+        LinearLayout page = kit.page(12);
+        page.addView(kit.navBar("提醒与权限", () -> appPage("me")));
+        TextView intro = kit.text("开启后台提醒并放行系统权限后，锁屏通知更及时稳定。", 13, kit.MUTED);
+        intro.setPadding(kit.dp(4), 0, kit.dp(4), 0);
+        page.addView(intro, kit.below(4));
+
+        LinearLayout control = kit.settingGroup(page, "任务提醒");
+        kit.settingSwitch(control, R.drawable.ic_bell, 0xffc77c1a, "开启任务提醒", "约每 10 秒检查任务，回到应用时暂停弹出", watching(), this::toggleWatch);
+        kit.setting(control, R.drawable.ic_say, kit.ACCENT, "发送测试通知", "验证当前通知栏与提示音是否正常", "", kit.MUTED, () -> {
+            Watcher.test(this);
+            android.widget.Toast.makeText(this, "已请求发送测试通知，请检查通知栏", android.widget.Toast.LENGTH_LONG).show();
+        });
+
         NotificationManager nm = getSystemService(NotificationManager.class);
         boolean notifications = nm.areNotificationsEnabled();
         boolean channel = nm.getNotificationChannel("tasks") == null || nm.getNotificationChannel("tasks").getImportance() != NotificationManager.IMPORTANCE_NONE;
         boolean battery = getSystemService(android.os.PowerManager.class).isIgnoringBatteryOptimizations(getPackageName());
         int data = getSystemService(android.net.ConnectivityManager.class).getRestrictBackgroundStatus();
-        page.addView(kit.text("必要权限", 13, kit.MUTED), kit.below(4));
-        page.addView(reminderRow("通知", notifications && channel ? "已允许" : "需要允许", notifications && channel ? kit.GOOD : kit.BAD,
-            () -> systemSettings(new Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, getPackageName()))), kit.below(8));
-        page.addView(reminderRow("任务通知类别", "声音、振动与锁屏显示", kit.MUTED,
-            () -> systemSettings(new Intent(android.provider.Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, getPackageName()).putExtra(android.provider.Settings.EXTRA_CHANNEL_ID, "tasks"))), kit.below(8));
-        page.addView(reminderRow("电池优化", battery ? "已不受电池优化限制" : "系统可能延迟锁屏后的提醒", battery ? kit.GOOD : kit.BUSY,
-            () -> systemSettings(new Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))), kit.below(8));
-        page.addView(reminderRow("后台联网", data == android.net.ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED ? "省流量模式正在限制后台联网" : "未被省流量模式限制", kit.MUTED,
-            () -> systemSettings(new Intent(android.provider.Settings.ACTION_IGNORE_BACKGROUND_DATA_RESTRICTIONS_SETTINGS, Uri.parse("package:" + getPackageName())))), kit.below(8));
-        page.addView(reminderRow("应用详情", "检查后台数据、自启动和省电策略", kit.ACCENT,
-            () -> systemSettings(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())))), kit.below(18));
+
+        LinearLayout perms = kit.settingGroup(page, "系统权限检查");
+        kit.setting(perms, R.drawable.ic_bell, notifications && channel ? kit.GOOD : kit.BAD,
+            "通知权限", "允许 Remote AI 发送提醒", notifications && channel ? "已允许" : "需允许", notifications && channel ? kit.GOOD : kit.BAD,
+            () -> systemSettings(new Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, getPackageName())));
+        kit.setting(perms, R.drawable.ic_settings, kit.MUTED,
+            "任务通知类别", "调整声音、振动与锁屏显示", "", kit.MUTED,
+            () -> systemSettings(new Intent(android.provider.Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, getPackageName()).putExtra(android.provider.Settings.EXTRA_CHANNEL_ID, "tasks")));
+        kit.setting(perms, R.drawable.ic_shield, battery ? kit.GOOD : kit.BUSY,
+            "电池优化", battery ? "已不受电池优化限制" : "建议设为不限制，避免锁屏延迟", battery ? "已放行" : "可能延迟", battery ? kit.GOOD : kit.BUSY,
+            () -> systemSettings(new Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)));
+        boolean dataRestricted = data == android.net.ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED;
+        kit.setting(perms, R.drawable.ic_link, dataRestricted ? kit.BUSY : kit.GOOD,
+            "后台联网", dataRestricted ? "省流量模式正在限制后台联网" : "未被省流量模式限制", dataRestricted ? "受限" : "正常", dataRestricted ? kit.BUSY : kit.GOOD,
+            () -> systemSettings(new Intent(android.provider.Settings.ACTION_IGNORE_BACKGROUND_DATA_RESTRICTIONS_SETTINGS, Uri.parse("package:" + getPackageName()))));
+        kit.setting(perms, R.drawable.ic_computer, kit.ACCENT,
+            "应用详情", "检查自启动、后台活动与省电策略", "", kit.MUTED,
+            () -> systemSettings(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName()))));
+
         String error = getSharedPreferences("remote-cli-watch", MODE_PRIVATE).getString("error", "");
-        if (!error.isEmpty()) page.addView(kit.text(error, 13, kit.BAD), kit.below(12));
-        page.addView(kit.text("开启后会保留一条“后台连接”通知，约每 10 秒检查任务。回到应用时暂停弹出任务通知，电脑上的确认被处理后会撤下旧提醒。\n\n在应用详情中将电池设为“不限制”或“允许后台活动”。部分手机还需手动开启自启动；这项设置无法自动检测。\n\n锁屏省电、断网或系统强行停止应用仍可能延迟提醒。电脑需要保持在线。", 13.5f, kit.INK), kit.below(18));
-        page.addView(kit.button("发送测试通知", 1, () -> { Watcher.test(this); android.widget.Toast.makeText(this, "已请求发送测试通知，请检查通知栏", android.widget.Toast.LENGTH_LONG).show(); }), kit.below(14));
-        page.addView(kit.button(watching() ? "关闭任务提醒" : "开启任务提醒", watching() ? 1 : 0, this::toggleWatch), kit.below(8));
-        page.addView(kit.button("返回我的", 2, () -> appPage("me")));
+        if (!error.isEmpty()) {
+            LinearLayout warn = kit.column();
+            warn.setPadding(kit.dp(14), kit.dp(12), kit.dp(14), kit.dp(12));
+            warn.setBackground(kit.shape(Kit.mix(kit.BAD, kit.PANEL, .09f), Kit.mix(kit.BAD, kit.LINE, .45f), 14));
+            warn.addView(kit.text(error, 13, kit.BAD));
+            page.addView(warn, kit.below(14));
+        }
+
+        TextView note = kit.text("开启后状态栏会保留“后台连接”通知。部分机型还需在“应用详情”中手动允许自启动和后台活动；电脑须保持在线，确认在电脑端处理后旧提醒会自动撤下。", 12.5f, kit.MUTED);
+        note.setPadding(kit.dp(6), 0, kit.dp(6), 0);
+        page.addView(note, kit.below(16));
         show(page, "reminders");
     }
     private void systemSettings(Intent intent) {
@@ -524,12 +607,6 @@ public final class MainActivity extends Activity {
         catch (android.content.ActivityNotFoundException unavailable) {
             startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())));
         }
-    }
-    private View reminderRow(String title, String status, int color, Runnable open) {
-        LinearLayout row = kit.row(); row.setPadding(kit.dp(14), kit.dp(10), kit.dp(8), kit.dp(10)); row.setBackground(kit.shape(kit.PANEL, kit.LINE, 14));
-        LinearLayout copy = kit.column(); copy.addView(kit.bold(title, 15, kit.INK)); copy.addView(kit.text(status, 12.5f, color), kit.below(3));
-        row.addView(copy, new LinearLayout.LayoutParams(0, -2, 1)); row.addView(kit.button("打开设置", 2, open), new LinearLayout.LayoutParams(kit.dp(92), -2));
-        return row;
     }
     /** Straight into one terminal; its page is told to come back here rather than to that computer's list. */
     void openTerminal(String address, String terminal) { openTerminal(address, terminal, false); }
@@ -558,6 +635,8 @@ public final class MainActivity extends Activity {
         settings.setBuiltInZoomControls(false); settings.setDisplayZoomControls(false);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         CookieManager.getInstance().setAcceptCookie(true);
+        // Keep the WebView renderer process bound while briefly switching apps so returning to a live terminal is instant.
+        if (Build.VERSION.SDK_INT >= 26) web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
         web.addJavascriptInterface(new Bridge(), "RemoteCliNative");
         // Without a chrome client a page's confirm() and prompt() are answered "no" without being shown.
         web.setWebChromeClient(filePicker);
@@ -611,33 +690,49 @@ public final class MainActivity extends Activity {
                 boolean relayRequest = url.startsWith(origin + "/api/");
                 if (ConnectionHealth.httpError(request.isForMainFrame(), relayRequest, response.getStatusCode())) reconnect(view, origin, health);
             }
+            @Override public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                // System reclaimed the WebView renderer in background: recreate cleanly instead of crashing or leaving a blank screen.
+                String currentUrl = view.getUrl();
+                String recoverPath = currentUrl != null && currentUrl.startsWith(origin + "/") ? currentUrl.substring(origin.length()) : path;
+                if (web == view) {
+                    detachWeb();
+                    try { view.destroy(); } catch (Exception ignored) { }
+                    web = null;
+                }
+                if (health.isActive() && "web".equals(screen)) root.post(() -> openPage(origin, "", recoverPath));
+                return true;
+            }
         });
         LinearLayout page = new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
         LinearLayout banner = new LinearLayout(this);
         banner.setOrientation(LinearLayout.HORIZONTAL);
-        banner.setBackgroundColor(kit.PANEL);
+        banner.setBackgroundColor(Kit.mix(kit.BAD, kit.PANEL, .08f));
         banner.setGravity(Gravity.CENTER_VERTICAL);
-        banner.setPadding(kit.dp(14), kit.dp(6), kit.dp(14), kit.dp(6));
+        banner.setPadding(kit.dp(14), kit.dp(8), kit.dp(10), kit.dp(8));
         bannerText = kit.text("", 13, kit.INK);
         banner.addView(bannerText, new LinearLayout.LayoutParams(0, -2, 1));
-        Button again = new Button(this);
-        again.setText("重试");
-        again.setMinHeight(kit.dp(48));
-        again.setMinimumWidth(kit.dp(64));
+        TextView again = kit.bold("重试", 13.5f, kit.ON_ACCENT);
+        again.setGravity(Gravity.CENTER); again.setMinHeight(kit.dp(48)); again.setPadding(kit.dp(14), 0, kit.dp(14), 0);
+        again.setBackground(kit.shape(kit.ACCENT, 0, 12));
+        again.setClickable(true); again.setFocusable(true);
         again.setOnClickListener(v -> openPage(address, password, path));
-        banner.addView(again, new LinearLayout.LayoutParams(-2, -2));
-        Button back = new Button(this);
-        back.setText("返回");
-        back.setMinHeight(kit.dp(48));
-        back.setMinimumWidth(kit.dp(64));
-        back.setOnClickListener(v -> home(""));
-        banner.addView(back, new LinearLayout.LayoutParams(-2, -2));
+        LinearLayout.LayoutParams retryGap = new LinearLayout.LayoutParams(-2, -2);
+        retryGap.leftMargin = kit.dp(8);
+        banner.addView(again, retryGap);
+        TextView back = kit.bold("返回", 13.5f, kit.MUTED);
+        back.setGravity(Gravity.CENTER); back.setMinHeight(kit.dp(48)); back.setPadding(kit.dp(12), 0, kit.dp(12), 0);
+        kit.press(back, () -> home(""));
+        LinearLayout.LayoutParams backGap = new LinearLayout.LayoutParams(-2, -2);
+        backGap.leftMargin = kit.dp(4);
+        banner.addView(back, backGap);
         banner.setVisibility(View.GONE);
         connectionBanner = banner;
         page.addView(banner, new LinearLayout.LayoutParams(-1, -2));
         page.addView(view, new LinearLayout.LayoutParams(-1, 0, 1));
+        page.setAlpha(0f);
         root.addView(page, new FrameLayout.LayoutParams(-1, -1));
+        page.animate().alpha(1f).setDuration(150).setInterpolator(new DecelerateInterpolator(1.8f)).start();
         String webTarget = address + path;
         if (!password.isEmpty()) webTarget += "#p=" + Uri.encode(password);
         view.loadUrl(webTarget);
@@ -682,6 +777,9 @@ public final class MainActivity extends Activity {
             runOnUiThread(() -> {
                 boolean failed = health.sample(ok, code);
                 if (!foreground || !health.isActive() || web != checked || !"web".equals(screen)) return;
+                if (ok && connectionBanner != null && connectionBanner.getVisibility() == View.VISIBLE) {
+                    connectionBanner.setVisibility(View.GONE);
+                }
                 if (failed) reconnect(checked, origin, health);
                 else ticker.postDelayed(watch, 3000);
             });
@@ -704,6 +802,7 @@ public final class MainActivity extends Activity {
             if (connectionBanner != null && bannerText != null) {
                 bannerText.setText(text);
                 connectionBanner.setVisibility(View.VISIBLE);
+                if (foreground) ticker.postDelayed(watch, 4000);
                 return;
             }
             home(text);
@@ -718,7 +817,7 @@ public final class MainActivity extends Activity {
     private String lookScript(boolean terminal, boolean drawn) {
         String own = prefs.getString("look-termskin", ""), skin = terminal && !own.isEmpty() ? own : prefs.getString("look-skin", "paper");
         StringBuilder script = new StringBuilder("(function(){try{var s=localStorage,was=s.getItem('rcli-skin')||'night';");
-        for (String key : new String[]{"skin", "text", "font", "spacing", "renderer"}) {
+        for (String key : new String[]{"skin", "text", "font", "spacing", "cursor", "renderer"}) {
             String value = "skin".equals(key) ? skin : prefs.getString("look-" + key, "");
             if (value.matches("[a-z0-9]{1,16}")) script.append("s.setItem('rcli-").append(key).append("','").append(value).append("');");
         }
@@ -727,11 +826,26 @@ public final class MainActivity extends Activity {
         return script.append("}catch(e){}})()").toString();
     }
     // (and, kept the same way for every computer: the kind of conversation its owner begins, "newkind")
-    private static final java.util.List<String> LOOK = java.util.Arrays.asList("skin", "termskin", "text", "font", "spacing", "renderer", "readfont", "readsize", "readline", "newkind");
+    private static final java.util.List<String> LOOK = java.util.Arrays.asList("skin", "termskin", "text", "font", "spacing", "cursor", "renderer", "readfont", "readsize", "readline", "newkind");
     private final Saver saver = new Saver(this);
     private final FilePicker filePicker = new FilePicker(this);
     private final class Bridge {
         @JavascriptInterface public boolean canUploadFiles() { return true; }
+        /** Subtle tactile feedback for embedded terminal keys and sheet controls, respecting system haptics. */
+        @JavascriptInterface public void haptic(String kind) {
+            final int code = "key".equals(kind) ? HapticFeedbackConstants.KEYBOARD_TAP
+                : "confirm".equals(kind) && Build.VERSION.SDK_INT >= 23 ? HapticFeedbackConstants.CONTEXT_CLICK
+                : HapticFeedbackConstants.CLOCK_TICK;
+            runOnUiThread(() -> { if (web != null && "web".equals(screen)) web.performHapticFeedback(code); });
+        }
+        /** Opens an http(s) link tapped in the terminal in the phone's browser. */
+        @JavascriptInterface public void openUrl(String url) {
+            if (url == null || !url.matches("(?i)https?://\\S{1,2048}")) return;
+            runOnUiThread(() -> {
+                try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))); }
+                catch (Exception ignored) { }
+            });
+        }
         // 终端按键条的自定义键：存应用偏好，App 升级与换连接线路都不丢（web 端有 localStorage 回退）。
         @JavascriptInterface public String termKeys() { return prefs.getString("term-keys", "[]"); }
         @JavascriptInterface public void termKeys(String json) {
@@ -842,6 +956,11 @@ public final class MainActivity extends Activity {
             return "";
         }
         @JavascriptInterface public void disconnect() { home(); }
+        /** Removes the currently opened computer from this phone without needing its password. */
+        @JavascriptInterface public void forgetCurrent() {
+            final String target = currentOrigin;
+            if (target != null && !target.isEmpty()) runOnUiThread(() -> confirmRemoveComputer(target));
+        }
         /** The terminal page reports the finished work it has shown, so the workbench stops listing it as new. */
         @JavascriptInterface public void seen(String terminal, String at) {
             final String origin = currentOrigin;

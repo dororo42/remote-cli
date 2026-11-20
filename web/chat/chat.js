@@ -9,7 +9,7 @@
   const $ = id => document.getElementById(id);
   const native = window.RemoteCliNative || null;
   const bridge = () => window.ProjectTerminal;
-  const TOOLS = { claude: 'Claude Code', codex: 'Codex' };
+  const TOOLS = { claude: 'Claude Code', codex: 'Codex', agy: 'Antigravity CLI' };
   const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
 
   // ---- the look: the app's, as on the list pages (app.js)
@@ -17,6 +17,10 @@
   const saved = (key, fallback) => {
     if (native && native.pref && LOOK.includes(key)) { const chosen = native.pref(key); if (chosen) return chosen; }
     try { return localStorage.getItem('rcli-' + key) || fallback; } catch (error) { return fallback; }
+  };
+  const keep = (key, value) => {
+    if (native && native.setPref && LOOK.includes(key)) native.setPref(key, value);
+    try { localStorage.setItem('rcli-' + key, value); } catch (error) { /* private window */ }
   };
   const TEXT = { small: '14px', normal: '15.5px', large: '17px', larger: '19px' };
   const READ = {
@@ -27,10 +31,12 @@
     const skin = window.RemoteCliPaint(saved('skin', 'paper'));
     Object.keys(READ).forEach(key => { const [choices, usual, name] = READ[key]; document.documentElement.style.setProperty(name, choices[saved(key, usual)] || choices[usual]); });
     document.documentElement.style.fontSize = TEXT[saved('text', 'normal')] || TEXT.normal;
+    const shade = skin.bg || skin.t.background;
     const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.content = skin.t.background;
-    if (native && native.chrome) native.chrome(skin.t.background);
+    if (meta) meta.content = shade;
+    if (native && native.chrome) native.chrome(shade);
   }
+  if (window.RemoteCliOnSystemTheme) window.RemoteCliOnSystemTheme(paint);
 
   function el(tag, props, ...children) {
     const node = document.createElement(tag);
@@ -61,6 +67,12 @@
   }
   let canRich = false;
   function setText(node, text, writing) {
+    reader.paint(node, () => renderText(node, text, writing));
+  }
+  function renderText(node, text, writing) {
+    const mode = canRich && !(writing && text.length > 24000);
+    if (node.readText === text && node.readRich === mode) return;
+    node.readText = text; node.readRich = mode;
     // a long answer is set as plain text while it is written, and in full once it is
     if (!canRich || (writing && text.length > 24000)) { node.className = node.className.replace(/\bmd\b/, '').trim() + ' plain'; node.style.whiteSpace = 'pre-wrap'; node.textContent = text; return; }
     node.style.whiteSpace = '';
@@ -71,9 +83,24 @@
 
   // ---- what was said: the items by their id, in the order they came
   const said = $('said');
+  const reader = new RemoteConversation.Reader(said);
+  const draft = new RemoteConversation.Draft(location.pathname + ':' + new URLSearchParams(location.search).get('id'));
+  const pendingStore = new RemoteConversation.Draft(draft.key + ':delivery');
   let terminal = null, device = { online: true }, rest = '', items = new Map(), asks = new Map();
   let state = 'starting', since = 0, lastEnd = '', writing = '', lastError = '', drawn = false;
   const mine = new Map();        // what was written here and not given back yet, by the number it was sent under
+  try {
+    const pending = JSON.parse(pendingStore.get() || '[]');
+    if (Array.isArray(pending)) pending.forEach(p => {
+      if (p && /^[a-f0-9]{32}$/.test(p.id) && typeof p.text === 'string' && typeof p.draft === 'string' && p.draft.length <= 8000) {
+        mine.set(p.id, { id: p.id, text: p.text, draft: p.draft, state: ['accepted', 'rejected'].includes(p.state) ? p.state : 'unknown', error: p.error || '', node: null });
+      }
+    });
+  } catch (error) { /* an unreadable receipt does not prevent the conversation from loading */ }
+  function saveMine() {
+    const rows = Array.from(mine.values(), ({ id, text, draft, state, error }) => ({ id, text, draft, state, error }));
+    pendingStore.set(rows.length ? JSON.stringify(rows) : '');
+  }
   const OUT_MOST = 200000;
 
   function clear() {
@@ -81,7 +108,7 @@
     said.replaceChildren();
     mine.forEach(p => { p.node = null; });
   }
-  // A step: what it is, the command, what it printed; folded to its last lines once it has done well
+  // Successful steps collapse by default; explicit reading choices survive subsequent output.
   function stepNode(item) {
     const what = el('span', { className: 'what', textContent: item.text }), more = el('span', { className: 'more' });
     const head = el('button', { type: 'button', ariaExpanded: 'true' }, el('span', { className: 'mark', ariaHidden: 'true' }), what, more);
@@ -89,18 +116,21 @@
     const code = el('code', { textContent: item.detail || '', hidden: !item.detail || item.text.includes(item.detail) });
     const out = el('pre', { hidden: true });
     const node = el('div', { className: 'step run' }, head, code, out);
-    head.onclick = () => { item.open = !item.open; drawStep(item); };
+    head.onclick = () => { item.open = !stepOpen(item); reader.change(() => drawStep(item)); };
     Object.assign(item, { node, what, more, code, outNode: out, out: item.out || '' });
     return node;
   }
+  const stepOpen = item => item.open === undefined ? item.state !== 'ok' : item.open;
   function drawStep(item) {
     const lines = item.out ? item.out.replace(/\s+$/, '').split('\n') : [];
-    const folded = !item.open && item.state === 'ok' && lines.length > 4;
-    item.node.className = 'step ' + item.state;
-    item.outNode.hidden = !lines.length;
-    item.outNode.textContent = folded ? lines.slice(-4).join('\n') : item.out.replace(/\s+$/, '');
-    item.more.textContent = folded ? '共 ' + lines.length + ' 行' : '';
-    if (item.state === 'run' && !item.outNode.hidden) item.outNode.scrollTop = item.outNode.scrollHeight;
+    const open = stepOpen(item), end = item.outNode.scrollHeight - item.outNode.scrollTop - item.outNode.clientHeight < 40;
+    item.node.className = 'step ' + item.state + (open ? '' : ' shut');
+    item.node.firstChild.setAttribute('aria-expanded', String(open));
+    item.outNode.hidden = !open || !lines.length;
+    const output = item.out.replace(/\s+$/, '');
+    reader.paint(item.outNode, () => { if (item.outNode.textContent !== output) item.outNode.textContent = output; });
+    item.more.textContent = (item.state === 'run' ? '执行中' : item.state === 'fail' ? '未完成' : '已完成') + (lines.length ? ' · ' + lines.length + ' 行' : '') + (open ? ' · 收起' : ' · 展开');
+    if (end && !reader.selected(item.outNode) && item.state === 'run' && !item.outNode.hidden) item.outNode.scrollTop = item.outNode.scrollHeight;
   }
   function add(e) {
     let node;
@@ -108,7 +138,7 @@
     if (e.kind === 'user') {
       // what this page sent comes back from the tool: the bubble that waited for it is that message now
       const waiting = e.op && mine.get(e.op);
-      if (waiting) { mine.delete(e.op); if (waiting.node) waiting.node.remove(); }
+      if (waiting) { acknowledge(waiting); mine.delete(e.op); saveMine(); if (waiting.node) waiting.node.remove(); }
       node = el('div', { className: 'user', textContent: item.text });
     } else if (e.kind === 'text') {
       node = el('div', { className: 'text md' });
@@ -142,14 +172,12 @@
   function later(item) { dirty.add(item); if (!frame) frame = requestAnimationFrame(redraw); }
   function redraw() {
     frame = 0;
-    const end = atEnd();
-    dirty.forEach(item => {
+    reader.change(() => { dirty.forEach(item => {
       if (item.kind === 'step') drawStep(item);
       else if (item.kind === 'text') setText(item.node, item.text, item.id === writing);
       else item.node.textContent = item.text;
-    });
+    }); });
     dirty.clear();
-    if (end) toEnd();
   }
   function earlier(messages, more) {
     // what was said before it was gone on with here: above, as the conversation's window shows it
@@ -243,14 +271,14 @@
   }
 
   // ---- reading: the stay at the end while one is there
-  const atEnd = () => said.scrollHeight - said.scrollTop - said.clientHeight < 80;
+  const atEnd = () => reader.atEnd();
   const toEnd = () => { said.scrollTop = said.scrollHeight; $('latest').hidden = true; };
   said.addEventListener('scroll', () => { $('latest').hidden = atEnd(); }, { passive: true });
-  $('latest').onclick = () => said.scrollTo({ top: said.scrollHeight, behavior: 'smooth' });
+  $('latest').onclick = () => said.scrollTo({ top: said.scrollHeight, behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
 
   // ---- what the bridge gives: the terminal, and the pieces of its output
   function receive(item) {
-    const end = !drawn || atEnd();
+    reader.change(() => {
     if (item.device) device = item.device;
     if (item.reset) clear();
     terminal = item.terminal || terminal;
@@ -271,31 +299,55 @@
     if (!drawn && !said.children.length) said.append(el('p', { className: 'empty', textContent: '发一句话开始' }));
     else if (said.children.length > 1) said.querySelectorAll('.empty').forEach(node => node.remove());
     drawn = true;
-    if (end) toEnd();
+    }, !drawn);
   }
 
   // ---- what is written here
   const box = $('box');
+  box.value = draft.get();
   function bubble(p) {
-    return el('div', { className: 'user going' + (p.failed ? ' failed' : ''), textContent: p.text, onclick: p.failed ? () => { box.value = box.value || p.text; grow(); p.node.remove(); mine.delete(p.id); } : null },
-      el('small', { textContent: p.failed ? '没有送出：' + p.failed + ' · 点一下放回输入框' : '正在送达' }));
+    const labels = { queued: '正在送达', retrying: '连接中断，正在确认送达', accepted: '已提交，等待对话接收', unknown: '送达结果未知，请先检查对话', rejected: '没有送出：' + (p.error || '') };
+    const node = el('div', { className: 'user going' + (p.state === 'rejected' || p.state === 'unknown' ? ' failed' : ''), textContent: p.text },
+      el('small', { textContent: labels[p.state] || labels.queued }));
+    if (p.state === 'rejected' || p.state === 'unknown') node.append(el('button', { type: 'button', textContent: p.state === 'unknown' ? '检查后重新编辑' : '重新编辑', onclick: () => {
+      const restore = () => {
+        if (box.value.trim() && box.value !== p.draft) return toast('输入框里还有未发送的文字，请先处理');
+        box.value = p.draft; draft.set(box.value); grow(); box.focus(); p.node.remove(); mine.delete(p.id); saveMine(); stands();
+      };
+      if (p.state === 'unknown') RemoteSheet.confirm({ title: '重新编辑这条消息', text: '电脑可能已经收到，请先检查对话。再次发送会作为一条新消息。', label: '已检查，重新编辑', act: sheet => { sheet.close(true); restore(); } });
+      else restore();
+    } }));
+    return node;
+  }
+  function acknowledge(p) {
+    draft.clear(p.draft);
+    if (box.value === p.draft) { box.value = ''; grow(); }
   }
   function say(text) {
-    text = text.trim();
+    const original = text; text = text.trim();
     if (!text || !terminal || terminal.state === 'closed') return;
-    const p = { id: newId(), text };
+    if (Array.from(mine.values()).some(p => p.text === text)) return toast('这条消息正在确认送达，请先查看它的状态');
+    const p = { id: newId(), text, draft: original, state: 'queued' };
+    draft.set(box.value);
     mine.set(p.id, p);
+    saveMine();
     said.querySelectorAll('.empty').forEach(node => node.remove());
     p.node = bubble(p); said.append(p.node); toEnd();
     bridge().send({ id: p.id, action: 'say', text });
   }
-  const grow = () => { box.style.height = 'auto'; box.style.height = Math.min(160, box.scrollHeight + 2) + 'px'; stands(); };
-  box.addEventListener('input', grow);
+  const grow = () => {
+    const prevScroll = box.scrollTop;
+    box.style.height = 'auto';
+    box.style.height = Math.min(160, box.scrollHeight + 2) + 'px';
+    if (prevScroll && box.scrollTop !== prevScroll) box.scrollTop = prevScroll;
+    stands();
+  };
+  box.addEventListener('input', () => { draft.set(box.value); grow(); });
   box.addEventListener('keydown', event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); $('write').requestSubmit(); } });
   $('write').addEventListener('submit', event => {
     event.preventDefault();
     if (!box.value.trim()) return box.focus();
-    say(box.value); box.value = ''; grow();
+    say(box.value); grow();
   });
   $('go').onclick = () => say('继续');
   $('stop').onclick = () => { $('stop').disabled = true; bridge().send({ action: 'stop' }); setTimeout(() => { $('stop').disabled = false; }, 2500); };
@@ -303,17 +355,6 @@
   $('back').onclick = () => bridge().close();
   $('files').onclick = () => { if (terminal && terminal.dir) location.href = '../files/?dir=' + encodeURIComponent(terminal.dir) + '&from=terminal'; };
 
-  // ---- the page's own sheet
-  function sheet(title, text, choices, fill) {
-    let dialog = $('chat-sheet');
-    if (!dialog) { dialog = el('dialog', { id: 'chat-sheet' }); document.body.append(dialog); dialog.onclick = event => { if (event.target === dialog) dialog.close(); }; }
-    const form = el('form', { method: 'dialog' }, el('h2', { textContent: title }), text ? el('p', { textContent: text }) : '');
-    if (fill) fill(form);
-    choices.forEach(([label, act, kind]) => form.append(el('button', { type: 'button', className: kind || '', textContent: label, onclick: () => { dialog.close(); act(); } })));
-    form.append(el('button', { type: 'button', className: 'cancel', textContent: '取消', onclick: () => dialog.close() }));
-    dialog.replaceChildren(form);
-    dialog.showModal();
-  }
   // Into a terminal of the phone's: the conversation is closed here and gone on with there, once the computer has let it go.
   async function inTerminal() {
     const { tool, dir, session } = terminal;
@@ -333,18 +374,73 @@
       location.replace('../terminal/?id=' + body.terminal + (new URLSearchParams(location.search).get('from') === 'bench' ? '&from=bench' : ''));
     } catch (error) { toast(error.message); }
   }
+  // ---- the menu: what the conversation is, what is done with it (handed to another AI, asked at a time), its
+  // name, and how it is read. Each opens as a page of the same sheet (../ui/sheet.js, ../ui/work.js).
+  const work = RemoteWork.forPage('../', toast);
+  const skinList = () => {
+    const cur = saved('skin', 'paper');
+    const items = Object.keys(window.RemoteCliSkins).map(key => { const k = window.RemoteCliSkins[key]; return { key, name: k.name, bg: k.bg || k.t.background, ink: k.t.foreground, muted: k.muted, accent: k.accent, current: key === cur }; });
+    items.unshift({ key: 'auto', name: '跟随系统', follow: true, current: cur === 'auto' });
+    return items;
+  };
+  const READING = {
+    text: ['字号', [['small', '小'], ['normal', '标准'], ['large', '大'], ['larger', '特大']], 'normal'],
+    readline: ['行距', [['tight', '紧凑'], ['normal', '标准'], ['loose', '宽松']], 'normal'],
+    readfont: ['字体', [['sans', '默认'], ['serif', '衬线'], ['mono', '等宽']], 'sans'] };
+  const STATE = { busy: ['正在执行', 'var(--busy)'], confirm: ['等你确认', 'var(--bad)'], starting: ['正在启动', 'var(--accent)'], idle: ['等你的消息', 'var(--good)'], ended: ['已结束', 'var(--muted)'] };
+  const of = () => ({ id: terminal.session || '', tool: terminal.tool, title: terminal.title || TOOLS[terminal.tool], dir: terminal.dir || '', terminal: terminal.id });
+  function menuPage() {
+    const { ui } = RemoteSheet;
+    return { title: '对话', build(p) {
+      const ended = terminal.state === 'closed', kind = ended ? 'ended' : terminal.state === 'starting' ? 'starting' : state;
+      const [standing, colour] = STATE[kind] || STATE.idle;
+      p.body.append(ui.who({ icon: ['claude', 'agy'].includes(terminal.tool) ? terminal.tool : 'codex', tint: ['claude', 'agy'].includes(terminal.tool) ? terminal.tool : 'codex', title: terminal.title || TOOLS[terminal.tool] || '对话',
+        line: (TOOLS[terminal.tool] || terminal.tool) + (terminal.dir ? ' · ' + terminal.dir : '') + ' · ' + (device.online ? standing : '电脑离线'), state: device.online ? colour : 'var(--bad)' }));
+      const noSession = terminal.session ? '' : '发出第一条消息后才能使用';
+      p.body.append(ui.tiles([
+        { id: 'menu-handoff', icon: 'hand', tint: 'claude', label: '交给 AI', why: noSession, say: toast, act: () => work.handoff(p.sheet, of()) },
+        { id: 'menu-schedule', icon: 'clock', tint: 'time', label: '定时提问', why: noSession || (ended ? '对话已结束，先继续这段对话' : ''), say: toast, act: () => work.schedules(p.sheet, of()) },
+        { id: 'menu-files', icon: 'folder', tint: 'file', label: '项目文件', why: terminal.dir ? '' : '这段对话不在项目里', say: toast, act: () => { p.sheet.close(null, true); location.href = '../files/?dir=' + encodeURIComponent(terminal.dir) + '&from=terminal'; } },
+        { id: 'menu-copy', icon: 'copy', tint: 'copy', label: '复制全文', say: toast, act: async () => { p.sheet.close(null); toast(await RemoteSheet.copy(said.innerText.trim()) ? '已复制整段对话' : '没能复制，请长按选择文字'); } }]));
+      const rows = [ui.row({ icon: 'pen', tint: 'muted', label: '重命名', value: terminal.title || '', go: () => p.sheet.push(renamePage()) })];
+      if (terminal.session && terminal.dir && !ended) rows.push(ui.row({ icon: 'term', tint: 'muted', label: '在终端中打开', go: () => p.sheet.push(ui.confirm({ title: '在终端中打开', text: '这里的对话会关闭，在手机终端里继续同一段对话。', label: '在终端中打开', busy: '正在转到终端…', act: async sheet => { sheet.close(null, true); await inTerminal(); } })) }));
+      if (ended && terminal.session) rows.push(ui.row({ icon: 'play', tint: 'good', label: '继续这段对话', act: () => { p.sheet.close(null, true); bridge().again(); } }));
+      p.body.append(ui.section('对话', ui.group(...rows)));
+      const chosenSkin = saved('skin', 'paper');
+      const skin = window.RemoteCliSkins[chosenSkin] || window.RemoteCliSkins.paper;
+      p.body.append(ui.section('阅读', ui.group(ui.row({ icon: 'look', tint: 'look', label: '外观', value: chosenSkin === 'auto' ? '跟随系统' : skin.name, go: () => p.sheet.push(lookPage()) }),
+        ...Object.keys(READING).map(key => { const [name, choices, usual] = READING[key]; return ui.row({ label: name, end: ui.seg(choices, saved(key, usual), value => { keep(key, value); reader.change(paint); }, { label: name }) }); }))));
+      if (!ended) p.body.append(ui.group(ui.row({ label: '结束对话', danger: true, act: () => p.sheet.push(ui.confirm({ title: '结束对话', text: '正在执行的会被中断。对话保存在电脑上，之后可以继续。', label: '结束对话', kind: 'danger', act: sheet => { sheet.close(null); bridge().send({ action: 'close' }); } })) })));
+    } };
+  }
+  function renamePage() {
+    const { ui } = RemoteSheet;
+    return { title: '重命名', build(p) {
+      const box = ui.input({ id: 'chat-name', value: terminal.title || '', max: 60, label: '对话名称' });
+      setTimeout(() => { box.focus(); box.select(); }, 280);
+      const save = ui.go('保存', async () => {
+        const title = box.value.trim();
+        if (!title) throw new Error('请写下名称');
+        const { status, body } = await bridge().post({ action: 'rename', id: newId(), terminal: terminal.id, title });
+        if (status !== 200) throw new Error(body.error || '没有保存');
+        terminal.title = title; header();
+        p.sheet.goBack();
+      }, { busy: '正在保存…', id: 'rename-save' });
+      box.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); save.button.click(); } });
+      p.body.append(box);
+      p.foot.append(...save.nodes);
+    } };
+  }
+  function lookPage() {
+    const { ui } = RemoteSheet;
+    return { title: '外观', build(p) {
+      p.body.append(ui.swatches(skinList(), key => { keep('skin', key); paint(); }), ui.note('对 App 的所有页面生效'));
+    } };
+  }
   $('menu').onclick = () => {
     if (!terminal) return;
-    const open = terminal.state !== 'closed', choices = [];
-    choices.push(['重命名', () => sheet('对话名称', '', [['保存', async () => {
-      const title = $('chat-name').value.trim();
-      if (!title) return;
-      try { const { status, body } = await bridge().post({ action: 'rename', id: newId(), terminal: terminal.id, title }); if (status !== 200) toast(body.error || '没有保存'); }
-      catch (error) { toast('没有保存，请重试'); }
-    }, 'solid']], form => { form.append(el('input', { id: 'chat-name', value: terminal.title, maxLength: 60, spellcheck: false, ariaLabel: '对话名称' })); setTimeout(() => $('chat-name').select(), 50); })]);
-    if (terminal.session && terminal.dir) choices.push(['在终端中打开', () => sheet('在终端中打开？', '这里的对话会关闭，在手机终端里继续同一段对话。', [['在终端中打开', inTerminal, 'solid']])]);
-    if (open) choices.push(['结束对话', () => sheet('结束这段对话？', '正在执行的会被中断。对话保存在电脑上，之后可以继续。', [['结束对话', () => bridge().send({ action: 'close' }), 'danger']]), 'danger']);
-    sheet('对话选项', '', choices);
+    work.ensure();
+    RemoteSheet.open(menuPage(), '对话选项');
   };
 
   // ---- what the bridge asks of this page
@@ -354,23 +450,41 @@
     connection(info) {
       const link = $('link');
       link.hidden = info.state === 'connected' || info.state === 'paused' || (info.state === 'connecting' && !info.reconnects);
-      link.textContent = info.state === 'offline' ? '连接已断开' : '正在重新连接…';
+      link.textContent = info.state === 'offline' ? '连接已断开，已显示的内容和草稿保留' : '正在重新连接，已显示的内容和草稿保留…';
+    },
+    inputState(state, op, message) {
+      const p = op && mine.get(op.id);
+      if (!p) { if (message) toast(message); return; }
+      p.state = state; p.error = message || '';
+      saveMine();
+      if (state === 'accepted') acknowledge(p);
+      if (p.node) reader.change(() => { const next = bubble(p); p.node.replaceWith(next); p.node = next; });
     },
     inputError(message, typed, op) {
       if (op && op.action === 'say' && mine.has(op.id)) {
-        const p = mine.get(op.id);
-        p.failed = message;
-        if (p.node) { const fresh = bubble(p); p.node.replaceWith(fresh); p.node = fresh; }
+        window.TerminalUI.inputState('rejected', op, message);
         return;
       }
       if (op && op.action === 'answer') { answering.delete(op.ask); drawAsks(); }
       toast(message);
     },
-    dictated: text => { box.value += text; grow(); },
+    dictated: text => {
+      const val = box.value;
+      const hasPos = typeof box.selectionStart === 'number' && typeof box.selectionEnd === 'number';
+      const start = hasPos ? box.selectionStart : val.length, end = hasPos ? box.selectionEnd : val.length;
+      const before = val.slice(0, start), after = val.slice(end);
+      const gap = /[A-Za-z0-9]$/.test(before) && /^[A-Za-z0-9]/.test(text) ? ' ' : '';
+      const inserted = gap + text;
+      box.value = before + inserted + after;
+      const caret = before.length + inserted.length;
+      if (hasPos) try { box.setSelectionRange(caret, caret); } catch (error) { /* unfocused */ }
+      draft.set(box.value); grow();
+    },
     skins: () => [], spacings: () => [], screenText: () => said.innerText
   };
   setInterval(() => { if (state === 'busy') $('clock').textContent = since ? lasted(Date.now() - since) : ''; }, 1000);
   paint();
+  grow();
   document.addEventListener('DOMContentLoaded', async () => {
     canRich = await richText();
     if (bridge()) bridge().ready();

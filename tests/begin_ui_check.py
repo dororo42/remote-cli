@@ -24,7 +24,7 @@ APP = """window.RemoteCliNative = (() => {
   const kept = name => localStorage.getItem('app-pref-' + name) || '';
   return Object.assign({ chrome() {}, pref: kept, setPref(name, value) { localStorage.setItem('app-pref-' + name, value); }, home() { note('home', ''); }, appPage(tab) { note('appPage', tab); }, computer() { return '办公室电脑'; } }, %s);
 })();"""
-NEW_APP, OLD_APP = APP % "{ appTabs() { return 'tasks,projects,together,me'; } }", APP % "{}"
+NEW_APP, OLD_APP = APP % "{ appTabs() { return 'tasks,projects,together,me'; }, forgetCurrent() { note('forgetCurrent', ''); } }", APP % "{}"
 
 out = Path(sys.argv[2]); out.mkdir(parents=True, exist_ok=True)
 with tempfile.TemporaryDirectory(prefix="remote-ai-begin-", ignore_cleanup_errors=True) as temporary:
@@ -171,6 +171,24 @@ with tempfile.TemporaryDirectory(prefix="remote-ai-begin-", ignore_cleanup_error
         played.info["features"] += ["codex-desktop-open", "claude-desktop-open"]
         assert errors() == "[]", errors()
 
+        # ---- Antigravity CLI: a terminal, unless the computer runs it as a conversation (chat-agy); then under 应用
+        played.info["tools"] = played.info["tools"] + ["agy"]
+        browser.open(played.origin + "/?project=web-shop", project, "a project's page, with agy", **phone(390))
+        press("#begin .seg button", "应用")
+        until("document.querySelectorAll('#launch button').length === 3", "the applications and agy's terminal")
+        assert texts("#launch button") == ["Codex", "Claude", "agy"], texts("#launch button")
+        played.info["features"] += ["chat", "chat-agy"]
+        browser.open(played.origin + "/?project=web-shop", project, "a project's page, agy as a conversation", **phone(390))
+        until("document.querySelectorAll('#launch button').length === 3", "the applications with agy")
+        assert texts("#launch button") == ["Codex", "Claude", "agy"], texts("#launch button")
+        press("#launch button", "agy")
+        until("location.pathname.endsWith('/chat/')", "agy's conversation page")
+        op = asked("start")[-1]
+        assert (op["tool"], op["dir"], op.get("form")) == ("agy", "web-shop", "chat"), op
+        played.info["features"] = [feature for feature in played.info["features"] if feature not in ("chat", "chat-agy")]
+        played.info["tools"] = [tool for tool in played.info["tools"] if tool != "agy"]
+        assert errors() == "[]", errors()
+
         # ---- inside the app: the tabs are the app's own
         app = browser.ask("Page.addScriptToEvaluateOnNewDocument", source=NEW_APP)["identifier"]
         noted = lambda: json.loads(value("sessionStorage.getItem('app-asked') || '[]'"))
@@ -212,9 +230,19 @@ with tempfile.TemporaryDirectory(prefix="remote-ai-begin-", ignore_cleanup_error
         value("document.querySelector('#sheet-form .bar .icon').click()")
         until("sessionStorage.getItem('app-asked') === JSON.stringify([['home', '']])", "back to the app's list")
         # 协作 opened by the app for one thing: that thing is begun at once
-        for what, field in (("handoff", "handoff-from"), ("many", "many-text"), ("chain", "chain-from"), ("schedule", "schedule-session")):
-            browser.open(played.origin + "/?tab=together&do=" + what, sheet + " && !!document.getElementById('%s')" % field, "协作, opened for " + what, **phone(390))
+        # (in the sheet of ui/sheet.js: the handover begins with the conversation to hand over)
+        for what, ready in (("handoff", "(document.querySelector('dialog.rs[open] .rs-bar h2') || {}).textContent === '交接哪段对话'"), ("many", "!!document.querySelector('dialog.rs[open] #many-text')"),
+                            ("chain", "!!document.querySelector('dialog.rs[open] #chain-from')"), ("schedule", "!!document.querySelector('dialog.rs[open] #schedule-session')")):
+            browser.open(played.origin + "/?tab=together&do=" + what, ready, "协作, opened for " + what, **phone(390))
+        # expired session in the app: login screen offers direct removal and back without asking for a password
+        played.signed_in = False
+        value("sessionStorage.removeItem('app-asked')")
+        browser.open(played.origin + "/", "!document.getElementById('login').hidden && !document.getElementById('login-native').hidden && !document.getElementById('login-forget').hidden", "login screen with native forget", **phone(390))
+        value("document.getElementById('login-forget').click()")
+        value("document.getElementById('login-back').click()")
+        assert noted() == [["forgetCurrent", ""], ["home", ""]], noted()
         assert errors() == "[]", errors()
+        played.signed_in = True
         browser.ask("Page.removeScriptToEvaluateOnNewDocument", identifier=app)
 
         # ---- an app of an earlier version has lists for 协作 and 我的 only: the other two stay the page's

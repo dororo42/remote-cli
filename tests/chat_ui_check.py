@@ -281,8 +281,13 @@ def main():
             assert answered and answered[0]["decision"] == "allow" and answered[0]["ask"] == "a1b2c3d4e5f60718", answered
             until("document.querySelectorAll('.text')[1]?.querySelector('code')?.textContent === 'formatPrice'", "the answer after the step")
             until("document.getElementById('standing').textContent === '等你的消息' && document.getElementById('stop').hidden", "waiting once the turn has ended")
-            # done steps fold to their last lines; a press opens one
-            assert value("document.querySelectorAll('.step')[0].className") == "step ok"
+            # Successful steps collapse fully; their header remains a keyboard/touch control.
+            assert value("document.querySelectorAll('.step')[0].className") == "step ok shut"
+            assert value("document.querySelector('.step button').getAttribute('aria-expanded')") == "false"
+            value("document.querySelector('.step button').click()")
+            assert value("document.querySelector('.step button').getAttribute('aria-expanded')") == "true"
+            assert value("!document.querySelector('.step pre').hidden")
+            value("document.querySelector('.step button').click()")
             picture("chat-done.png")
 
             # ---- a message: it stands at once, and is the tool's once given back
@@ -316,13 +321,77 @@ def main():
             picture("chat-dark.png")
             value("localStorage.setItem('rcli-skin', 'paper')")
 
+            # A draft belongs to this conversation and survives page recreation.
+            value("document.getElementById('box').value = '还没发出的草稿'; document.getElementById('box').dispatchEvent(new Event('input'))")
+            ask("Page.reload")
+            until("document.getElementById('box')?.value === '还没发出的草稿' && document.querySelectorAll('.step').length === 3", "draft after reload")
+
+            # Transport receipts clear only the draft they actually acknowledged, not a newer edit.
+            value("window.savedSend = ProjectTerminal.send; window.sentOps = []; ProjectTerminal.send = op => sentOps.push(op); document.getElementById('write').requestSubmit()")
+            assert value("document.getElementById('box').value") == '还没发出的草稿'
+            value("document.getElementById('box').value = '下一条消息'; document.getElementById('box').dispatchEvent(new Event('input')); TerminalUI.inputState('retrying', sentOps[0])")
+            assert value("document.querySelector('.user.going').textContent.includes('正在确认送达')")
+            assert not value("document.querySelector('.user.going').classList.contains('failed')")
+            value("TerminalUI.inputState('accepted', sentOps[0])")
+            assert value("document.getElementById('box').value") == '下一条消息'
+            assert value("document.querySelector('.user.going').textContent.includes('已提交，等待对话接收')")
+            value("document.getElementById('write').requestSubmit(); TerminalUI.inputState('unknown', sentOps[1])")
+            before_retry = value("sentOps.length")
+            value("document.getElementById('write').requestSubmit()")
+            assert value("sentOps.length") == before_retry, 'an uncertain delivery cannot be repeated by pressing Send'
+            assert value("document.querySelector('.user.failed').textContent.includes('送达结果未知')")
+            pending_id = value("sentOps[1].id")
+            ask("Page.reload")
+            until("document.querySelector('.user.failed')?.textContent.includes('送达结果未知') && document.getElementById('box').value === '下一条消息'", "uncertain receipt after reload")
+            assert not any(op.get('id') == pending_id for op in computer.seen), 'stored messages must not replay on reload'
+            value("TerminalUI.inputState('accepted', {id: %s})" % json.dumps(pending_id))
+            assert value("document.getElementById('box').value") == ''
+
+            # Selecting a live answer freezes only that node until the selection is released.
+            computer.emit(terminal, t="item", id="selection-check", kind="text", text="保留这段选中文字")
+            until("Array.from(document.querySelectorAll('.text')).some(n => n.textContent.trim() === '保留这段选中文字')", "selection fixture")
+            value("window.selectedAnswer = Array.from(document.querySelectorAll('.text')).find(n => n.textContent.trim() === '保留这段选中文字'); var range = document.createRange(); range.selectNodeContents(selectedAnswer.querySelector('p')); getSelection().removeAllRanges(); getSelection().addRange(range)")
+            computer.emit(terminal, t="more", id="selection-check", text="，新内容继续到达。")
+            until("document.querySelector('.text.writing') === selectedAnswer", "same streaming node")
+            time.sleep(0.3)
+            assert value("getSelection().toString()") == '保留这段选中文字'
+            assert value("selectedAnswer.textContent.trim()") == '保留这段选中文字'
+            value("getSelection().removeAllRanges()")
+            until("selectedAnswer.textContent.includes('新内容继续到达')", "deferred selected text update")
+
+            # The shared reader retains unchanged native-message nodes, open details and focus.
+            assert value("""(() => {
+              const root = document.createElement('div'); document.body.append(root);
+              const reader = new RemoteConversation.Reader(root);
+              const old = document.createElement('details'); old.innerHTML = '<summary>操作</summary><p>完整输出</p>'; old.readKey = 'step'; old.open = true; root.append(old); old.firstChild.focus();
+              const fresh = document.createElement('div'); const same = old.cloneNode(true); same.open = false; same.readKey = 'step'; fresh.append(same);
+              const answer = document.createElement('p'); answer.textContent = '新回答'; answer.readKey = 'answer'; fresh.append(answer);
+              reader.replace(fresh);
+              const good = root.firstChild === old && old.open && document.activeElement === old.firstChild && root.children.length === 2;
+              reader.dispose(); root.remove(); return good;
+            })()""")
+
+            # Narrow phones, large text and desktop share the same readable column.
+            for width in (320, 390, 430, 1440):
+                ask("Emulation.setDeviceMetricsOverride", width=width, height=844, deviceScaleFactor=1, mobile=width < 500)
+                value("document.documentElement.style.fontSize = '19px'")
+                sizes = value("({viewport:innerWidth, client:document.documentElement.clientWidth, html:document.documentElement.scrollWidth, body:document.body.scrollWidth})")
+                assert sizes['viewport'] == width and sizes['client'] == width, sizes
+                assert max(sizes['html'], sizes['body']) <= width, sizes
+                picture('chat-width-%d.png' % width)
+            ask("Emulation.setDeviceMetricsOverride", width=390, height=844, deviceScaleFactor=2, mobile=True)
+            value("document.documentElement.style.fontSize = '15.5px'")
+
             # ---- ended from the menu: the box goes, and the way to go on with it comes
+            # (the menu is the sheet of ../ui/sheet.js: its rows, and a page that asks once before the end)
+            sheet_button = "Array.from(document.querySelectorAll('dialog.rs button')).find(b => b.innerText.trim() === %s)"
             value("document.getElementById('menu').click()")
-            until("document.getElementById('chat-sheet')?.open", "the menu")
-            assert value("Array.from(document.querySelectorAll('#chat-sheet button')).map(b => b.textContent)") == ["重命名", "在终端中打开", "结束对话", "取消"]
-            value("Array.from(document.querySelectorAll('#chat-sheet button')).find(b => b.textContent === '结束对话').click()")
-            until("Array.from(document.querySelectorAll('#chat-sheet button')).some(b => b.textContent === '结束对话' && b.className === 'danger') && document.getElementById('chat-sheet').open", "asked once")
-            value("Array.from(document.querySelectorAll('#chat-sheet button')).find(b => b.textContent === '结束对话').click()")
+            until("!!document.querySelector('dialog.rs[open]')", "the menu")
+            rows = value("Array.from(document.querySelectorAll('dialog.rs .rs-row b, dialog.rs .rs-row.danger > span')).map(b => b.textContent)")
+            assert rows[:2] == ["重命名", "在终端中打开"] and rows[-1] == "结束对话", rows
+            value(sheet_button % json.dumps("结束对话") + ".click()")
+            until("!!document.getElementById('rs-confirm') && document.getElementById('rs-confirm').classList.contains('danger')", "asked once")
+            value("document.getElementById('rs-confirm').click()")
             until("document.getElementById('standing').textContent === '对话已结束' && !document.getElementById('again').hidden && document.getElementById('write').hidden", "ended", 20)
             assert any(op["action"] == "close" for op in computer.seen)
             # going on with it starts it again, as a conversation, with the same id
@@ -347,9 +416,10 @@ def main():
             assert len(begun) == 1 and begun[0]["form"] == "chat" and begun[0]["tool"] == "claude" and begun[0]["dir"] == "web-shop" and "text" not in begun[0] and "session" not in begun[0], begun
             assert not any(op["action"] == "app_open" for op in computer.seen), "the desktop app is not opened by a press"
             value("bridge = window.ProjectTerminal; document.getElementById('menu').click()")
-            until("document.getElementById('chat-sheet')?.open", "the menu")
-            value("Array.from(document.querySelectorAll('#chat-sheet button')).find(b => b.textContent === '结束对话').click()")
-            value("Array.from(document.querySelectorAll('#chat-sheet button')).find(b => b.textContent === '结束对话').click()")
+            until("!!document.querySelector('dialog.rs[open]')", "the menu")
+            value(sheet_button % json.dumps("结束对话") + ".click()")
+            until("!!document.getElementById('rs-confirm')", "asked once")
+            value("document.getElementById('rs-confirm').click()")
             until("document.getElementById('standing').textContent === '对话已结束'", "the new one ended", 20)
             # a saved conversation in 任务 is gone on with as a conversation; a held press offers the terminal
             for terminal_id in [t["id"] for t in json.loads(http_get(port, "/api/terminal", phone.cookie))["terminals"] if t["state"] == "running"]:
@@ -361,8 +431,9 @@ def main():
             card = "Array.from(document.querySelectorAll('#recent-list .card')).find(c => c.textContent.includes('结算页的金额'))"
             until("!!" + card, "the saved conversation's card")
             value(card + ".dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))")
-            until("Array.from(document.querySelectorAll('#sheet[open] button')).some(b => b.textContent === '在手机终端继续')", "the terminal behind a held press")
-            value("document.getElementById('sheet').close()")
+            until("Array.from(document.querySelectorAll('dialog.rs[open] button')).some(b => b.innerText.trim() === '在手机终端继续')", "the terminal behind a held press")
+            value("document.querySelector('dialog.rs:not(.closing) .rs-close').click()")
+            until("!document.querySelector('dialog.rs')", "the sheet closed")
             before = len(computer.seen)
             value(card + ".querySelector('.open').click()")
             until("location.pathname.endsWith('/chat/') && document.getElementById('title').textContent === '结算页的金额'", "the saved conversation as a conversation", 20)

@@ -87,8 +87,9 @@ class Played:
         self.relay = Relay(str(Path(temporary) / "relay.json"))
         self.now = int(time.time() * 1000)
         self.info = {"instance": "d" * 32, "enabled": True, "tools": ["claude", "codex", "shell"], "workspaces": ["web-shop", "thesis", "data-tools"], "name": "办公室的电脑", "version": "1.6.0", "shell": "PowerShell",
-                     "features": ["peek", "reach", "end", "outbox", "marks", "files", "projects", "work", "chains", "codex-desktop-control", "codex-desktop-open", "claude-desktop-open"]}
+                     "features": ["peek", "reach", "end", "outbox", "marks", "files", "projects", "work", "chains", "brief", "schedule-days", "codex-desktop-control", "codex-desktop-open", "claude-desktop-open"]}
         self.sessions, self.said = story(self.now)
+        self.teams = []          # several AIs at one piece of work (Teams.cs)
         # what the computer keeps of its owner's work (docs/PROTOCOL.md, `/api/work`), and what it was asked to do
         self.chains = [{"id": "e" * 32, "from": THESIS, "from_tool": "codex", "from_title": "整理第三章的参考文献", "to": TABLES, "to_tool": "claude", "to_title": "核对回归表的系数",
                         "text": "按上面整理好的文献，核对正文里的引用编号有没有对上。", "left": 2, "rounds": 3, "runs": 1, "last": {"at": self.now - 14 * 60000, "ok": True, "note": "已交给对话"}}]
@@ -99,6 +100,7 @@ class Played:
         threading.Thread(target=self.compute, daemon=True).start()
         played = self
 
+        self.signed_in = True
         class Handler(http.server.SimpleHTTPRequestHandler):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, directory=str(ROOT / "web"), **kwargs)
@@ -113,7 +115,7 @@ class Played:
 
             def do_GET(self):
                 if self.path == "/api/session":
-                    return self.reply({"signed_in": True})
+                    return self.reply({"signed_in": played.signed_in})
                 if self.path == "/api/terminal":
                     played.relay.agent({"info": played.info, "sessions": played.sessions})
                     return self.reply(played.relay.overview())
@@ -190,8 +192,84 @@ class Played:
         if action == "work_schedule_remove":
             self.schedules[:] = [one for one in self.schedules if one["id"] != op["schedule"]]
             return {}
+        if action == "work_teams":
+            return {"teams": self.teams}
+        if action == "work_team_start":
+            given = op["item"]
+            mode = given["mode"]
+            if mode == "compare":
+                members = {t: "1" * 32 for t in given["tools"]}
+                candidates = [{"tool": t, "summary": f"{t} 的候选方案说明", "stat": "1 个文件改动：card.css", "diff": f"--- a/card.css\n+++ b/card.css\n+/* {t} */", "ready": True} for t in given["tools"]]
+                item = dict(given, state="choose", phase="", picked="", note="各候选方案已完成，对比改动后选一个合并到主目录", round=1, created=now, members=members, awaited=[], candidates=candidates,
+                            log=[{"at": now, "who": "目标", "text": given["goal"]}, {"at": now + 1, "who": given["tools"][0], "text": "方案已完成"}])
+            else:
+                role = "writer" if mode == "review" else "leader"
+                item = dict(given, state="running", phase="discuss" if given.get("discuss") else "", picked="", note="", round=1, created=now, members={role: "1" * 32}, awaited=[role],
+                            log=[{"at": now, "who": "目标", "text": given["goal"]}, {"at": now + 1, "who": role, "text": "开始：【协作任务】" + given["goal"]}])
+            self.teams[:] = [one for one in self.teams if one["id"] != item["id"]] + [item]
+            return {"team": item}
+        if action == "work_team_say":
+            team = next((one for one in self.teams if one["id"] == op["team"]), None)
+            if team is None:
+                raise RemoteError("没有找到这个协作任务")
+            if team["state"] in ("done", "stopped"):
+                team["round"] = team.get("round", 1) + 1
+                team["rounds"] = max(team.get("rounds", 3), team["round"] + 1)
+            team["state"] = "running"
+            team["note"] = ""
+            team["log"].append({"at": now, "who": "user", "text": op["text"]})
+            return {"team": team}
+        if action == "work_team_pick":
+            team = next((one for one in self.teams if one["id"] == op["team"]), None)
+            if team is None:
+                raise RemoteError("没有找到这个协作任务")
+            tool = op.get("tool", "")
+            team["picked"] = tool
+            team["state"] = "done"
+            team["note"] = f"已合并 {tool} 的方案" if tool else "已放弃所有候选方案并清理工作区"
+            for c in team.get("candidates", []):
+                c["ready"] = False
+            team["log"].append({"at": now, "who": "结果", "text": team["note"]})
+            return {"team": team}
+        if action == "work_team_swap":
+            team = next((one for one in self.teams if one["id"] == op["team"]), None)
+            if team is None:
+                raise RemoteError("没有找到这个协作任务")
+            role, new_tool, note = op.get("role", ""), op["tool"], op.get("note", "")
+            if team["mode"] == "review":
+                idx = 1 if role == "reviewer" else 0
+                old_tool = team["tools"][idx]
+                team["tools"][idx] = new_tool
+                team["awaited"] = [role or ("reviewer" if idx == 1 else "writer")]
+            else:
+                old_tool = team["tools"][0] if role == "leader" else (role or (team["tools"][1] if len(team["tools"]) > 1 else team["tools"][0]))
+                if role == "leader":
+                    team["tools"] = [new_tool] + [t for t in team["tools"] if t != new_tool]
+                    team["awaited"] = ["leader"]
+                else:
+                    if new_tool not in team["tools"]:
+                        team["tools"].append(new_tool)
+                    team["awaited"] = [new_tool]
+            team["state"] = "running"
+            team["note"] = ""
+            team.setdefault("failed", {}).pop(new_tool, None)
+            team["log"].append({"at": now, "who": "切换", "text": f"已将 {old_tool} 切换为 {new_tool}" + (f"（{note}）" if note else "")})
+            return {"team": team}
+        if action in ("work_team_stop", "work_team_resume", "work_team_remove"):
+            team = next((one for one in self.teams if one["id"] == op["team"]), None)
+            if team is None:
+                raise RemoteError("没有找到这个协作任务")
+            if action == "work_team_remove":
+                self.teams[:] = [one for one in self.teams if one["id"] != op["team"]]
+            else:
+                team.update(state="stopped" if action == "work_team_stop" else "running", note="已停止" if action == "work_team_stop" else "")
+            return {}
         if action == "work_handoff":
             return {"status": "accepted", "note": "已交给对话", "length": 420}
+        if action == "work_brief":
+            source = next(one for one in self.sessions if one["id"] == op["from"])
+            return {"text": "【对话交接】下面是我在另一段对话里的进展（%s，“%s”，项目 %s），请接着处理。\n\n我最初的要求：\n整理第三章引用的文献，统一成 GB/T 7714 格式\n\n它最后的回答：\n已统一 42 条文献的格式，剩下 3 条缺少页码，列在 refs-todo.md 里。\n\n它最近做的操作：\n- Bash：python check_refs.py\n- Edit：chapter3/refs.bib" % ({"claude": "Claude Code", "codex": "Codex"}[source["tool"]], source["title"], source["dir"])
+                    + ("\n\n我的补充：\n" + op["note"] if op.get("note") else ""), "tool": source["tool"], "dir": source["dir"], "title": source["title"]}
         if action == "session_say":
             return {"status": "accepted", "sent": True, "now": True, "way": "hook", "state": "handed", "message": op["id"]}
         # a new conversation: a terminal is started (nothing runs in it here), or a desktop app is handed the first words
@@ -277,7 +355,7 @@ def shots(browser, played):
     browser.open(played.origin + "/?tab=together", "document.querySelectorAll('#chains .card, #schedules .card').length >= 4", "the tab of conversations working together")
     browser.picture(OUT / "together.png")
     # (a taller screen for this one, so that the days are in the picture with today's figures)
-    browser.open(played.origin + "/?tab=me", "document.querySelectorAll('#me .day').length === 7 && !!document.querySelector('#computer')", "the tab of the owner's work", **dict(PHONE, height=940))
+    browser.open(played.origin + "/?tab=me&stats=1", "document.querySelectorAll('#me .day').length === 7 && !!document.querySelector('#computer')", "the tab of the owner's work", **dict(PHONE, height=940))
     browser.picture(OUT / "me.png")
     browser.open(played.origin + "/?tab=tasks&take=" + FIXING, "document.querySelector('#sheet .state') && document.querySelector('#sheet .said')?.textContent.includes('formatPrice')", "a conversation's window")
     browser.value("(() => { const said = document.querySelector('#sheet .said'); said.scrollTop = said.scrollHeight; })()")

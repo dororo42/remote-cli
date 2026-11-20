@@ -6,13 +6,17 @@ import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
+import android.os.Build;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
-import android.view.MotionEvent;
+import android.view.HapticFeedbackConstants;
 import android.view.View;
 import android.view.Window;
+import android.view.animation.DecelerateInterpolator;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
@@ -22,18 +26,9 @@ import java.util.function.IntConsumer;
 
 /** The colours and small views the app's own screens are built from, matching the pages a computer serves. */
 final class Kit {
-    /** One row per skin in web/terminal/skins.js: background, panel, raised, line, ink, muted, accent, on accent, good, busy, bad. */
-    private static final int[][] SKINS = {
-        {0x1a1b26, 0x222436, 0x2c2f47, 0x2f334d, 0xc0caf5, 0x8189ad, 0x7aa2f7, 0x10121c, 0x9ece6a, 0xe0af68, 0xf7768e},
-        {0x16181d, 0x1e2127, 0x2a2e37, 0x2c313a, 0xd7dae0, 0x7f8795, 0x61afef, 0x0f1114, 0x98c379, 0xe5c07b, 0xe06c75},
-        {0x1e2326, 0x272e33, 0x323c41, 0x343f44, 0xd3c6aa, 0x859289, 0xa7c080, 0x1a2023, 0xa7c080, 0xdbbc7f, 0xe67e80},
-        {0x1e1e2e, 0x262637, 0x313244, 0x313244, 0xcdd6f4, 0x8c8fa8, 0xcba6f7, 0x181825, 0xa6e3a1, 0xf9e2af, 0xf38ba8},
-        {0xfbfbfc, 0xf0f1f4, 0xe4e6eb, 0xd5d8df, 0x2b2f3a, 0x666b78, 0x2f6fe4, 0xffffff, 0x3d8a3a, 0xa36a00, 0xc93c37},
-        {0xfaf4ed, 0xf4ede4, 0xebe1d5, 0xddd3c6, 0x4a4566, 0x7a7089, 0x286983, 0xffffff, 0x3b7d5c, 0xb9781a, 0xb4506a},
-        {0x10191b, 0x1b292b, 0x27383a, 0x3b5052, 0xe2ece9, 0xa4b7b6, 0xedbb83, 0x10191b, 0xa8c99a, 0xe7c58b, 0xf39188}
-    };
-    static final String[] NAMES = {"night", "slate", "pine", "dusk", "paper", "dawn", "pond"};
-    static final String[] TITLES = {"夜航", "墨岩", "松林", "暮紫", "纸白 · 明亮", "晨光 · 明亮", "锦鲤池塘"};
+    private static final int[][] SKINS = Palettes.COLORS;
+    static final String[] NAMES = Palettes.NAMES;
+    static final String[] TITLES = Palettes.TITLES;
     /** The background of the skin with this name; an unknown name gives the default. */
     static int shade(String name) {
         for (int i = 0; i < NAMES.length; i++) if (NAMES[i].equals(name)) return 0xff000000 | SKINS[i][0];
@@ -49,7 +44,7 @@ final class Kit {
         return "";
     }
     /** The skin a new installation starts with. */
-    static final int PAPER = 0xfffbfbfc;
+    static final int PAPER = 0xfff2f3f7;
     private final Activity activity;
     int BG, PANEL, RAISED, LINE, INK, MUTED, ACCENT, ON_ACCENT, GOOD, BUSY, BAD;
 
@@ -65,12 +60,84 @@ final class Kit {
         GOOD = 0xff000000 | skin[8]; BUSY = 0xff000000 | skin[9]; BAD = 0xff000000 | skin[10];
     }
 
+    // ---- Semantic design tokens derived from the active skin
+    int solidInk() { return ACCENT; }
+    int onSolidInk() { return ON_ACCENT; }
+    int heroBg() { return PANEL; }
+    int heroTintBg() { return light(BG) ? mix(ACCENT, PANEL, .06f) : PANEL; }
+    int heroBorder() { return light(BG) ? mix(ACCENT, cardBorder(), .20f) : LINE; }
+    int heroFg() { return INK; }
+    int heroMuted() { return MUTED; }
+    int heroChipBg() { return RAISED; }
+    int cardBorder() { return light(BG) ? 0xffe9ebef : LINE; }
+    int dividerColor() { return light(BG) ? 0xffeef0f3 : rim(); }
+    int subSurface() { return light(BG) ? 0xfff6f7f9 : BG; }
+    int accentSoft() { return light(BG) ? 0xffeef1ff : tint(ACCENT, 40); }
+    int accentInk() { return light(BG) ? 0xff2445c8 : ACCENT; }
+    int busySoft() { return light(BG) ? 0xfffff7ea : tint(BUSY, 34); }
+    int busyInk() { return light(BG) ? 0xff8a4b00 : BUSY; }
+    int busyDot() { return light(BG) ? 0xfff59e0b : BUSY; }
+    int goodSoft() { return light(BG) ? 0xffdcfce7 : tint(GOOD, 36); }
+    int goodInk() { return light(BG) ? 0xff15803d : GOOD; }
+    int goodDot() { return light(BG) ? 0xff16a34a : GOOD; }
+    int badSoft() { return light(BG) ? 0xfffdedec : tint(BAD, 34); }
+
+    static String toolMono(String tool) {
+        if ("agy".equals(tool)) return "AG";
+        if ("codex".equals(tool)) return "CX";
+        if ("claude".equals(tool)) return "CC";
+        if ("opencode".equals(tool)) return "OC";
+        if ("qoder".equals(tool)) return "QD";
+        if ("cline".equals(tool)) return "CL";
+        if ("pi".equals(tool)) return "PI";
+        return "";
+    }
+    int toolBadgeBg(String tool) {
+        boolean day = light(BG);
+        if ("agy".equals(tool)) return day ? 0xffece8fd : 0xff261d4a;
+        if ("codex".equals(tool)) return day ? 0xffe6eefd : 0xff17284a;
+        if ("claude".equals(tool)) return day ? 0xfffbe9e1 : 0xff3a2318;
+        if ("opencode".equals(tool)) return day ? 0xffe6f6ec : 0xff153224;
+        if ("qoder".equals(tool)) return day ? 0xffeef1ff : 0xff1b2548;
+        if ("cline".equals(tool)) return day ? 0xfff3e8ff : 0xff2d1b4e;
+        if ("pi".equals(tool)) return day ? 0xfffef3c7 : 0xff3b2a10;
+        return RAISED;
+    }
+    int toolBadgeFg(String tool) {
+        boolean day = light(BG);
+        if ("agy".equals(tool)) return day ? 0xff5536c9 : 0xffbca9f8;
+        if ("codex".equals(tool)) return day ? 0xff1d4fbf : 0xff9dbbf7;
+        if ("claude".equals(tool)) return day ? 0xffa9441d : 0xfff7b593;
+        if ("opencode".equals(tool)) return day ? 0xff15803d : 0xff86efac;
+        if ("qoder".equals(tool)) return day ? 0xff2445c8 : 0xff9dbbf7;
+        if ("cline".equals(tool)) return day ? 0xff7c3aed : 0xffd8b4fe;
+        if ("pi".equals(tool)) return day ? 0xff9a5b00 : 0xfffcd34d;
+        return INK;
+    }
+
     int dp(float value) { return Math.round(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value, activity.getResources().getDisplayMetrics())); }
+    /** Crisp 0.5dp hairline divider/stroke on high-DPI displays. */
+    int hairline() { return Math.max(1, Math.round(activity.getResources().getDisplayMetrics().density * 0.5f)); }
+    /** Subtle surface rim: whisper-soft dark edge on light canvas, faint highlight on dark canvas. */
+    int rim() { return light(BG) ? tint(0xff0e1116, 18) : tint(0xffffffff, 20); }
+    /** Soft elevation for cards on light themes; flat layered contrast on dark themes. */
+    void elevate(View view, float depthDp) {
+        if (!light(BG)) { view.setElevation(0); return; }
+        view.setElevation(dp(depthDp));
+        if (Build.VERSION.SDK_INT >= 28) {
+            view.setOutlineAmbientShadowColor(0x100e1116);
+            view.setOutlineSpotShadowColor(0x1c0e1116);
+        }
+    }
+    void haptic(View view, int kind) { if (view != null) view.performHapticFeedback(kind); }
     static int tint(int color, int alpha) { return Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color)); }
     /** One colour laid over another at the given share, as the pages do with color-mix. */
     static int mix(int over, int under, float share) {
         return Color.rgb(Math.round(Color.red(over) * share + Color.red(under) * (1 - share)), Math.round(Color.green(over) * share + Color.green(under) * (1 - share)),
             Math.round(Color.blue(over) * share + Color.blue(under) * (1 - share)));
+    }
+    private static Typeface weight(int w) {
+        return Build.VERSION.SDK_INT >= 28 ? Typeface.create(Typeface.DEFAULT, w, false) : (w >= 600 ? Typeface.DEFAULT_BOLD : Typeface.DEFAULT);
     }
 
     TextView text(String value, float size, int color) {
@@ -78,16 +145,32 @@ final class Kit {
         view.setText(value); view.setTextSize(size); view.setTextColor(color); view.setLineSpacing(dp(3), 1f);
         return view;
     }
-    TextView bold(String value, float size, int color) { TextView view = text(value, size, color); view.setTypeface(Typeface.DEFAULT_BOLD); return view; }
+    TextView medium(String value, float size, int color) { TextView view = text(value, size, color); view.setTypeface(weight(500)); return view; }
+    TextView semibold(String value, float size, int color) { TextView view = text(value, size, color); view.setTypeface(weight(600)); return view; }
+    TextView bold(String value, float size, int color) { TextView view = text(value, size, color); view.setTypeface(weight(700)); return view; }
+    TextView mono(String value, float size, int color) {
+        TextView view = text(value, size, color);
+        view.setTypeface(Typeface.MONOSPACE);
+        view.setFontFeatureSettings("tnum");
+        return view;
+    }
+    /** Tabular sans-serif KPI number, matching modern iOS/macOS metric displays. */
+    TextView figure(String value, float size, int color) {
+        TextView view = semibold(value, size, color);
+        view.setFontFeatureSettings("tnum");
+        view.setLetterSpacing(-0.02f);
+        view.setSingleLine(true);
+        return view;
+    }
     /** One line that ends in an ellipsis when it does not fit. */
     TextView line(String value, float size, int color, boolean strong) {
-        TextView view = strong ? bold(value, size, color) : text(value, size, color);
+        TextView view = strong ? semibold(value, size, color) : text(value, size, color);
         view.setSingleLine(true); view.setEllipsize(TextUtils.TruncateAt.END);
         return view;
     }
     /** A title may use the available width before it is shortened. */
     TextView title(String value, float size, int color, boolean strong) {
-        TextView view = strong ? bold(value, size, color) : text(value, size, color);
+        TextView view = strong ? semibold(value, size, color) : medium(value, size, color);
         view.setMaxLines(2); view.setEllipsize(TextUtils.TruncateAt.END);
         return view;
     }
@@ -96,28 +179,51 @@ final class Kit {
         drawable.setColor(fill); drawable.setCornerRadius(dp(radius)); if (stroke != 0) drawable.setStroke(dp(1), stroke);
         return drawable;
     }
+    GradientDrawable hairlineShape(int fill, int stroke, float radius) {
+        GradientDrawable drawable = new GradientDrawable();
+        drawable.setColor(fill); drawable.setCornerRadius(dp(radius)); if (stroke != 0) drawable.setStroke(hairline(), stroke);
+        return drawable;
+    }
+    LinearLayout cardBox(float radius) {
+        LinearLayout card = column();
+        card.setBackground(shape(PANEL, cardBorder(), radius));
+        card.setClipToOutline(true);
+        elevate(card, 1.5f);
+        return card;
+    }
+    View insetDivider(int leftDp) {
+        View line = new View(activity);
+        line.setBackgroundColor(dividerColor());
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(1));
+        if (leftDp > 0) params.leftMargin = dp(leftDp);
+        line.setLayoutParams(params);
+        return line;
+    }
     EditText field(String hint, int type) {
         EditText box = new EditText(activity);
-        box.setHint(hint); box.setHintTextColor(MUTED); box.setTextColor(INK); box.setTextSize(16); box.setSingleLine(true);
-        box.setInputType(type); box.setBackground(shape(PANEL, LINE, 14)); box.setPadding(dp(16), 0, dp(16), 0); box.setMinHeight(dp(52));
+        box.setHint(hint); box.setHintTextColor(MUTED); box.setTextColor(INK); box.setTextSize(15.5f); box.setSingleLine(true);
+        box.setInputType(type); box.setBackground(shape(PANEL, cardBorder(), 16)); box.setPadding(dp(16), 0, dp(16), 0); box.setMinHeight(dp(50));
         return box;
     }
-    /** A button: 0 the main action, 1 an ordinary one, 2 only text. A press dims it for a moment. */
+    /** A button: 0 the main action, 1 an ordinary one, 2 only text, 3 soft danger. */
     TextView button(String label, int kind, Runnable action) {
-        TextView view = bold(label, 16, kind == 0 ? ON_ACCENT : kind == 1 ? INK : MUTED);
-        view.setGravity(Gravity.CENTER); view.setMinHeight(dp(52)); view.setPadding(dp(18), 0, dp(18), 0);
-        if (kind < 2) view.setBackground(shape(kind == 0 ? ACCENT : PANEL, kind == 0 ? 0 : LINE, 16));
+        int ink = kind == 0 ? onSolidInk() : kind == 3 ? BAD : kind == 1 ? INK : MUTED;
+        TextView view = semibold(label, 15, ink);
+        view.setGravity(Gravity.CENTER); view.setMinHeight(dp(kind == 0 ? 50 : 48)); view.setPadding(dp(16), dp(6), dp(16), dp(6));
+        if (kind == 0) view.setBackground(shape(solidInk(), 0, 14));
+        else if (kind == 1) view.setBackground(shape(PANEL, cardBorder(), 14));
+        else if (kind == 3) view.setBackground(shape(badSoft(), 0, 14));
         press(view, action);
         return view;
     }
     void press(View view, Runnable action) {
         view.setClickable(true); view.setFocusable(true);
-        view.setOnTouchListener((v, event) -> {
-            int what = event.getActionMasked();
-            if (what == MotionEvent.ACTION_DOWN) v.setAlpha(.6f);
-            else if (what == MotionEvent.ACTION_UP || what == MotionEvent.ACTION_CANCEL) v.setAlpha(1f);
-            return false;
-        });
+        Drawable base = view.getBackground();
+        if (!(base instanceof RippleDrawable)) {
+            int ripple = tint(INK, light(BG) ? 20 : 34);
+            Drawable mask = base != null ? null : shape(0xffffffff, 0, 14);
+            view.setBackground(new RippleDrawable(ColorStateList.valueOf(ripple), base, mask));
+        }
         view.setOnClickListener(v -> action.run());
     }
     LinearLayout.LayoutParams below(int top) {
@@ -127,36 +233,99 @@ final class Kit {
     }
     LinearLayout column() { LinearLayout column = new LinearLayout(activity); column.setOrientation(LinearLayout.VERTICAL); return column; }
     LinearLayout row() { LinearLayout row = new LinearLayout(activity); row.setGravity(Gravity.CENTER_VERTICAL); return row; }
+    /** A clean navigation bar for secondary screens: back circle button, title, optional right actions. */
+    LinearLayout navBar(String title, Runnable onBack, View... actions) {
+        LinearLayout bar = row();
+        bar.setMinimumHeight(dp(48));
+        View back = circleAction(R.drawable.ic_back, "返回", false, onBack);
+        LinearLayout.LayoutParams backParams = (LinearLayout.LayoutParams) back.getLayoutParams();
+        backParams.leftMargin = -dp(4);
+        backParams.rightMargin = dp(6);
+        bar.addView(back, backParams);
+        TextView named = bold(title, 20, INK);
+        named.setSingleLine(true); named.setEllipsize(TextUtils.TruncateAt.END);
+        named.setLetterSpacing(-0.015f);
+        bar.addView(named, new LinearLayout.LayoutParams(0, -2, 1));
+        for (View action : actions) if (action != null) bar.addView(action);
+        return bar;
+    }
     LinearLayout settingGroup(LinearLayout page, String label) {
-        page.addView(bold(label, 13, MUTED), below(24));
-        LinearLayout group = column(); group.setBackground(shape(PANEL, 0, 18));
-        page.addView(group, below(8)); return group;
+        if (label != null && !label.isEmpty()) {
+            TextView heading = semibold(label, 14, INK);
+            heading.setPadding(dp(4), 0, dp(4), 0);
+            page.addView(heading, below(20));
+        }
+        LinearLayout group = cardBox(22);
+        page.addView(group, below(label != null && !label.isEmpty() ? 10 : 16));
+        return group;
     }
     void setting(LinearLayout group, String label, String description, String value, Runnable action) {
-        LinearLayout row = settingBody(group, label, description);
+        setting(group, 0, 0, label, description, value, MUTED, action);
+    }
+    void setting(LinearLayout group, int iconRes, int iconTint, String label, String description, String value, Runnable action) {
+        setting(group, iconRes, iconTint, label, description, value, MUTED, action);
+    }
+    void setting(LinearLayout group, int iconRes, int iconTint, String label, String description, String value, int valueColor, Runnable action) {
+        LinearLayout row = settingBody(group, iconRes, iconTint, label, description);
         if (value != null && !value.isEmpty()) {
-            TextView status = line(value, 12.5f, MUTED, false); status.setMaxWidth(dp(110));
-            LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(-2, -2); gap.setMargins(dp(10), 0, dp(8), 0); row.addView(status, gap);
+            TextView status = valueColor != MUTED ? semibold(value, 12.5f, valueColor) : line(value, 13, valueColor, false);
+            status.setSingleLine(true); status.setEllipsize(TextUtils.TruncateAt.END); status.setMaxWidth(dp(120));
+            if (valueColor != MUTED) {
+                status.setPadding(dp(8), dp(2), dp(8), dp(2));
+                status.setBackground(shape(tint(valueColor, 30), 0, 99));
+            }
+            LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(-2, -2); gap.setMargins(dp(10), 0, dp(6), 0); row.addView(status, gap);
         }
-        row.addView(icon(R.drawable.ic_chevron, MUTED, 14)); press(row, action);
+        row.addView(icon(R.drawable.ic_chevron, tint(MUTED, 150), 16));
+        press(row, action);
     }
     void settingSwitch(LinearLayout group, String label, String description, boolean on, Runnable action) {
-        LinearLayout row = settingBody(group, label, description);
-        android.widget.Switch toggle = new android.widget.Switch(activity); toggle.setChecked(on); toggle.setContentDescription(label);
-        toggle.setThumbTintList(new ColorStateList(new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}}, new int[]{ACCENT, MUTED}));
-        toggle.setTrackTintList(new ColorStateList(new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}}, new int[]{tint(ACCENT, 90), LINE}));
-        LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(-2, -2); gap.leftMargin = dp(12); row.addView(toggle, gap);
-        toggle.setOnCheckedChangeListener((button, checked) -> action.run());
+        settingSwitch(group, 0, 0, label, description, on, action);
     }
-    private LinearLayout settingBody(LinearLayout group, String label, String description) {
-        if (group.getChildCount() > 0) { View line = new View(activity); line.setBackgroundColor(LINE); LinearLayout.LayoutParams divider = new LinearLayout.LayoutParams(-1, dp(1)); divider.setMargins(dp(16), 0, dp(16), 0); group.addView(line, divider); }
-        LinearLayout row = row(); row.setPadding(dp(16), dp(13), dp(16), dp(13)); row.setMinimumHeight(dp(64));
-        LinearLayout copy = column(); copy.addView(text(label, 16, INK));
-        if (description != null && !description.isEmpty()) copy.addView(text(description, 12.5f, MUTED), below(3));
-        row.addView(copy, new LinearLayout.LayoutParams(0, -2, 1)); group.addView(row); return row;
+    void settingSwitch(LinearLayout group, int iconRes, int iconTint, String label, String description, boolean on, Runnable action) {
+        LinearLayout row = settingBody(group, iconRes, iconTint, label, description);
+        View toggle = toggleView(on, label);
+        LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(dp(50), dp(30)); gap.leftMargin = dp(12);
+        row.addView(toggle, gap);
+        press(row, () -> { haptic(row, HapticFeedbackConstants.CLOCK_TICK); action.run(); });
+    }
+    /** A crisp pill toggle switch matching web/ui/sheet.css (.rs-switch). */
+    View toggleView(boolean on, String label) {
+        FrameLayout track = new FrameLayout(activity);
+        track.setBackground(shape(on ? goodDot() : mix(MUTED, RAISED, .32f), 0, 15));
+        View thumb = new View(activity);
+        thumb.setBackground(shape(0xffffffff, 0, 13));
+        thumb.setElevation(dp(2));
+        FrameLayout.LayoutParams knob = new FrameLayout.LayoutParams(dp(26), dp(26), Gravity.CENTER_VERTICAL | (on ? Gravity.END : Gravity.START));
+        knob.setMargins(dp(2), 0, dp(2), 0);
+        track.addView(thumb, knob);
+        track.setContentDescription(label + (on ? "，已开启" : "，已关闭"));
+        return track;
+    }
+    private LinearLayout settingBody(LinearLayout group, int iconRes, int iconTint, String label, String description) {
+        if (group.getChildCount() > 0) {
+            group.addView(insetDivider(iconRes != 0 ? 64 : 16));
+        }
+        LinearLayout row = row();
+        row.setPadding(dp(14), dp(12), dp(14), dp(12));
+        row.setMinimumHeight(dp(56));
+        if (iconRes != 0) {
+            View badge = tile(iconRes, iconTint == 0 ? ACCENT : iconTint, 36);
+            LinearLayout.LayoutParams badgeParams = (LinearLayout.LayoutParams) badge.getLayoutParams();
+            badgeParams.rightMargin = dp(12);
+            row.addView(badge, badgeParams);
+        }
+        LinearLayout copy = column();
+        TextView title = medium(label, 15, INK);
+        title.setSingleLine(true); title.setEllipsize(TextUtils.TruncateAt.END);
+        copy.addView(title);
+        if (description != null && !description.isEmpty()) copy.addView(text(description, 12.5f, MUTED), below(2));
+        row.addView(copy, new LinearLayout.LayoutParams(0, -2, 1));
+        group.addView(row);
+        return row;
     }
     /** A screen's content: one column with the page margins. */
-    LinearLayout page(int top) { LinearLayout page = column(); page.setPadding(dp(18), dp(top), dp(18), dp(28)); return page; }
+    LinearLayout page(int top) { LinearLayout page = column(); page.setPadding(dp(16), dp(top), dp(16), dp(24)); return page; }
 
     ImageView icon(int drawable, int color, int size) {
         ImageView view = new ImageView(activity);
@@ -164,26 +333,68 @@ final class Kit {
         view.setLayoutParams(new LinearLayout.LayoutParams(dp(size), dp(size)));
         return view;
     }
-    /** An icon on a rounded tile tinted with its own colour: the tool a task runs, or a folder. */
+    /** An icon on a rounded tile tinted with its own colour: a folder or a setting glyph. */
     View tile(int drawable, int color, int size) {
         FrameLayout tile = new FrameLayout(activity);
-        tile.setBackground(shape(mix(color, BG, .16f), 0, size * .3f));
-        ImageView image = icon(drawable, color, Math.round(size * .55f));
-        tile.addView(image, new FrameLayout.LayoutParams(dp(size * .55f), dp(size * .55f), Gravity.CENTER));
+        tile.setBackground(shape(mix(color, BG, .15f), 0, size * .30f));
+        ImageView image = icon(drawable, color, Math.round(size * .52f));
+        tile.addView(image, new FrameLayout.LayoutParams(dp(size * .52f), dp(size * .52f), Gravity.CENTER));
         tile.setLayoutParams(new LinearLayout.LayoutParams(dp(size), dp(size)));
         return tile;
     }
+    /** An icon tile with explicit fill and stroke colors (e.g. calm neutral quick-action tiles or status folders). */
+    View tintedTile(int drawable, int fill, int iconColor, int size, float radius) {
+        FrameLayout tile = new FrameLayout(activity);
+        tile.setBackground(shape(fill, 0, radius));
+        int glyph = Math.round(size * .50f);
+        tile.addView(icon(drawable, iconColor, glyph), new FrameLayout.LayoutParams(dp(glyph), dp(glyph), Gravity.CENTER));
+        tile.setLayoutParams(new LinearLayout.LayoutParams(dp(size), dp(size)));
+        return tile;
+    }
+    /** Tool identity squircle badge: two-letter monogram (AG / CX / CC) or terminal icon for shell. */
+    View toolBadge(String tool, int sizeDp) {
+        String mono = toolMono(tool);
+        int bg = toolBadgeBg(tool), fg = toolBadgeFg(tool);
+        float radius = sizeDp >= 40 ? 13f : sizeDp >= 34 ? 11f : 9f;
+        FrameLayout badge = new FrameLayout(activity);
+        badge.setBackground(shape(bg, 0, radius));
+        if (!mono.isEmpty()) {
+            float sp = sizeDp >= 42 ? 13f : sizeDp >= 38 ? 12f : 10.5f;
+            TextView label = bold(mono, sp, fg);
+            label.setIncludeFontPadding(false);
+            label.setLetterSpacing(0.02f);
+            label.setGravity(Gravity.CENTER);
+            badge.addView(label, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+        } else {
+            int glyph = Math.round(sizeDp * .48f);
+            badge.addView(icon(R.drawable.ic_shell, fg, glyph), new FrameLayout.LayoutParams(dp(glyph), dp(glyph), Gravity.CENTER));
+        }
+        badge.setLayoutParams(new LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp)));
+        return badge;
+    }
+    /** Circular 42dp visual action button inside a 48dp touch target, solid dark or outlined white. */
+    View circleAction(int drawable, String says, boolean solid, Runnable action) {
+        FrameLayout box = new FrameLayout(activity), disc = new FrameLayout(activity);
+        disc.setBackground(shape(solid ? solidInk() : PANEL, solid ? 0 : cardBorder(), 21));
+        if (solid) elevate(disc, 4f);
+        disc.addView(icon(drawable, solid ? onSolidInk() : INK, 20), new FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER));
+        box.addView(disc, new FrameLayout.LayoutParams(dp(42), dp(42), Gravity.CENTER));
+        box.setContentDescription(says);
+        box.setLayoutParams(new LinearLayout.LayoutParams(dp(48), dp(48)));
+        press(box, action);
+        return box;
+    }
     /**
-     * The top of one of the app's own lists, as a computer's pages have it: the name of its tab large, a line under
-     * it that says how things stand, and at the right what is done there.
+     * The top of one of the app's own lists: the name of its tab large, a line under it that says how things stand,
+     * and at the right what is done there.
      */
     LinearLayout head(String title, View under, View... actions) {
         LinearLayout head = row();
         LinearLayout titles = column();
-        TextView name = bold(title, 29, INK);
-        name.setIncludeFontPadding(false); name.setLineSpacing(0, 1f);
+        TextView name = bold(title, 31, INK);
+        name.setIncludeFontPadding(false); name.setLineSpacing(0, 1f); name.setLetterSpacing(-0.02f);
         titles.addView(name);
-        if (under != null) titles.addView(under, below(5));
+        if (under != null) titles.addView(under, below(4));
         head.addView(titles, new LinearLayout.LayoutParams(0, -2, 1));
         for (View action : actions) if (action != null) head.addView(action);
         return head;
@@ -210,12 +421,13 @@ final class Kit {
         press(box, action);
         return box;
     }
-    /** A small action on a card: its icon on a quiet disc, with room around it for a thumb. */
-    View discButton(int drawable, String says, Runnable action) {
+    /** A small action on a card: its icon on a quiet rounded tile, with room around it for a thumb. */
+    View discButton(int drawable, String says, Runnable action) { return discButton(drawable, says, RAISED, MUTED, action); }
+    View discButton(int drawable, String says, int fill, int iconColor, Runnable action) {
         FrameLayout box = new FrameLayout(activity), disc = new FrameLayout(activity);
-        disc.setBackground(shape(RAISED, 0, 18));
-        disc.addView(icon(drawable, MUTED, 16), new FrameLayout.LayoutParams(dp(16), dp(16), Gravity.CENTER));
-        box.addView(disc, new FrameLayout.LayoutParams(dp(36), dp(36), Gravity.CENTER));
+        disc.setBackground(shape(fill, 0, 12));
+        disc.addView(icon(drawable, iconColor, 17), new FrameLayout.LayoutParams(dp(17), dp(17), Gravity.CENTER));
+        box.addView(disc, new FrameLayout.LayoutParams(dp(38), dp(38), Gravity.CENTER));
         box.setContentDescription(says);
         box.setLayoutParams(new LinearLayout.LayoutParams(dp(48), dp(48)));
         press(box, action);
@@ -227,33 +439,55 @@ final class Kit {
         dot.setLayoutParams(new LinearLayout.LayoutParams(dp(size), dp(size)));
         return dot;
     }
+    /** A glowing status dot inside a soft halo ring (online green / live amber). */
+    View haloDot(int coreColor, int haloColor) {
+        FrameLayout wrap = new FrameLayout(activity);
+        wrap.setBackground(shape(haloColor, 0, 7));
+        View core = new View(activity);
+        core.setBackground(shape(coreColor, 0, 4));
+        wrap.addView(core, new FrameLayout.LayoutParams(dp(8), dp(8), Gravity.CENTER));
+        wrap.setLayoutParams(new LinearLayout.LayoutParams(dp(14), dp(14)));
+        return wrap;
+    }
+    /** Status pill with explicit text, fill, and optional dot colour (0 omits dot). */
+    TextView statusPill(String label, int fg, int bg, int dotColor) {
+        TextView pill = semibold(label, 12, fg);
+        pill.setSingleLine(true);
+        pill.setGravity(Gravity.CENTER_VERTICAL);
+        pill.setMinHeight(dp(26));
+        pill.setPadding(dp(9), dp(2), dp(9), dp(2));
+        pill.setBackground(shape(bg, 0, 99));
+        if (dotColor != 0) {
+            GradientDrawable mark = shape(dotColor, 0, 3);
+            mark.setBounds(0, 0, dp(6), dp(6));
+            pill.setCompoundDrawables(mark, null, null, null);
+            pill.setCompoundDrawablePadding(dp(5));
+        }
+        return pill;
+    }
     /** What a task is doing: its colour as a dot and as the text, on a wash of the same colour. */
     TextView pill(String label, int color) {
-        TextView pill = bold(label, 11.5f, color);
-        pill.setSingleLine(true); pill.setPadding(dp(8), dp(2), dp(9), dp(2)); pill.setBackground(shape(tint(color, 38), 0, 99));
-        GradientDrawable mark = shape(color, 0, 6);
-        mark.setBounds(0, 0, dp(6), dp(6));
-        pill.setCompoundDrawables(mark, null, null, null); pill.setCompoundDrawablePadding(dp(5));
-        return pill;
+        return statusPill(label, color, tint(color, 34), color);
     }
 
     /** Choices on a sheet that rises from the bottom, within reach of a thumb. notes may hold null; danger marks one choice, or is -1. */
-    // A sheet that rises from the bottom of the screen, in the app's look: its box with the grip, the title and a
-    // line under it; and putting it on the screen.
     private LinearLayout sheetBox(String title, String note, int noteLines) {
         LinearLayout box = column();
-        box.setPadding(dp(18), dp(10), dp(18), dp(14));
+        box.setPadding(dp(16), dp(8), dp(16), dp(16));
         GradientDrawable back = new GradientDrawable();
-        back.setColor(PANEL); back.setCornerRadii(new float[]{dp(22), dp(22), dp(22), dp(22), 0, 0, 0, 0});
+        back.setColor(BG); back.setCornerRadii(new float[]{dp(24), dp(24), dp(24), dp(24), 0, 0, 0, 0});
         box.setBackground(back);
         View grip = new View(activity);
-        grip.setBackground(shape(LINE, 0, 2));
-        LinearLayout.LayoutParams middle = new LinearLayout.LayoutParams(dp(40), dp(4));
-        middle.gravity = Gravity.CENTER_HORIZONTAL; middle.bottomMargin = dp(14);
+        grip.setBackground(shape(tint(MUTED, 97), 0, 3));
+        LinearLayout.LayoutParams middle = new LinearLayout.LayoutParams(dp(38), dp(5));
+        middle.gravity = Gravity.CENTER_HORIZONTAL; middle.bottomMargin = dp(12);
         box.addView(grip, middle);
-        box.addView(bold(title, 18, INK));
+        TextView named = bold(title, 17, INK);
+        named.setGravity(Gravity.CENTER); named.setSingleLine(true); named.setEllipsize(TextUtils.TruncateAt.END);
+        box.addView(named);
         if (note != null && !note.isEmpty()) {
             TextView under = text(note, 13.5f, MUTED);
+            under.setGravity(Gravity.CENTER);
             if (noteLines > 0) { under.setMaxLines(noteLines); under.setEllipsize(TextUtils.TruncateAt.END); }
             box.addView(under, below(4));
         }
@@ -262,12 +496,15 @@ final class Kit {
     private void raise(Dialog dialog, LinearLayout box, boolean typing) {
         dialog.setContentView(box);
         Window window = dialog.getWindow();
-        // a sheet to write in comes with the keyboard and stays above it
         if (window != null && typing) window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE | android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         dialog.show();
         if (window == null) return;
         window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        window.setDimAmount(0.36f);
         window.setLayout(-1, -2); window.setGravity(Gravity.BOTTOM);
+        box.setAlpha(0f);
+        box.setTranslationY(dp(36));
+        box.animate().alpha(1f).translationY(0f).setDuration(240).setInterpolator(new DecelerateInterpolator(2.2f)).start();
     }
     /** A sheet with a box to write in and one button, which hands over what was written. */
     void write(String title, String note, String hint, String yes, java.util.function.Consumer<String> written) {
@@ -276,7 +513,7 @@ final class Kit {
         LinearLayout box = sheetBox(title, note, 3);
         final EditText field = field(hint, android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         field.setSingleLine(false); field.setMinLines(2); field.setMaxLines(6); field.setGravity(Gravity.TOP | Gravity.START);
-        field.setBackground(shape(BG, LINE, 14)); field.setPadding(dp(16), dp(13), dp(16), dp(13));
+        field.setBackground(shape(PANEL, cardBorder(), 16)); field.setPadding(dp(16), dp(13), dp(16), dp(13));
         box.addView(field, below(14));
         box.addView(button(yes, 0, () -> {
             String text = field.getText().toString().trim();
@@ -291,17 +528,67 @@ final class Kit {
         final Dialog dialog = new Dialog(activity);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
         LinearLayout box = sheetBox(title, note, 0);
+        LinearLayout group = cardBox(20), apart = cardBox(20);
         for (int i = 0; i < labels.length; i++) {
-            LinearLayout item = column();
-            item.setGravity(Gravity.CENTER_VERTICAL); item.setMinimumHeight(dp(54)); item.setPadding(dp(16), dp(9), dp(16), dp(9));
-            item.setBackground(shape(RAISED, LINE, 14));
-            item.addView(bold(labels[i], 15.5f, i == danger ? BAD : INK));
-            if (notes != null && notes[i] != null && !notes[i].isEmpty()) item.addView(text(notes[i], 12.5f, MUTED));
+            String said = notes != null && notes[i] != null ? notes[i] : "";
+            boolean current = said.startsWith("当前使用");
+            if (current) said = said.replaceFirst("^当前使用( · )?", "");
+            LinearLayout target = i == danger ? apart : group;
+            if (target.getChildCount() > 0) target.addView(insetDivider(16));
+            LinearLayout item = row();
+            item.setMinimumHeight(dp(54)); item.setPadding(dp(16), dp(10), dp(14), dp(10));
+            LinearLayout words = column();
+            TextView name = medium(labels[i], 15.5f, i == danger ? BAD : current ? accentInk() : INK);
+            if (current || i == danger) name.setTypeface(weight(600));
+            if (i == danger) { name.setGravity(Gravity.CENTER); words.setGravity(Gravity.CENTER_HORIZONTAL); }
+            words.addView(name);
+            if (!said.isEmpty()) words.addView(text(said, 12.5f, MUTED), below(2));
+            item.addView(words, new LinearLayout.LayoutParams(0, -2, 1));
+            if (current) item.addView(icon(R.drawable.ic_check, accentInk(), 20));
+            item.setContentDescription(labels[i] + (current ? "，当前使用" : ""));
             final int at = i;
             press(item, () -> { dialog.dismiss(); picked.accept(at); });
-            box.addView(item, below(i == 0 ? 14 : 8));
+            target.addView(item);
         }
-        box.addView(button("取消", 2, dialog::dismiss), below(4));
+        if (group.getChildCount() > 0) box.addView(group, below(14));
+        if (apart.getChildCount() > 0) box.addView(apart, below(group.getChildCount() > 0 ? 10 : 14));
+        box.addView(button("取消", 1, dialog::dismiss), below(10));
         raise(dialog, box, false);
+    }
+    /** A bottom confirmation sheet matching web/ui/sheet.js, replacing raw system AlertDialogs. */
+    void confirmSheet(String title, String note, String yesLabel, boolean danger, Runnable onYes) {
+        final Dialog dialog = new Dialog(activity);
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout box = sheetBox(title, null, 0);
+        if (note != null && !note.isEmpty()) {
+            LinearLayout card = column();
+            card.setPadding(dp(14), dp(12), dp(14), dp(12));
+            card.setBackground(shape(danger ? badSoft() : accentSoft(), 0, 14));
+            card.addView(text(note, 13.5f, INK));
+            box.addView(card, below(12));
+        }
+        box.addView(button(yesLabel, danger ? 3 : 0, () -> { dialog.dismiss(); onYes.run(); }), below(14));
+        box.addView(button("取消", 1, dialog::dismiss), below(8));
+        raise(dialog, box, false);
+    }
+    /** A single-line input sheet (e.g. renaming a computer). */
+    void promptSheet(String title, String initial, String hint, String yesLabel, java.util.function.Consumer<String> onSave) {
+        final Dialog dialog = new Dialog(activity);
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout box = sheetBox(title, null, 0);
+        final EditText field = field(hint, android.text.InputType.TYPE_CLASS_TEXT);
+        field.setText(initial);
+        field.setSelection(initial == null ? 0 : initial.length());
+        field.setBackground(shape(PANEL, cardBorder(), 16));
+        box.addView(field, below(14));
+        box.addView(button(yesLabel, 0, () -> {
+            String value = field.getText().toString().trim();
+            if (value.isEmpty()) return;
+            dialog.dismiss();
+            onSave.accept(value);
+        }), below(12));
+        box.addView(button("取消", 1, dialog::dismiss), below(8));
+        raise(dialog, box, true);
+        field.requestFocus();
     }
 }

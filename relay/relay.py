@@ -69,7 +69,7 @@ _session_re = {"opencode": re.compile(r"^ses_[A-Za-z0-9]{10,40}$"),
 
 
 def session_id_ok(tool, session):
-    """A conversation id in this tool's own shape; claude, codex, qoder and pi name a UUID."""
+    """A conversation id in this tool's own shape; claude, codex, agy, qoder and pi name a UUID."""
     return bool(_session_re.get(tool, _session).fullmatch(session))
 _word = re.compile(r"^[a-z0-9_]{1,40}$")
 PROJECT_ACTIONS = ("project_add", "project_remove", "project_rename")
@@ -78,7 +78,7 @@ DESKTOP_ACTIONS = ("app_open",)
 DESKTOP_TOOLS = ("codex", "claude")
 UPDATE_ACTION = "update"      # the program on the computer looks for a newer version of itself and installs it
 MAX_TERMINALS, MAX_HISTORY, OUTPUT_LIMIT, CLOSED_LIMIT = 8, 12, 2_000_000, 300_000
-LABELS = {"claude": "Claude Code", "codex": "Codex", "opencode": "OpenCode", "qoder": "Qoder", "cline": "Cline", "pi": "Pi", "shell": "PowerShell"}
+LABELS = {"claude": "Claude Code", "codex": "Codex", "agy": "Antigravity CLI", "opencode": "OpenCode", "qoder": "Qoder", "cline": "Cline", "pi": "Pi", "shell": "PowerShell"}
 OP_SECONDS = 120
 
 
@@ -97,6 +97,27 @@ def _words(text, most=8000):
     return text
 
 
+def _quotas(items):
+    """How much of each tool's usage limits the computer's owner has used, as the computer read it from the tools
+    (agent-windows/Quotas.cs): per tool, each window's share used (0..100) and when it starts anew; or why it is not
+    known. Nothing of the account itself."""
+    kept = []
+    for item in items[:4] if isinstance(items, list) else []:
+        if not isinstance(item, dict) or item.get("tool") not in ("claude", "codex", "agy") or type(item.get("at")) is not int:
+            continue
+        windows = []
+        for w in (item.get("windows") if isinstance(item.get("windows"), list) else [])[:8]:
+            if not (isinstance(w, dict) and isinstance(w.get("name"), str) and re.fullmatch(r"[a-z0-9_]{1,32}", w["name"])
+                    and type(w.get("used")) in (int, float) and 0 <= w["used"] <= 100):
+                continue
+            entry = {"name": w["name"], "used": float(w["used"]), "resets": w["resets"] if type(w.get("resets")) is int and w["resets"] >= 0 else 0}
+            if _name(w.get("group"), 32):
+                entry["group"] = w["group"].strip()
+            windows.append(entry)
+        kept.append({"tool": item["tool"], "at": item["at"], "why": str(item.get("why") or "")[:80], "windows": windows})
+    return kept
+
+
 def _folders(items, limit):
     """Folders as the computer reports them; the relay only shows them and hands the chosen one back."""
     out = []
@@ -104,7 +125,7 @@ def _folders(items, limit):
         if isinstance(item, dict) and _name(item.get("name"), 60) and _name(item.get("path"), 260):
             out.append({"name": item["name"], "path": item["path"], "fixed": item.get("fixed") is True, "exists": item.get("exists") is not False,
                         "updated": item["updated"] if type(item.get("updated")) is int else 0, "live": item.get("live") is True,
-                        "tools": [t for t in str(item.get("tools", "")).split() if t in ("claude", "codex", "opencode", "qoder", "cline", "pi")],
+                        "tools": [t for t in str(item.get("tools", "")).split() if t in ("claude", "codex", "agy", "opencode", "qoder", "cline", "pi")],
                         # by what the folder is used on the computer, in the computer's words: a desktop app, an editor, a terminal
                         "kinds": [k[:20] for k in item.get("kinds", []) if isinstance(k, str) and k.strip()][:4] if isinstance(item.get("kinds"), list) else []})
     return out
@@ -234,6 +255,10 @@ REDRAW_SECONDS, ECHO_SECONDS = 3, 1.2
 
 
 def _asks(term):
+    seq = term.get("seq", 0)
+    cached = term.get("_asks_cache")
+    if cached and cached[0] == seq:
+        return cached[1]
     text, size = [], 0
     for chunk in reversed(term.get("output", [])):
         text.append(chunk["data"])
@@ -241,7 +266,9 @@ def _asks(term):
         if size >= 6000:
             break
     tail = "".join(_ESCAPES.sub("", "".join(reversed(text))).split()).lower()[-900:]
-    return any(ask in tail for ask in _ASKS)
+    matched = any(ask in tail for ask in _ASKS)
+    term["_asks_cache"] = (seq, matched)
+    return matched
 
 
 def _phase(term, now):
@@ -310,12 +337,15 @@ WAKE_SECONDS = 85       # a message that is handed to a conversation where it si
 COMPUTER_ACTIONS = ("settings_read", "settings_change", "line_switch", "line_take", "line_keep")
 # What the phone asks about its owner's work on the computer (the computer needs the feature "work"): the numbers of
 # it, the questions set to be asked at a time, and one conversation handed over to another.
-WORK_ACTIONS = ("stats", "schedules", "schedule_set", "schedule_remove", "handoff", "chains", "chain_set", "chain_remove")
+WORK_ACTIONS = ("stats", "schedules", "schedule_set", "schedule_remove", "handoff", "brief", "chains", "chain_set", "chain_remove",
+                "teams", "team_start", "team_stop", "team_resume", "team_remove", "team_say", "team_pick", "team_swap")
 # What the phone can do to a conversation that a program on the computer has open, where its tool lets it be reached.
 REACH = ("say", "answer", "stop")
 # What is done to a terminal that runs a conversation through its tool's structured mode (form "chat"; docs/PROTOCOL.md,
 # "Chats"): what is said, a stop, an answer to what it asks, ending it. It has no screen to type into or size.
-CHAT_TOOLS = ("claude", "codex")
+CHAT_TOOLS = ("claude", "codex", "agy")
+# a tool beyond the first two runs as a conversation only where the computer says it can (Antigravity CLI: by ACP)
+CHAT_FEATURES = {"agy": "chat-agy"}
 CHAT_ACTIONS = ("say", "stop", "answer", "close", "rename")
 CHAT_DECISIONS = re.compile(r"^(allow|always|deny|choice:[0-9]{1,2})$")
 # By which way the computer does each thing to a conversation that a program there has open (docs/PROTOCOL.md):
@@ -390,8 +420,9 @@ class Relay:
     def __init__(self, path):
         self.path = path
         self._lock = threading.Lock()
-        self._changed = threading.Condition(self._lock)   # new output, a new state or a new operation: waiting requests look again
-        self._tick = [0]            # counts every wake-up, so a waiter can tell that one happened between its look and its wait
+        self._changed = threading.Condition(self._lock)       # new terminal output or state: waiting stream/overview readers wake
+        self._ops_changed = threading.Condition(self._lock)   # new queued operations or RPC answers: pull() and _held() wake
+        self._tick = [0]            # counts terminal output/state wake-ups, so a waiter can tell one happened between look and wait
         self._kept = None           # the list of terminals, once it has been read
         self._unsaved = None        # the time of the oldest output not yet written to disk
         self._logged = {}           # terminal -> [seq of the last piece in its file, characters in the file]
@@ -452,7 +483,7 @@ class Relay:
                 _write(file + ".tmp", _lines(output))
                 _replace(file + ".tmp", file)
                 self._logged[key] = [last, sum(len(c["data"]) for c in output)]
-        _write(self.path + ".tmp", json.dumps({"threads": {key: {k: v for k, v in term.items() if k != "output"} for key, term in state["threads"].items()}}, ensure_ascii=False))
+        _write(self.path + ".tmp", json.dumps({"threads": {key: {k: v for k, v in term.items() if k not in ("output", "_asks_cache")} for key, term in state["threads"].items()}}, ensure_ascii=False))
         _replace(self.path + ".tmp", self.path)
         for name in os.listdir(folder):
             if name.endswith(".jsonl") and name[:-6] not in state["threads"]:
@@ -567,7 +598,7 @@ class Relay:
         return lines
 
     def _public(self, term):
-        shown = {k: v for k, v in term.items() if k not in ("output", "instance", "size", "out_at", "touched", "calm_until", "modes", "modes_rest", "asking")}
+        shown = {k: v for k, v in term.items() if k not in ("output", "instance", "size", "out_at", "touched", "calm_until", "modes", "modes_rest", "asking", "_asks_cache")}
         # Until the owner names a terminal, it carries the name of the conversation it has open.
         if not term.get("renamed"):
             shown["title"] = next((s["title"] for s in self._sessions if s["id"] == term.get("session")), term["title"])
@@ -599,7 +630,7 @@ class Relay:
             if deadline <= time.monotonic():
                 result.pop("tick", None)
                 return result
-            mark = json.dumps([result["terminal"], result["device"]["online"], result["device"]["enabled"]], sort_keys=True)
+            mark = (result["terminal"], result["device"]["online"], result["device"]["enabled"])
             first = mark if first is None else first
             remaining = deadline - time.monotonic()
             tick = result.pop("tick")
@@ -608,7 +639,7 @@ class Relay:
             self._wait(tick, remaining)
 
     def _wait(self, seen, seconds):
-        """Sleeps until the next wake-up, unless one already happened after the caller looked."""
+        """Sleeps until the next terminal output/state wake-up, unless one already happened after the caller looked."""
         with self._changed:
             if self._tick[0] == seen:
                 self._changed.wait(min(seconds, 5))
@@ -616,6 +647,9 @@ class Relay:
     def _wake(self):
         self._tick[0] += 1
         self._changed.notify_all()
+
+    def _wake_ops(self):
+        self._ops_changed.notify_all()
 
     def stream(self, terminal, after=0, seconds=55, beat=15):
         """Yields a terminal's output as it arrives, for about `seconds`; the reader then asks again from where it is.
@@ -626,7 +660,7 @@ class Relay:
         while True:
             result = self._overview(terminal, after, time.time())
             tick = result.pop("tick")
-            mark = json.dumps([result["terminal"], result["device"]["online"], result["device"]["enabled"]], sort_keys=True)
+            mark = (result["terminal"], result["device"]["online"], result["device"]["enabled"])
             now = time.monotonic()
             if result["chunks"] or result["reset"] or mark != sent or now - last >= beat:
                 sent, last, after = mark, now, result["after"]
@@ -743,13 +777,16 @@ class Relay:
                 if payload.get("form", "") not in ("", "chat") or "text" in payload and not chat:
                     raise RemoteError("终端选项无效")
                 if chat:
-                    if tool not in CHAT_TOOLS or "chat" not in self._device.get("features", []):
+                    features = self._device.get("features", [])
+                    if tool not in CHAT_TOOLS or "chat" not in features or CHAT_FEATURES.get(tool, "chat") not in features:
                         raise RemoteError("电脑端版本不支持这种对话，请更新电脑端")
                     if payload.get("history") or payload.get("fork"):
                         raise RemoteError("对话选项无效")
                     if "text" in payload and _words(payload["text"]) is None:
                         raise RemoteError("内容为空、超过 8000 字或含有控制字符")
                 session = payload.get("session", "")
+                if tool == "agy" and (payload.get("history") or (payload.get("takeover") and not session)):
+                    raise RemoteError("请在项目中选择具体的 Antigravity 对话，或新建终端")
                 if payload.get("history") and not session and not previous:
                     raise RemoteError("请在项目中选择具体的历史对话；新建终端不会打开 resume 选择器")
                 saved = None
@@ -798,6 +835,7 @@ class Relay:
                     if not isinstance(title, str) or not title.strip() or len(title) > 60 or any(ord(c) < 32 for c in title):
                         raise RemoteError("名称需为 1 至 60 字")
                     term.update(title=title.strip(), renamed=True)
+                    self._wake()
                     self._save(state)
                     return {"id": op_id, "terminal": terminal, "state": "done", "error": ""}
                 if term["state"] != "running":
@@ -845,8 +883,9 @@ class Relay:
             if asked is not None:
                 op["asked"] = asked         # what the viewer sent, to know the same request again
             self._pending[op_id] = self._pending.queued[op_id] = op
-            self._wake()
+            self._wake_ops()
             if action == "start":
+                self._wake()
                 self._save(state)
             return {k: op[k] for k in ("id", "terminal", "state", "error")}
 
@@ -901,17 +940,17 @@ class Relay:
             return self._held(question, now, wait)
 
     def _held(self, question, now, wait):
-        """Passes a question on to the computer and waits for its answer. Called with self._changed held."""
+        """Passes a question on to the computer and waits for its answer. Called with self._lock held."""
         op_id = question["id"]
         op = {"id": op_id, "terminal": "", "state": "queued", "error": "", "at": now, "payload": question}
         self._pending[op_id] = self._pending.queued[op_id] = op
-        self._wake()
+        self._wake_ops()
         deadline = time.monotonic() + wait
         while op["state"] == "queued":
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            self._changed.wait(min(remaining, 5))
+            self._ops_changed.wait(min(remaining, 5))
         self._pending.queued.pop(op_id, None)
         self._pending.pop(op_id, None)           # asked once, answered once: nothing of the answer stays here
         if op["state"] == "queued":
@@ -1076,7 +1115,8 @@ class Relay:
 
     def work(self, payload, now=None, wait=FILE_SECONDS):
         """The owner's work on the computer: its numbers by day ("stats"), the questions set to be asked at a time
-        ("schedules", "schedule_set", "schedule_remove"), and a conversation handed over to another ("handoff").
+        ("schedules", "schedule_set", "schedule_remove"), a conversation handed over to another ("handoff"), and what such
+        a hand-over says ("brief"), to be read first or to begin a new conversation with.
         The computer keeps and does all of it; the relay checks the question, passes it on and keeps nothing."""
         now = time.time() if now is None else now
         if not isinstance(payload, dict):
@@ -1098,6 +1138,12 @@ class Relay:
             # (passing on when a conversation stops needs its tool's own word that it has: a computer says whether it has that)
             if action.startswith("chain") and "chains" not in self._device.get("features", []):
                 raise RemoteError("这台电脑的电脑端不支持接力")
+            if action == "brief" and "brief" not in self._device.get("features", []):
+                raise RemoteError("这台电脑的电脑端不支持交给新对话，请更新电脑端")
+            if action.startswith("team") and "teams" not in self._device.get("features", []):
+                raise RemoteError("这台电脑的电脑端不支持协作任务，请更新电脑端")
+            if action in ("team_say", "team_pick", "team_swap") and "teams-v2" not in self._device.get("features", []):
+                raise RemoteError("这台电脑的电脑端版本较旧，不支持此协作操作，请更新电脑端")
             listed = {s["id"]: s for s in self._sessions}
             # (a conversation in one of the phone's own terminals is open too: the computer types into that terminal)
             typed = {t.get("session") for t in self._state()["threads"].values() if t["state"] == "running" and t.get("session")}
@@ -1124,6 +1170,14 @@ class Relay:
                 # (the tool is the one the computer listed the conversation with, whatever the phone says)
                 question["item"] = {"id": item["id"], "session": of["id"], "tool": of["tool"], "text": text, "kind": kind, "on": item.get("on") is not False,
                                     "at": int(item["at"]) if kind == "once" else 0, "minutes": item["minutes"] if kind == "every" else 0, "time": item["time"] if kind == "daily" else ""}
+                # a daily one on some days of the week only: 1 Monday to 7 Sunday (a computer without the days asks every day)
+                days = item.get("days", [])
+                if not isinstance(days, list) or len(days) > 7 or any(type(day) is not int or not 1 <= day <= 7 for day in days) or len(set(days)) != len(days):
+                    raise RemoteError("星期无效")
+                if days and kind == "daily":
+                    if "schedule-days" not in self._device.get("features", []):
+                        raise RemoteError("这台电脑的电脑端不支持按星期提问，请更新电脑端")
+                    question["item"]["days"] = sorted(days)
             elif action == "schedule_remove":
                 if not isinstance(payload.get("schedule"), str) or not _id.fullmatch(payload["schedule"]):
                     raise RemoteError("定时提问无效")
@@ -1143,6 +1197,85 @@ class Relay:
                 if type(rounds) is not int or not 1 <= rounds <= 10:
                     raise RemoteError("次数需在 1 到 10 之间")
                 question["item"] = {"id": item["id"], "from": first["id"], "from_tool": first["tool"], "to": then["id"], "to_tool": then["tool"], "text": text, "rounds": rounds}
+            elif action == "team_start":
+                # several AIs at one piece of work (agent-windows/Teams.cs): each member a conversation the computer runs
+                item = payload.get("item")
+                if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not _id.fullmatch(item["id"]):
+                    raise RemoteError("协作任务无效")
+                mode, goal, tools, rounds, folder = item.get("mode"), item.get("goal"), item.get("tools"), item.get("rounds", 3), item.get("dir")
+                if mode not in ("review", "lead", "compare"):
+                    raise RemoteError("协作方式无效")
+                if not isinstance(folder, str) or folder not in self._device["workspaces"]:
+                    raise RemoteError("电脑没有报告这个项目")
+                if not isinstance(goal, str) or not 0 < len(goal.strip()) <= 4000 or "\0" in goal:
+                    raise RemoteError("目标需为 1 至 4000 字")
+                features = self._device.get("features", [])
+                runs = [t for t in CHAT_TOOLS if t in self._device["tools"] and "chat" in features and CHAT_FEATURES.get(t, "chat") in features]
+                if not isinstance(tools, list) or any(t not in runs for t in tools):
+                    raise RemoteError("这台电脑不能让这个工具参与协作")
+                if mode == "review" and len(tools) != 2:
+                    raise RemoteError("写审需要一个写的 AI 和一个审查的 AI")
+                if mode == "lead" and (not 2 <= len(tools) <= 4 or len(set(tools)) != len(tools)):
+                    raise RemoteError("领队需要一个领队和 1 至 3 个不同的成员")
+                if mode == "compare" and (not 2 <= len(tools) <= 3 or len(set(tools)) != len(tools)):
+                    raise RemoteError("并行比稿需要 2 至 3 个不同的 AI")
+                if type(rounds) is not int or not 1 <= rounds <= 10:
+                    raise RemoteError("轮数需在 1 到 10 之间")
+                rules = item.get("rules", "")
+                if not isinstance(rules, str) or len(rules.strip()) > 1000 or "\0" in rules:
+                    raise RemoteError("分工偏好不能超过 1000 字")
+                discuss = item.get("discuss", False)
+                if not isinstance(discuss, bool):
+                    raise RemoteError("讨论选项无效")
+                if (mode == "compare" or discuss) and "teams-v2" not in features:
+                    raise RemoteError("这台电脑的电脑端版本较旧，不支持先议后写或并行比稿，请更新电脑端")
+                question["item"] = {"id": item["id"], "mode": mode, "dir": folder, "goal": goal.strip(), "tools": tools, "rounds": rounds}
+                if discuss and mode in ("review", "lead"):
+                    question["item"]["discuss"] = True
+                if rules.strip():
+                    question["item"]["rules"] = rules.strip()
+            elif action in ("team_stop", "team_resume", "team_remove"):
+                if not isinstance(payload.get("team"), str) or not _id.fullmatch(payload["team"]):
+                    raise RemoteError("协作任务无效")
+                question["team"] = payload["team"]
+            elif action == "team_say":
+                if not isinstance(payload.get("team"), str) or not _id.fullmatch(payload["team"]):
+                    raise RemoteError("协作任务无效")
+                text, target = payload.get("text"), payload.get("target", "")
+                if not isinstance(text, str) or not 0 < len(text.strip()) <= 4000 or "\0" in text:
+                    raise RemoteError("消息需为 1 至 4000 字")
+                if not isinstance(target, str) or len(target.strip()) > 32 or "\0" in target:
+                    raise RemoteError("发送对象无效")
+                question["team"] = payload["team"]
+                question["text"] = text.strip()
+                if target.strip():
+                    question["target"] = target.strip()
+            elif action == "team_pick":
+                if not isinstance(payload.get("team"), str) or not _id.fullmatch(payload["team"]):
+                    raise RemoteError("协作任务无效")
+                tool = payload.get("tool", "")
+                if not isinstance(tool, str) or (tool != "" and tool not in CHAT_TOOLS):
+                    raise RemoteError("候选方案无效")
+                question["team"] = payload["team"]
+                question["tool"] = tool
+            elif action == "team_swap":
+                if not isinstance(payload.get("team"), str) or not _id.fullmatch(payload["team"]):
+                    raise RemoteError("协作任务无效")
+                role, tool, note = payload.get("role", ""), payload.get("tool"), payload.get("note", "")
+                if not isinstance(role, str) or len(role.strip()) > 32 or "\0" in role:
+                    raise RemoteError("角色无效")
+                features = self._device.get("features", [])
+                runs = [t for t in CHAT_TOOLS if t in self._device["tools"] and "chat" in features and CHAT_FEATURES.get(t, "chat") in features]
+                if not isinstance(tool, str) or tool not in runs:
+                    raise RemoteError("这台电脑不能让这个工具参与协作")
+                if not isinstance(note, str) or len(note.strip()) > 1000 or "\0" in note:
+                    raise RemoteError("补充说明不能超过 1000 字")
+                question["team"] = payload["team"]
+                if role.strip():
+                    question["role"] = role.strip()
+                question["tool"] = tool
+                if note.strip():
+                    question["note"] = note.strip()
             elif action == "chain_remove":
                 if not isinstance(payload.get("chain"), str) or not _id.fullmatch(payload["chain"]):
                     raise RemoteError("接力无效")
@@ -1160,6 +1293,13 @@ class Relay:
                 question.update({"from": given["id"], "from_tool": given["tool"], "to": taking["id"], "to_tool": taking["tool"], "note": note})
                 if wait == FILE_SECONDS:
                     wait = WAKE_SECONDS         # (the one that takes over may have to be woken first)
+            elif action == "brief":
+                given, note = listed.get(payload.get("from")), payload.get("note", "")
+                if not given:
+                    raise RemoteError("电脑上没有找到这个对话，请刷新后重试")
+                if not isinstance(note, str) or len(note) > 1000:
+                    raise RemoteError("补充说明需在 1000 字以内")
+                question.update({"from": given["id"], "from_tool": given["tool"], "note": note})
             return self._held(question, now, wait)
 
     def pull(self, payload, now=None):
@@ -1169,7 +1309,7 @@ class Relay:
             raise RemoteError("电脑实例编号无效")
         seconds = payload.get("wait", 12)
         deadline = time.monotonic() + (min(max(seconds, 0), 12) if type(seconds) in (int, float) else 12)
-        with self._changed:
+        with self._ops_changed:
             while True:
                 fresh = [op for op in self._pending.queued.values() if not op.get("sent")] if payload["instance"] == self._device["instance"] else []
                 if fresh:
@@ -1179,7 +1319,7 @@ class Relay:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return {"operations": []}
-                self._changed.wait(min(remaining, 5))
+                self._ops_changed.wait(min(remaining, 5))
 
     def agent(self, payload, now=None):
         now = time.time() if now is None else now
@@ -1192,7 +1332,9 @@ class Relay:
         with self._lock:
             self._expire(now)
             state = self._state()
-            dirty = wrote = False
+            was_online = now - self._device["seen"] < 15
+            was_enabled = self._device["enabled"]
+            dirty = wrote = answered = False
             if isinstance(payload.get("sessions"), list):
                 self._sessions[:] = [
                     {"id": s["id"], "tool": s["tool"], **_placed(s), "title": s["title"].strip()[:80], "updated": s["updated"],
@@ -1208,14 +1350,19 @@ class Relay:
                      "can_takeover": s.get("can_takeover") is True, "ownership_known": s.get("ownership_known") is True,
                      "takeover_reason": str(s.get("takeover_reason") or "")[:200]}
                     for s in payload["sessions"][:120]
-                    if isinstance(s, dict) and isinstance(s.get("id"), str) and session_id_ok(s.get("tool"), s["id"]) and s.get("tool") in ("claude", "codex", "opencode", "qoder", "cline", "pi")
+                    if isinstance(s, dict) and isinstance(s.get("id"), str) and session_id_ok(s.get("tool"), s["id"]) and s.get("tool") in ("claude", "codex", "agy", "opencode", "qoder", "cline", "pi")
                     and _placed(s) and isinstance(s.get("title"), str) and s["title"].strip() and type(s.get("updated")) is int]
             self._device.update(seen=now, instance=instance, enabled=info.get("enabled") is True,
                            version=str(info.get("version") or "")[:20], newer=str(info.get("newer") or "")[:20], shell=_shell(info.get("shell")),
-                           features=[x for x in info.get("features", []) if x in ("codex-fork", "codex-takeover", "terminal-exit", "files", "file-upload", "update", "peek", "settings", "reach", "marks", "delete", "projects", "end", "outbox", "work", "chains", "codex-desktop-control", "chat") + tuple(tool + "-desktop-open" for tool in DESKTOP_TOOLS)],
-                           tools=[x for x in info.get("tools", []) if x in ("claude", "codex", "opencode", "qoder", "cline", "pi", "shell")],
+                           features=[x for x in info.get("features", []) if x in ("codex-fork", "codex-takeover", "terminal-exit", "files", "file-upload", "update", "peek", "settings", "reach", "marks", "delete", "projects", "end", "outbox", "work", "chains", "brief", "schedule-days", "codex-desktop-control", "chat", "chat-agy", "teams", "teams-v2") + tuple(tool + "-desktop-open" for tool in DESKTOP_TOOLS)],
+                           tools=[x for x in info.get("tools", []) if isinstance(x, str) and x in LABELS],
+                           agy_external=[x for x in info["agy_external"][:16] if type(x) is int and 0 < x < 8640000000000000]
+                           if info.get("enabled") is True and isinstance(info.get("agy_external"), list) else [],
                            workspaces=[x for x in info.get("workspaces", []) if isinstance(x, str) and 0 < len(x) <= 60],
-                           projects=_folders(info.get("projects"), 60), candidates=_folders(info.get("candidates"), 40))
+                           projects=_folders(info.get("projects"), 60), candidates=_folders(info.get("candidates"), 40),
+                           quotas=_quotas(info.get("quotas")) if info.get("enabled") is True else [])
+            if not was_online or was_enabled != self._device["enabled"]:
+                wrote = True
             for term in state["threads"].values():
                 if term.get("instance") != instance and term["state"] in ("starting", "running"):
                     term.update(state="closed", error="电脑后台已重启，请从历史对话恢复")
@@ -1229,7 +1376,7 @@ class Relay:
                 if op and op["state"] == "queued":
                     if op["payload"]["action"] in ANSWERED:
                         op["result"] = ack.get("result") if isinstance(ack.get("result"), dict) else {}
-                        wrote = True        # the request that waits for it looks again
+                        answered = True        # the request that waits for it looks again
                     op.update(state="error" if ack.get("error") else "done", error=str(ack.get("error", ""))[:300])
                     self._pending.queued.pop(op["id"], None)
                     term = state["threads"].get(op["terminal"])
@@ -1326,6 +1473,8 @@ class Relay:
                 self._unsaved = None
             if dirty or wrote:
                 self._wake()
+            if answered:
+                self._wake_ops()
             for op in self._pending.queued.values():
                 op["sent"] = True
             ops = [{**op["payload"], "terminal": op["terminal"], "at": op["at"]} for op in self._pending.queued.values()]
