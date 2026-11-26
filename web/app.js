@@ -13,7 +13,7 @@
   // The look belongs to the app, not to one computer: inside the app it is kept there, so every computer's pages
   // open in the same skin and text size. A browser keeps it per address, as it keeps everything else. So is the
   // kind of conversation its owner begins (begin.js): in an application, or in a terminal.
-  const LOOK = ['skin', 'text', 'readfont', 'readsize', 'readline', 'newkind'];
+  const LOOK = ['skin', 'text', 'readfont', 'readsize', 'readline', 'newtool'];
   const saved = (key, fallback) => {
     if (native && native.pref && LOOK.includes(key)) { const chosen = native.pref(key); if (chosen) return chosen; }
     try { return localStorage.getItem('rcli-' + key) || fallback; } catch (error) { return fallback; }
@@ -22,7 +22,7 @@
     if (native && native.setPref && LOOK.includes(key)) native.setPref(key, value);
     try { localStorage.setItem('rcli-' + key, value); } catch (error) { /* private window */ }
   };
-  let data = null, project = '', timer = 0, shown = 2, endedShown = 8, toastTimer = 0;
+  let data = null, project = '', timer = 0, shown = 16, endedShown = 8, toastTimer = 0;
   let relayVersion = '';
   // The tabs at the foot. The one last used is kept while the app is open (a terminal's page leads back to it);
   // ?tab=<name> opens one by a link. A project in detail belongs to 项目: `project` is set only there.
@@ -105,6 +105,7 @@
   paint();
   if (window.RemoteCliOnSystemTheme) window.RemoteCliOnSystemTheme(paint);
   $('back').innerHTML = ICON.back; $('settings').innerHTML = ICON.gear; $('new-task').innerHTML = svg('<path d="M12 5v14M5 12h14"/>', 24);
+  $('organize').innerHTML = svg('<path d="M12 3.5l1.9 5.6 5.6 1.9-5.6 1.9L12 18.5l-1.9-5.6-5.6-1.9 5.6-1.9z"/>', 16) + '<span>整理</span>';
   document.querySelectorAll('#tabs button').forEach(button => {
     button.querySelector('.glyph').innerHTML = button.dataset.tab === 'projects' ? svg(ICON.folder.replace(/^<svg[^>]*>|<\/svg>$/g, ''), 24) : ICON[button.dataset.tab];
     button.addEventListener('click', () => go(button.dataset.tab));
@@ -131,28 +132,61 @@
   }
 
   // ---- sheets from the bottom
-  // `window`: it fills the screen and is left by its own way back (a conversation), instead of rising from the bottom.
+  // `fullWindow`: it fills the screen and is left by its own way back (a conversation), instead of rising from the bottom.
   // A sheet is told that it was closed a moment after it is closed. One that is opened in that moment waits for it:
   // else it would take the word meant for the one before, and answer "nothing chosen" while it is still on the screen.
-  let sheetGone = Promise.resolve();
-  function openSheet(build, window) {
+  let sheetGone = Promise.resolve(), backFromReader = null;
+  window.addEventListener('popstate', event => {
+    if (!backFromReader) return;
+    event.stopImmediatePropagation();
+    backFromReader();
+  });
+  function openSheet(build, fullWindow) {
     return sheetGone.then(() => new Promise(done => {
       const form = $('sheet-form'), sheet = $('sheet');
+      const nestedReader = fullWindow && window.RemoteSheet.current;
       form.textContent = '';
-      sheet.classList.toggle('window', !!window);
+      sheet.classList.toggle('window', !!fullWindow);
       let answer = null;
       build(form, value => { answer = value; sheet.close(); });
-      if (!window) form.append(el('button', { type: 'button', className: 'cancel', textContent: '取消', onclick: () => sheet.close() }));
-      sheetGone = new Promise(gone => { sheet.onclose = () => { gone(); done(answer); }; });
+      if (!fullWindow) form.append(el('button', { type: 'button', className: 'cancel', textContent: '取消', onclick: () => sheet.close() }));
+      sheetGone = new Promise(gone => {
+        let finished = false, backTimer = 0;
+        const finish = () => {
+          if (finished) return;
+          finished = true;
+          clearTimeout(backTimer);
+          backFromReader = null;
+          gone();
+          done(answer);
+        };
+        if (nestedReader) {
+          history.pushState({ ...history.state, conversationReader: true }, '');
+          // The full-screen reader is on top of a collaboration sheet whose Back must wait.
+          backFromReader = () => { if (sheet.open) sheet.close(); else finish(); };
+        }
+        sheet.onclose = () => {
+          if (nestedReader && history.state?.conversationReader) {
+            backTimer = setTimeout(finish, 400);
+            history.back();
+          } else finish();
+        };
+      });
       sheet.onclick = event => { if (event.target === sheet) sheet.close(); };       // a tap beside the sheet
       sheet.showModal();
     }));
+  }
+  function closeReader() {
+    const reader = $('sheet');
+    if (!reader || !reader.open) return false;
+    reader.close();
+    return true;
   }
   // A question with a few answers, optionally with fields to fill in; resolves with the answer, or null when dismissed.
   // It rises as the sheet of ui/sheet.js: a single answer that ends or saves something is its one button at the foot;
   // several are rows with a mark for what each does, those that end or delete something apart at the end.
   const MARK = { pin: 'pin', hide: 'hide', finish: 'stop', end: 'stop', handoff: 'hand', add: 'folder', enter: 'enter', delete: 'trash', remove: 'trash', rename: 'pen',
-    resume: 'term', chat: 'chat', 'chat-close': 'chat', close: 'term', copy: 'copy' };
+    resume: 'term', chat: 'chat', 'chat-close': 'chat', close: 'term', copy: 'copy', organize: 'spark', follow_up: 'clock', select: 'tick' };
   function ask(title, text, choices, fields) {
     const kit = window.RemoteSheet.ui;
     return window.RemoteSheet.open({ title, build(p) {
@@ -222,9 +256,12 @@
   // `ways`): its application's own channel, its tool's hooks, its tool's own way to one that sits idle. '' where
   // there is none, and then the computer's words why. (A relay of an earlier version passes neither on: the one
   // way it names for the conversation is taken then.)
-  const APP = 'codex-desktop';
+  const NATIVE_APPS = ['codex-desktop', 'agy-desktop'];
+  const isNativeApp = way => NATIVE_APPS.includes(way);
+  const needsTurnForStop = way => way === 'codex-desktop';
   const wayOf = (s, thing) => !s || !s.live ? '' : s.ways ? s.ways[thing] || ''
-    : thing === 'end' ? (s.can_takeover === true ? 'process' : '') : !can(s, thing) ? '' : thing !== 'answer' && s.transport === APP ? APP : 'hook';
+    : thing === 'end' ? (s.can_takeover === true ? 'process' : '') : !can(s, thing) ? ''
+    : isNativeApp(s.transport) && (thing !== 'answer' || s.transport === 'agy-desktop') ? s.transport : 'hook';
   const whyNot = (s, thing, usual) => (s && s.why && s.why[thing]) || usual;
   const running = t => t.state === 'running' || t.state === 'starting';
   const usable = () => data && data.device.online && data.device.enabled;
@@ -233,7 +270,7 @@
   // Reading a transcript alone does not imply that the original application accepts remote input.
   const controlMode = session => {
     if (!session || !session.live) return 'saved';
-    return session.transport === APP || can(session, 'say') || can(session, 'answer') || can(session, 'stop') ? 'shared' : 'read';
+    return isNativeApp(session.transport) || can(session, 'say') || can(session, 'answer') || can(session, 'stop') ? 'shared' : 'read';
   };
   const controlCopy = {
     shared: '连接电脑上的原对话 · 返回不结束任务',
@@ -252,7 +289,7 @@
       if (!Array.isArray(raw)) return [];
       const now = Date.now();
       const restored = raw.filter(p => p && p.payload && /^[a-f0-9]{16,32}$/.test(p.payload.id) && p.payload.session === session.id &&
-        p.payload.action === 'say' && p.payload.transport === APP && p.payload.text === p.text &&
+        p.payload.action === 'say' && isNativeApp(p.payload.transport) && p.payload.text === p.text &&
         typeof p.text === 'string' && p.text.length > 0 && p.text.length <= 8000 && Number.isFinite(p.before) && p.before >= 0 &&
         Number.isFinite(p.createdAt) && now >= p.createdAt && now - p.createdAt < 24 * 60 * 60 * 1000).map(p => {
           // A tab may have disappeared between dispatch and its response. Treat such a row as
@@ -266,7 +303,7 @@
   }
   function saveDesktopPending(key, pending) {
     try {
-      const nativePending = pending.filter(p => p.payload.transport === APP);
+      const nativePending = pending.filter(p => isNativeApp(p.payload.transport));
       if (nativePending.length) sessionStorage.setItem(key, JSON.stringify(nativePending));
       else sessionStorage.removeItem(key);
     } catch (error) { /* private browsing or a full storage quota */ }
@@ -299,19 +336,41 @@
   }
   // ?take=<conversation> comes from the app's workbench: the question about taking over a conversation that runs on
   // the computer is asked at once, and the terminal that follows leads back to the workbench.
-  let take = new URLSearchParams(location.search).get('take') || '', anew = new URLSearchParams(location.search).get('new') === '1', fromBench = !!take || anew;
+  const startParams = new URLSearchParams(location.search);
+  let take = startParams.get('take') || '', anew = startParams.get('new') === '1', fromBench = !!take || anew || startParams.get('from') === 'bench';
+  let readFromBench = startParams.get('read') || '';
+  let organizeFromBench = startParams.get('organize') === '1';
+  let wantedTeam = startParams.get('do') === 'team' && /^[a-f0-9]{16,32}$/.test(startParams.get('item') || '') ? startParams.get('item') : '';
   // A terminal's page; for one that runs a conversation through its tool's structured mode, the conversation's (chat/).
-  function open(terminal, form) { location.href = (form === 'chat' ? 'chat/' : 'terminal/') + '?id=' + encodeURIComponent(terminal) + (fromBench ? '&from=bench' : ''); }
+  function open(terminal, form, extra) {
+    let url = (form === 'chat' ? 'chat/' : 'terminal/') + '?id=' + encodeURIComponent(terminal) + (fromBench ? '&from=bench' : '');
+    if (extra && extra.team) {
+      url += '&team=' + encodeURIComponent(extra.team);
+      if (project) url += '&returnProject=' + encodeURIComponent(project);
+      else if (tab && tab !== 'together') url += '&returnTab=' + encodeURIComponent(tab);
+    } else if (!fromBench) url += '&returnList=' + (extra?.returnList || saveListPosition());
+    location.href = url;
+  }
   // What the app's own lists opened this page for (a new conversation, one conversation's window) leads back to
   // them when it is left without going on to a terminal's page.
   const leave = left => { if (!left && fromBench && native && native.home) native.home(); };
   // Resolves with whether the page is left for the terminal that was started.
-  async function start(tool, dir, session, takeover, fork) {
+  function applyParams(payload, tool, params) {
+    const d = window.RemoteTeamDefaults;
+    const saved = d ? d.savedParams(tool, data && data.device && data.device.max_mode) : {};
+    const chosen = Object.assign({}, saved, params || {});
+    if (chosen.model) payload.model = chosen.model;
+    if (chosen.effort) payload.effort = chosen.effort;
+    if (chosen.mode && tool !== 'agy' && pageHost.has('chat-params')) payload.mode = chosen.mode;
+    return payload;
+  }
+  async function start(tool, dir, session, takeover, fork, extra, params) {
     const payload = { action: 'start', tool, dir, history: false };
     if (session) Object.assign(payload, { session, takeover: !!takeover });
     if (fork) payload.fork = true;
+    if (!session) applyParams(payload, tool, params);
     const result = await run(payload, '正在电脑上启动 ' + TOOLS[tool] + '…');
-    if (result) open(result.terminal);
+    if (result) open(result.terminal, 'terminal', extra);
     return !!result;
   }
   const agyShellTitle = dir => 'Antigravity CLI' + (dir ? ' · ' + dir : '');
@@ -340,17 +399,50 @@
   // the tools the computer runs as a conversation, and what it says of itself where it does (Antigravity CLI: by ACP)
   const CHAT_TOOLS = { claude: 'chat', codex: 'chat', agy: 'chat-agy' };
   const chatOk = tool => !!data && (data.device.features || []).includes('chat') && !!CHAT_TOOLS[tool] && (data.device.features || []).includes(CHAT_TOOLS[tool]) && (data.device.tools || []).includes(tool);
-  async function chat(tool, dir, session, takeover) {
+  async function chat(tool, dir, session, takeover, extra, params) {
     const payload = { action: 'start', tool, dir, history: false, form: 'chat' };
     if (session) Object.assign(payload, { session, takeover: !!takeover });
+    if (!session) applyParams(payload, tool, params);
     const result = await run(payload, '正在电脑上启动 ' + TOOLS[tool] + '…');
-    if (result) open(result.terminal, 'chat');
+    if (result) open(result.terminal, 'chat', extra);
     return !!result;
   }
-  // A saved conversation is gone on with the way its owner begins conversations (begin.js): as a conversation, or in
-  // a terminal for one who chose terminals. The other way is behind a held press.
-  const asChat = s => chatOk(s.tool) && saved('newkind', '') !== 'term';
-  const goOn = s => asChat(s) ? chat(s.tool, s.dir, s.id) : start(s.tool, s.dir, s.id, false);
+  // A saved conversation is gone on with as a conversation where the computer runs its tool so (it can be shown on the
+  // tool's own screen from there), else in a terminal. The other way is behind a held press.
+  const asChat = s => chatOk(s.tool);
+  const goOn = (s, extra) => asChat(s) ? chat(s.tool, s.dir, s.id, false, extra) : start(s.tool, s.dir, s.id, false, false, extra);
+
+  const speakerOf = s => s && (/Antigravity 桌面版/.test(s.origin || s.kind || '') || s.transport === 'agy-desktop') ? 'Antigravity' : TOOLS[s.tool];
+  async function readHistory(session) {
+    if (!usable()) { toast('电脑离线，暂时无法打开'); return false; }
+    if (!pageHost.has('peek')) return goOn(session);
+    const key = fromBench ? '' : saveListPosition();
+    const ui = window.RemoteSheet.ui;
+    const title = session.organize?.title || session.title || speakerOf(session);
+    const sheet = window.RemoteSheet.open({ full: true, title, build(p) {
+      const record = el('div', { className: 'said saved-reader', ariaLabel: '对话记录' });
+      const load = async () => {
+        record.replaceChildren(ui.note('正在读取对话…'));
+        try {
+          const reply = await api('api/conversation', { id: newId(), session: session.id });
+          const content = el('div');
+          if (reply.more) content.append(ui.note('更早的内容在电脑上'));
+          if (!reply.messages?.length) content.append(ui.empty('这段对话暂无可读内容'));
+          await writeSaid(content, reply.messages || [], speakerOf(session), new Set(), new Map());
+          record.replaceChildren(content);
+        } catch (error) {
+          record.replaceChildren(ui.note(error.message, 'bad'), ui.row({ label: '重试读取', act: load }));
+        }
+      };
+      p.body.append(record);
+      p.foot.append(...ui.go('继续对话', () => p.sheet.close(true)).nodes);
+      load();
+    } });
+    const next = await sheet.result;
+    if (key) restoreListPosition(key, false);
+    if (next && key) return goOn(session, { returnList: key });
+    return next ? goOn(session) : false;
+  }
   // A message for a running terminal without going into it: what the box of its page would send. The relay puts it
   // the way the program takes pasted text and adds Enter (the operation "say").
   async function say(t) {
@@ -366,11 +458,11 @@
   // The same for a conversation that is open on the computer: this is shared collaboration. The message is delivered
   // to the program that owns the conversation and the window stays there; it is never presented as a hand-off.
   async function tell(s) {
-    if (s.transport === APP) return takeOver(s);
+    if (isNativeApp(s.transport)) return takeOver(s);
     if (!usable()) return toast('电脑离线，暂时不能发送');
     const text = await openSheet((form, finish) => {
       const box = el('textarea', { rows: 3, maxLength: 8000, placeholder: '发送消息', autocapitalize: 'off', spellcheck: false, ariaLabel: '消息' });
-      form.append(el('h3', { textContent: s.title }), el('p', { textContent: s.last || TOOLS[s.tool] + ' · ' + (s.dir || base(s.folder)) }),
+      form.append(el('h3', { textContent: s.title }), el('p', { textContent: s.last || speakerOf(s) + ' · ' + (s.dir || base(s.folder)) }),
         el('div', { className: 'control-mode shared', role: 'status', textContent: '共享协作：消息会交给电脑上的原对话，电脑窗口继续保持打开' }), box,
         el('button', { type: 'button', className: 'choice solid', onclick: () => { if (box.value.trim()) finish(box.value); else box.focus(); } }, el('span', { textContent: '发送' })));
       setTimeout(() => box.focus(), 80);
@@ -382,31 +474,56 @@
     refresh();
   }
   const answering = new Set();
-  async function answerAsk(s, allow, scope = 'once') {
-    const id = s.ask.id;
-    if (answering.has(id)) return;
+  async function answerAsk(s, allow, scope = 'once', choice = '') {
+    const id = s.ask && s.ask.id;
+    if (!id || answering.has(id)) return false;
     answering.add(id);
     document.querySelectorAll('[data-approval="' + id + '"] button').forEach(b => b.disabled = true);
-    try { await api('api/conversation', { id: newId(), session: s.id, action: 'answer', ask: id, allow, scope }); toast(allow ? '已向电脑提交授权' : '已向电脑提交拒绝'); }
-    catch (error) { toast(error.message); }
+    let ok = false;
+    try {
+      const payload = { id: newId(), session: s.id, action: 'answer', ask: id, allow, scope };
+      if (choice) payload.choice = choice;
+      const answerWay = wayOf(s, 'answer') || (isNativeApp(s.transport) ? s.transport : '');
+      if (isNativeApp(answerWay)) payload.transport = answerWay;
+      await api('api/conversation', payload);
+      toast(choice ? '已提交选择' : allow ? '已向电脑提交授权' : '已向电脑提交拒绝');
+      ok = true;
+    } catch (error) { toast(error.message); }
     finally { answering.delete(id); }
     await refresh();
     document.querySelectorAll('[data-approval="' + id + '"] button').forEach(b => b.disabled = false);
+    return ok;
   }
   function approvalActions(s, after = () => {}) {
-    const answers = el('div', { className: 'answers' });
+    const options = s.ask.options && s.ask.options.length ? s.ask.options : [{ id: 'once', label: '允许一次', detail: '只允许这一次操作' }];
+    const hasChoice = options.some(o => /^choice:\d+$/.test(o.id || ''));
+    const hasDeny = options.some(o => o.id === 'deny');
+    const answers = el('div', { className: 'answers' + (hasChoice ? ' choices' : '') });
     answers.dataset.approval = s.ask.id;
-    if (can(s, 'answer')) {
-      const options = s.ask.options && s.ask.options.length ? s.ask.options : [{ id: 'once', label: '允许一次', detail: '只允许这一次操作' }];
-      options.forEach(o => answers.append(el('button', { type: 'button', className: o.id === 'once' ? 'yes' : 'see', textContent: o.label, title: o.detail, disabled: answering.has(s.ask.id), onclick: () => {
-        if (o.id === 'once') { answerAsk(s, true, o.id).then(after); return; }
-        if (answers.querySelector('.approval-rule')) return;
-        const rule = el('div', { className: 'approval-rule' }, el('p', { textContent: o.detail }),
-          el('button', { type: 'button', className: 'yes', textContent: '确认保存并允许', onclick: () => answerAsk(s, true, o.id).then(after) }),
-          el('button', { type: 'button', className: 'see', textContent: '取消', onclick: () => rule.remove() }));
-        answers.append(rule);
-      } })));
-      answers.append(el('button', { type: 'button', className: 'no', textContent: '拒绝', disabled: answering.has(s.ask.id), onclick: () => answerAsk(s, false).then(after) }));
+    if (can(s, 'answer') || !!wayOf(s, 'answer')) {
+      options.forEach(o => {
+        if (o.id === 'deny') {
+          answers.append(el('button', { type: 'button', className: 'no', textContent: o.label || '拒绝', title: o.detail || '', disabled: answering.has(s.ask.id), onclick: () => answerAsk(s, false, 'once').then(after) }));
+          return;
+        }
+        if (/^choice:\d+$/.test(o.id || '')) {
+          const detail = o.detail && o.detail !== o.label ? el('small', { textContent: o.detail }) : '';
+          answers.append(el('button', { type: 'button', className: 'yes choice-opt', title: o.detail || o.label || '', disabled: answering.has(s.ask.id), onclick: () => answerAsk(s, true, 'once', o.id).then(after) },
+            el('span', { textContent: o.label || o.id }), detail));
+          return;
+        }
+        answers.append(el('button', { type: 'button', className: o.id === 'once' ? 'yes' : 'see', textContent: o.label, title: o.detail || '', disabled: answering.has(s.ask.id), onclick: () => {
+          if (o.id === 'once') { answerAsk(s, true, o.id).then(after); return; }
+          if (answers.querySelector('.approval-rule')) return;
+          const rule = el('div', { className: 'approval-rule' }, el('p', { textContent: o.detail || '将在本机保存此允许规则' }),
+            el('button', { type: 'button', className: 'yes', textContent: '确认保存并允许', onclick: () => answerAsk(s, true, o.id).then(after) }),
+            el('button', { type: 'button', className: 'see', textContent: '取消', onclick: () => rule.remove() }));
+          answers.append(rule);
+        } }));
+      });
+      if (!hasDeny) {
+        answers.append(el('button', { type: 'button', className: 'no', textContent: hasChoice ? '取消' : '拒绝', disabled: answering.has(s.ask.id), onclick: () => answerAsk(s, false, 'once').then(after) }));
+      }
     } else answers.append(el('span', { className: 'there', textContent: '请在电脑或原终端中选择授权范围' }));
     return answers;
   }
@@ -440,20 +557,34 @@
     const script = el('script', { src: 'files/vendor/' + name, onload: done, onerror: failed });
     document.head.append(script);
   }));
+  let markdownReady = null;
+  function loadMarkdown() {
+    if (window.marked && window.DOMPurify) return Promise.resolve(true);
+    if (!markdownReady) {
+      markdownReady = Promise.all([need('marked.min.js'), need('purify.min.js')])
+        .then(() => !!(window.marked && window.DOMPurify), () => false);
+    }
+    return markdownReady;
+  }
+  function markdownNode(text, cache) {
+    const raw = String(text || '');
+    const rich = !!(window.marked && window.DOMPurify);
+    if (rich && cache && cache.has(raw)) return cache.get(raw).cloneNode(true);
+    if (!rich) return el('div', { className: 'plain', textContent: raw });
+    // nothing that could act or load: no links to follow, no pictures, no forms, no styles of its own
+    const html = DOMPurify.sanitize(marked.parse(raw, { gfm: true, breaks: true }),
+      { FORBID_TAGS: ['style', 'form', 'button', 'textarea', 'select', 'input', 'img', 'a', 'iframe', 'video', 'audio'], FORBID_ATTR: ['style', 'href', 'src'] });
+    const body = el('div', { className: 'md', html });
+    body.querySelectorAll('table').forEach(table => { const wrap = el('div', { className: 'wide' }); table.replaceWith(wrap); wrap.append(table); });
+    if (cache) {
+      cache.set(raw, body.cloneNode(true));
+      if (cache.size > 160) cache.delete(cache.keys().next().value);
+    }
+    return body;
+  }
   async function writeSaid(box, messages, toolName, phoneTexts, cache) {
-    let rich = false;
-    try { await Promise.all([need('marked.min.js'), need('purify.min.js')]); rich = !!(window.marked && window.DOMPurify); } catch (error) { /* plain text then */ }
-    const set = text => {
-      if (cache.has(text)) return cache.get(text).cloneNode(true);
-      if (!rich) return el('div', { className: 'plain', textContent: text });
-      // nothing that could act or load: no links to follow, no pictures, no forms, no styles of its own
-      const html = DOMPurify.sanitize(marked.parse(text, { gfm: true, breaks: true }),
-        { FORBID_TAGS: ['style', 'form', 'button', 'textarea', 'select', 'input', 'img', 'a', 'iframe', 'video', 'audio'], FORBID_ATTR: ['style', 'href', 'src'] });
-      const body = el('div', { className: 'md', html });
-      body.querySelectorAll('table').forEach(table => { const wrap = el('div', { className: 'wide' }); table.replaceWith(wrap); wrap.append(table); });
-      cache.set(text, body.cloneNode(true));
-      return body;
-    };
+    await loadMarkdown();
+    const set = text => markdownNode(text, cache);
     let run = null, last = '';
     const keyed = (node, value) => { node.readKey = JSON.stringify(value); return node; };
     messages.forEach(m => {
@@ -501,7 +632,7 @@
   // conversation stays in the program that has it and is used there as before; this works beside it. It follows what
   // is said there while it is open, what the conversation asks is answered here, and what is written here is handed to
   // it where it is. (Taking it into a terminal is another thing: see ways.)
-  async function takeOver(session) {
+  async function takeOver(session, extra) {
     if (!usable()) return false;
     const canPeek = (data.device.features || []).includes('peek');
     let watch = 0, readingView;
@@ -528,9 +659,9 @@
         stopping.textContent = stopAttempt ? '正在查询…' : '正在停止…';
         stopSays(stopAttempt ? '正在查询上次停止请求的结果…' : '正在请求停止回答…');
         try {
-          let current = now(), way = stopAttempt ? APP : wayOf(current, 'stop');
+          let current = now(), way = stopAttempt ? stopAttempt.transport : wayOf(current, 'stop');
           // A just-started turn may not yet be present in the overview. Refresh before deciding it cannot stop.
-          if (!stopAttempt && (!way || (way === APP && !current.turn))) {
+          if (!stopAttempt && (!way || (needsTurnForStop(way) && !current.turn))) {
             await refresh();
             current = now(); way = wayOf(current, 'stop');
           }
@@ -539,13 +670,16 @@
             stopSays(why);
             return;
           }
-          if (way === APP && !stopAttempt && !current.turn) {
+          if (needsTurnForStop(way) && !stopAttempt && !current.turn) {
             stopSays('尚未取得当前执行轮次，停止请求未发送。请稍后重试，或在电脑上停止');
             return;
           }
-          const query = !!stopAttempt;
-          if (way === APP && !stopAttempt) stopAttempt = { id: newId(), session: current.id, action: 'stop', turn: current.turn, transport: APP };
-          const result = await api('api/conversation', way === APP ? { ...stopAttempt, receipt: query } : { id: newId(), session: current.id, action: 'stop', transport: way });
+          const query = !!stopAttempt, nativeStop = isNativeApp(way);
+          if (nativeStop && !stopAttempt) {
+            stopAttempt = { id: newId(), session: current.id, action: 'stop', transport: way };
+            if (needsTurnForStop(way)) stopAttempt.turn = current.turn;
+          }
+          const result = await api('api/conversation', nativeStop ? { ...stopAttempt, receipt: query } : { id: newId(), session: current.id, action: 'stop', transport: way });
           if (result.status === 'confirmed') { stopSays(result.goal_pause_error ? '本次回答已停止，但目标未暂停，请在电脑上检查' : '已停止本次回答，可以继续对话'); stopAttempt = null; }
           else if (result.status === 'asked') stopSays('已请求停止，将在下一次工具操作前停下；当前输出可能仍会继续');
           else stopSays('停止结果尚未确认，请查询停止结果或检查电脑上的原对话');
@@ -631,7 +765,7 @@
       state.before(syncNote);
       state.after(stopNote);
       const stateKey = current => JSON.stringify([current.updated, current.status, current.last, current.turn]);
-      let stamp = '', seen = '', read = false, reading = false, sending = false, stands = null, standsAt = '', readError = '', quick = 0, asked = 0, changed = 0, sawBusy = 0;
+      let stamp = '', seen = '', read = false, reading = false, sending = false, stands = null, standsAt = '', liveAsk = null, liveAskAt = '', readError = '', quick = 0, asked = 0, changed = 0, sawBusy = 0, lastKind = '';
       const pendingScope = pendingKey(session);
       const pending = desktopPending.get(pendingScope) || loadDesktopPending(pendingScope, session);
       desktopPending.set(pendingScope, pending);
@@ -639,6 +773,20 @@
       const savePending = () => saveDesktopPending(pendingScope, pending);
       const same = (messages, text) => messages.filter(m => m.role === 'user' && String(m.text || '').trim() === text).length;
       let record = [];
+      function mergeCurrent(listed) {
+        const key = stateKey(listed), freshRead = standsAt === key, freshAsk = liveAskAt === key;
+        let out = listed;
+        if (freshRead && stands !== null && !listed.ask && listed.transport !== 'codex-desktop') {
+          if (stands !== 'confirm' || (freshAsk && liveAsk)) out = Object.assign({}, out, { status: stands });
+        }
+        if (freshAsk && liveAsk && !out.ask) {
+          const reach = Array.isArray(out.reach) ? (out.reach.includes('answer') ? out.reach : out.reach.concat('answer')) : ['answer'];
+          const answerWay = wayOf(out, 'answer') || (isNativeApp(out.transport) ? out.transport : '');
+          const ways = out.ways ? Object.assign({}, out.ways, { answer: out.ways.answer || answerWay }) : out.ways;
+          out = Object.assign({}, out, { status: 'confirm', ask: liveAsk, reach, ways });
+        }
+        return out;
+      }
       // What the phone said and the conversation has not taken yet stands under what was said, message by message,
       // as the computer keeps it (`queued`): waiting, or held since the conversation was told to stop. Each can be
       // taken back; what is held can be sent after all. What this page sent itself is shown with its whole words;
@@ -684,7 +832,7 @@
           if (kept.some(item => item.id === p.payload.id)) p.waited = true;
           // (one that waited and waits no more has been handed to the conversation: its record says so soon)
           const row = line(p.text, p.payload.id, p.waited ? '已交给对话' : p.delivery || '手机消息 · 正在送达', !(p.sent || p.uncertain));
-          if (p.payload.transport === APP && p.uncertain) row.append(el('button', { type: 'button', textContent: '查询发送结果', onclick: async event => {
+          if (isNativeApp(p.payload.transport) && p.uncertain) row.append(el('button', { type: 'button', textContent: '查询发送结果', onclick: async event => {
             event.currentTarget.disabled = true;
             try { await deliver(p, true); } finally { waiting(); refresh(); }
           } }));
@@ -698,7 +846,7 @@
       // it now or takes it when it has done what it is at. The application's channel keeps a receipt that can be
       // asked for again when the answer was lost; by any other way a refusal is final. False: it was not sent.
       async function deliver(mine, query = false) {
-        const receipt = mine.payload.transport === APP;
+        const receipt = isNativeApp(mine.payload.transport);
         try {
           const result = await api('api/conversation', receipt ? { ...mine.payload, receipt: query } : mine.payload);
           mine.uncertain = result.status !== 'accepted' || result.sent !== true; mine.sent = !mine.uncertain;
@@ -712,27 +860,42 @@
       }
       async function follow(current) {
         const listed = [current.updated, current.status, current.last || ''].join('\n');
-        if (!canPeek || reading || (read && stamp === null && listed === seen)) return;
+        if (!canPeek) {
+          if (!read) { read = true; said.replaceChildren(el('p', { className: 'quiet', textContent: '当前电脑端版本不支持直接查看历史对话' })); }
+          return;
+        }
+        if (reading || (read && stamp === null && listed === seen)) return;
         reading = true;
         const startedAt = stateKey(current);
+        let stateChanged = false;
         try {
           const got = await api('api/conversation', Object.assign({ id: newId(), session: session.id }, stamp ? { since: stamp } : {}));
           readError = '';
-          if (typeof got.status === 'string') { stands = got.status; standsAt = startedAt; }
+          if (typeof got.status === 'string') {
+            if (stands !== got.status || standsAt !== startedAt) stateChanged = true;
+            stands = got.status; standsAt = startedAt;
+          }
+          if (Object.prototype.hasOwnProperty.call(got, 'ask')) {
+            const nextAsk = got.ask && typeof got.ask === 'object' && got.ask.id ? got.ask : null;
+            if (JSON.stringify(liveAsk) !== JSON.stringify(nextAsk) || liveAskAt !== startedAt) stateChanged = true;
+            if (nextAsk && (!current.ask || current.ask.id !== nextAsk.id)) refresh();
+            liveAsk = nextAsk; liveAskAt = startedAt;
+          }
           if (!got.same) {
             record = got.messages || [];
             if (typeof got.asked === 'number') asked = got.asked;
             if (typeof got.updated === 'number') changed = got.updated;
             const fresh = el('div');
             if (got.more) fresh.append(el('p', { className: 'earlier', textContent: '更早的内容在电脑上' }));
-            await writeSaid(fresh, record, TOOLS[session.tool], phoneTexts, textCache);
+            await writeSaid(fresh, record, speakerOf(current), phoneTexts, textCache);
             if (!said.isConnected) return;
             const initial = !read;
             reader.paint(said, () => reader.change(() => { reader.replace(fresh); waiting(); latest.hidden = atEnd(); }, initial));
           }
           stamp = typeof got.stamp === 'string' ? got.stamp : null; seen = listed; read = true;
-        } catch (error) { stands = null; readError = '对话同步中断，正在重试：' + error.message; if (!read) said.replaceChildren(el('p', { className: 'quiet', textContent: error.message })); }
+        } catch (error) { stands = null; liveAsk = null; readError = '对话同步中断，正在重试：' + error.message; if (!read) said.replaceChildren(el('p', { className: 'quiet', textContent: error.message })); }
         reading = false;
+        if (stateChanged && said.isConnected && $('sheet').open) show();
       }
       // ---- how it stands, what it asks, and the box
       const box = el('textarea', { rows: 1, maxLength: 8000, placeholder: '发消息', autocapitalize: 'off', spellcheck: false, ariaLabel: '消息' });
@@ -746,12 +909,14 @@
       });
       const send = el('button', { type: 'button', className: 'solid', textContent: '发送', onclick: async () => {
         const original = box.value, text = original.trim();
-        if (send.disabled || !usable() || !can(now(), 'say') || now().ask) return;
+        const active = mergeCurrent(now());
+        if (send.disabled || !usable() || !can(active, 'say') || active.ask) return;
         if (!text) return box.focus();
         stopSays('');
         // what is written stands in the window at once, as what the user said, while it is on its way
         const mine = { text, before: same(record, text) + pending.filter(p => p.text === text).length, sent: false, createdAt: Date.now(), payload: { id: newId(), session: session.id, action: 'say', text } };
-        if (wayOf(now(), 'say') === APP) mine.payload.transport = APP;
+        const sayWay = wayOf(active, 'say');
+        if (isNativeApp(sayWay)) mine.payload.transport = sayWay;
         pending.push(mine); savePending(); draft.set(original);
         phoneTexts.add(text);
         waiting(); said.scrollTop = said.scrollHeight;
@@ -768,7 +933,7 @@
       let shown = '';
       function show() {
         // how it stands is what the computer said of it last: with the conversation itself, or in the lists
-        const listed = now(), current = stands === null || standsAt !== stateKey(listed) || stands === 'confirm' || listed.ask || listed.transport === APP ? listed : Object.assign({}, listed, { status: stands }), phase = current.live ? reachPhase(current) : '';
+        const listed = now(), current = mergeCurrent(listed), phase = current.live ? reachPhase(current) : '';
         syncNote.textContent = readError || (String(current.last || '').startsWith('Claude Code 本次执行失败：') ? current.last : '');
         syncNote.hidden = !syncNote.textContent;
         const mode = controlMode(current);
@@ -779,6 +944,7 @@
         follow(listed);
         // the line of how it stands: its clock goes on between the computer's words
         const kind = !current.live ? 'stopped' : phase || 'stopped';
+        lastKind = kind;
         // at work since its user spoke, as its record says; where the record does not say, since this window saw it at work
         sawBusy = kind !== 'busy' ? 0 : sawBusy || Date.now();
         const from = kind === 'busy' ? (asked && asked <= Date.now() ? asked : sawBusy) : kind === 'stopped' || kind === 'waiting' ? changed || current.updated : 0;
@@ -788,7 +954,8 @@
         clock.textContent = !from ? '' : kind === 'busy' ? lasted(Date.now() - from) : ago(from);
         ending.hidden = !canEnd(current);
         // A running CLI is not necessarily interruptible. Never present ending its process as stopping one turn.
-        const stoppable = !!wayOf(current, 'stop') && (wayOf(current, 'stop') !== APP || !!current.turn);
+        const stopWay = wayOf(current, 'stop');
+        const stoppable = !!stopWay && (!needsTurnForStop(stopWay) || !!current.turn);
         stopping.hidden = !stopAttempt && !stoppable;
         if (kind === 'busy' && !stoppable && !stopAttempt && !stopping.disabled) {
           stopSays(whyNot(current, 'stop', '当前对话不支持从手机单独中断本轮回答，请在电脑上停止'));
@@ -802,12 +969,13 @@
         asks.textContent = '';
         asks.hidden = !current.ask;
         if (current.ask) {
-          const answers = approvalActions(current, show);
+          const askId = current.ask.id;
+          const answers = approvalActions(current, ok => { if (ok && liveAsk && liveAsk.id === askId) liveAsk = null; shown = ''; show(); });
           asks.append(el('div', { className: 'card asking' }, el('div', { className: 'ask' }, el('pre', { textContent: current.ask.text }), answers)));
         }
         // The box stands wherever something can be said, and also where it will be once the conversation has done
         // what it is at (its application takes nothing meanwhile): the next thing can be written there already.
-        const sayable = can(current, 'say') && !current.ask, later = !sayable && !current.ask && current.live && current.transport === APP;
+        const sayable = can(current, 'say') && !current.ask, later = !sayable && !current.ask && current.live && isNativeApp(current.transport);
         write.hidden = !sayable && !later;
         send.disabled = sending || !sayable; box.placeholder = sayable ? '发消息' : '先写草稿，稍后发送';
         below.textContent = '';
@@ -820,20 +988,25 @@
         }
       }
       show();
-      // every second; for a while after something was written here, twice as often
+      // ~600ms while busy/confirm or in the quick window after sending; ~1200ms while idle
       let ticks = 0;
-      watch = setInterval(() => { if ($('sheet').open && (++ticks % 2 === 0 || Date.now() < quick)) show(); }, 500);
+      watch = setInterval(() => {
+        if (!$('sheet').open) return;
+        ticks++;
+        const fast = lastKind === 'busy' || lastKind === 'confirm' || Date.now() < quick;
+        if (fast ? ticks % 2 === 0 : ticks % 4 === 0) show();
+      }, 300);
     }, true);
     clearInterval(watch);
     if (readingView) readingView.dispose();
     if (choice && choice.handoff) { await views.together.handoff(choice.handoff); return false; }
-    return choice ? into(choice.session, choice.value) : false;
+    return choice ? into(choice.session, choice.value, extra) : false;
   }
   // Into a terminal of the phone's: by taking the conversation from the program that has it, by a copy, or, for one
   // that nothing has open, simply by going on with it.
-  function into(session, how) {
-    if (how === 'chat' || how === 'chat-close') return chat(session.tool, session.dir, session.id, how === 'chat-close');
-    return start(session.tool, session.dir, session.id, how === 'close', how === 'copy');
+  function into(session, how, extra) {
+    if (how === 'chat' || how === 'chat-close') return chat(session.tool, session.dir, session.id, how === 'chat-close', extra);
+    return start(session.tool, session.dir, session.id, how === 'close', how === 'copy', extra);
   }
   // A new conversation is begun by begin.js: for one project on its page, for any of them from 任务 and from the
   // app's own lists (?new=1).
@@ -887,21 +1060,96 @@
   // (one that no program has open is told by what started it)
   // and one that a program has open by what the computer says uses it (a command line inside an editor's terminal
   // is a terminal's); a computer of an earlier version says only where the program runs
-  const sourceOf = s => !s.live || s.kind ? sourceOfKind(s.kind) : /桌面版|后台服务/.test(s.origin || '') || sessionHost(s) === 'shared' || (s.origin && s.origin !== '命令行' && s.origin !== '电脑独立终端') ? 'app' : 'term';
+  const sourceOf = s => !s.live || s.kind ? sourceOfKind(s.kind) : /桌面版|后台服务/.test(s.origin || '') || isNativeApp(s.transport) || sessionHost(s) === 'shared' || (s.origin && s.origin !== '命令行' && s.origin !== '电脑独立终端') ? 'app' : 'term';
+  const TEAM_MODES = { review: '写审', lead: '分工协作', compare: '比稿' };
+  const teamUpdatedMs = value => { const n = Number(value) || 0; return n > 0 && n < 10000000000 ? n * 1000 : n; };
+  const summarizeTeamTools = list => {
+    const counts = new Map();
+    list.forEach(t => counts.set(t, (counts.get(t) || 0) + 1));
+    return [...counts.entries()].map(([t, n]) => (TOOLS[t] || t) + (n > 1 ? ' ×' + n : '')).join('、');
+  };
+  const teamWho = card => {
+    const roster = Array.isArray(card.roster) ? card.roster.filter(r => r && r.tool) : [];
+    if (card.mode === 'lead' && roster.length) {
+      const leader = roster.find(r => r.role === 'leader') || roster[0];
+      const rest = roster.filter(r => r !== leader).map(r => r.tool);
+      const leadName = TOOLS[leader.tool] || leader.tool || '';
+      return rest.length ? leadName + ' 带 ' + summarizeTeamTools(rest) : leadName + (card.auto_roster ? ' 自动组队' : '');
+    }
+    const list = Array.isArray(card.tools) ? card.tools : [];
+    if (card.mode === 'review') return (TOOLS[list[0]] || list[0] || '') + ' 写 · ' + (TOOLS[list[1]] || list[1] || '') + ' 审';
+    if (card.mode === 'compare') return list.map(t => TOOLS[t] || t).join(' vs ');
+    return (TOOLS[list[0]] || list[0] || '') + (list.length > 1 ? ' 带 ' + summarizeTeamTools(list.slice(1)) : card.auto_roster ? ' 自动组队' : '');
+  };
+  const teamStatusOf = x => {
+    const c = x.team;
+    if (x.teamConfirm) return ['confirm', '等你确认'];
+    if (c.state === 'choose') return ['confirm', '待选方案'];
+    if (c.state === 'running') return ['busy', window.RemoteTeams?.phaseLabel?.(c.phase) || '进行中'];
+    if (c.state === 'paused') return ['waiting', '已暂停'];
+    if (c.state === 'done') return ['ended', '已完成'];
+    if (c.state === 'stopped') return ['ended', c.mode === 'lead' && (c.phase === 'verify' || c.last) ? '未完成' : '已停止'];
+    if (c.state === 'failed') return ['failed', '没有开始'];
+    return ['ended', c.state || '已结束'];
+  };
   function things() {
     const sessions = data.sessions || [], saved = {};
     sessions.forEach(s => { saved[s.tool + ':' + s.id] = s; });
-    const out = (data.terminals || []).map(t => {
-      const s = t.session ? saved[t.tool + ':' + t.session] || null : null, phase = phaseOf(t), live = running(t), tool = isAgyShell(t) ? 'agy' : t.tool;
+    const rawCards = Array.isArray(data.device && data.device.team_cards) ? data.device.team_cards : [];
+    const teamCards = [], teamIds = new Set();
+    rawCards.forEach(c => { if (c && c.id && !teamIds.has(c.id)) { teamIds.add(c.id); teamCards.push(c); } });
+    const sessionTeam = new Map();
+    sessions.forEach(s => { if (s.team && teamIds.has(s.team)) sessionTeam.set(s.tool + ':' + s.id, s.team); });
+    const teamChildConfirm = new Map();
+    (data.terminals || []).forEach(t => {
+      const tid = (t.team && teamIds.has(t.team)) ? t.team : (t.session ? sessionTeam.get(t.tool + ':' + t.session) : '');
+      if (tid && running(t) && phaseOf(t) === 'confirm') {
+        teamChildConfirm.set(tid, (t.asks && t.asks.join('\n')) || t.ask || '成员正在等你确认');
+      }
+    });
+    sessions.forEach(s => {
+      if (s.team && teamIds.has(s.team) && s.live && reachPhase(s) === 'confirm') {
+        teamChildConfirm.set(s.team, (s.ask && s.ask.text) || '成员正在等你确认');
+      }
+    });
+    const out = [];
+    (data.terminals || []).forEach(t => {
+      const s = t.session ? saved[t.tool + ':' + t.session] || null : null;
+      const belongs = (t.team && teamIds.has(t.team)) || (s && s.team && teamIds.has(s.team));
+      if (belongs) return;
+      const phase = phaseOf(t), live = running(t), tool = isAgyShell(t) ? 'agy' : t.tool;
       // an ended terminal whose conversation is listed is found there, to be gone on with: it is not listed twice
-      return { t, s, tool, title: t.title, place: t.dir || base(t.folder), project: t.dir, apart: !t.dir, live, phase, rank: PHASE[phase][1], at: t.phase_at || t.created,
-        source: t.form === 'chat' ? 'app' : 'term', pinned: !!(s && s.pinned), hidden: false, state: live ? 'active' : 'ended', twice: !live && !!s && !s.terminal };
+      out.push({ t, s, tool, title: t.title, place: t.dir || base(t.folder), project: t.dir, apart: !t.dir, live, phase, rank: PHASE[phase][1], at: t.phase_at || t.created,
+        source: t.form === 'chat' ? 'app' : 'term', pinned: !!(s && s.pinned), hidden: false, state: live ? 'active' : 'ended', twice: !live && !!s && !s.terminal });
     });
     sessions.filter(s => !s.terminal).forEach(s => {
+      if (s.team && teamIds.has(s.team)) return;
       const phase = !s.live || s.now === false ? '' : reachPhase(s) || (sessionHost(s) === 'cli' ? (s.status === 'busy' ? 'busy' : s.status === 'confirm' ? 'confirm' : s.status === 'waiting' ? 'waiting' : 'idle') : '');
       out.push({ s, tool: s.tool, title: s.title, place: s.dir || base(s.folder), project: s.dir, apart: !s.dir, live: !!s.live, phase, rank: phase ? PHASE[phase][1] : 6, at: s.updated,
         source: sourceOf(s), pinned: !!s.pinned, hidden: !!s.hidden && !s.live, state: sessionActivity(s) });
     });
+    teamCards.forEach(c => {
+      const rosterTools = Array.isArray(c.roster) ? c.roster.filter(r => r && r.tool).map(r => r.tool) : [];
+      const tools = [...new Set(rosterTools.length ? rosterTools : (Array.isArray(c.tools) ? c.tools : []))];
+      const confirmRaw = c.confirm;
+      const teamConfirm = !!confirmRaw || teamChildConfirm.has(c.id);
+      const confirmText = typeof confirmRaw === 'string' ? confirmRaw : (confirmRaw && typeof confirmRaw === 'object' ? (confirmRaw.text || confirmRaw.ask || '') : '') || teamChildConfirm.get(c.id) || '';
+      const isChoose = c.state === 'choose', isRunning = c.state === 'running', isPaused = c.state === 'paused';
+      const live = teamConfirm || isChoose || isRunning || isPaused;
+      const phase = teamConfirm || isChoose ? 'confirm' : isRunning ? 'busy' : isPaused ? 'waiting' : (c.state === 'failed' ? 'failed' : 'ended');
+      out.push({
+        team: c, teamTools: tools, teamConfirm, teamConfirmText: confirmText,
+        tool: tools[0] || '', title: c.goal || '协作任务', place: c.dir || '', project: c.dir || '', apart: !c.dir,
+        live, phase, rank: PHASE[phase] ? PHASE[phase][1] : 6, at: teamUpdatedMs(c.updated),
+        source: 'app', pinned: false, hidden: false, state: live ? 'active' : 'history'
+      });
+    });
+    for (const x of out) {
+      if (!x.s) continue;
+      x.organize = x.s.organize;
+      x.originalTitle = x.organize?.original_title || x.s.title || x.title;
+      if (x.organize?.title) x.title = x.organize.title;
+    }
     return out;
   }
   const needsYou = x => x.live && x.phase === 'confirm';
@@ -914,26 +1162,81 @@
   // that a program has open, that program (a desktop app by its own name, which names the tool too; a command
   // line; an editor, and whether it is the editor's terminal); for one that is only saved, by what it was started.
   const whereOf = x => {
+    if (x.team) return '协作 · ' + (TEAM_MODES[x.team.mode] || x.team.mode || '协作') + ' · ' + teamWho(x.team);
     const tool = TOOLS[x.tool];
     if (x.t) return tool + (x.live ? ' · ' + (x.t.form === 'chat' ? PHONE_CHAT : PHONE) : '');
     const kind = x.s.kind || '';
     if (!x.live) return !kind ? tool : /桌面版/.test(kind) ? kind : tool + ' · ' + kind;
-    const origin = x.s.origin && x.s.origin !== '电脑独立终端' ? x.s.origin : '';
+    const origin = x.s.origin && x.s.origin !== '电脑独立终端' ? x.s.origin : (x.s.transport === 'agy-desktop' ? 'Antigravity 桌面版' : x.s.transport === 'codex-desktop' ? 'Codex 桌面版' : '');
     return !origin ? tool : /桌面版|后台服务/.test(origin) ? origin : tool + ' · ' + origin + (kind === '终端' && origin !== '命令行' ? ' 的终端' : '');
   };
   // what a search looks through
-  const wordsOf = x => [x.title, x.place, TOOLS[x.tool], SOURCE[x.source] || '', x.t && x.live ? (x.t.form === 'chat' ? PHONE_CHAT : PHONE) : '', x.s && x.s.origin || '', x.s && x.s.kind || '', x.apart ? '未加入项目' : '', x.pinned ? '置顶' : '', x.hidden ? '已隐藏' : ''].join('\n').toLowerCase();
+  const wordsOf = x => {
+    if (x.team) {
+      const c = x.team, [, label] = teamStatusOf(x), models = c.models && typeof c.models === 'object' ? Object.values(c.models).join('\n') : '';
+      const rosterModels = Array.isArray(c.roster) ? c.roster.map(r => [r && r.model, r && r.effort].filter(Boolean).join('\n')).filter(Boolean).join('\n') : '';
+      return [x.title, x.place, '协作任务', TEAM_MODES[c.mode] || c.mode || '', c.auto_roster ? '自动组队' : '', label, c.note || '', x.teamConfirmText || '', (x.teamTools || []).map(t => TOOLS[t] || t).join('\n'), models, rosterModels, SOURCE.app].join('\n').toLowerCase();
+    }
+    return [x.title, x.originalTitle, x.organize?.summary, ...(x.organize?.tags || []), x.place, TOOLS[x.tool], SOURCE[x.source] || '', x.t && x.live ? (x.t.form === 'chat' ? PHONE_CHAT : PHONE) : '', x.s && x.s.origin || '', x.s && x.s.kind || '', x.apart ? '未加入项目' : '', x.pinned ? '置顶' : '', x.hidden ? '已隐藏' : ''].join('\n').toLowerCase();
+  };
   // what a card shows: it is built again when any of this changes
-  const signed = x => x.t ? [x.t.id, x.phase, x.title, x.t.phase_at, x.pinned, x.place, x.apart]
-    : [x.s.id, x.phase, x.s.now, x.s.status, x.title, x.s.host, x.s.origin, (x.s.reach || ['-']).join(), canEnd(x.s), endingSessions.has(x.s.id), x.s.ask || null, x.s.last || '', x.pinned, x.hidden, x.place, !!x.apart, x.state, x.source];
+  const signed = x => x.team ? ['team', x.team.id, x.team.state, x.team.phase, !!x.team.last, x.team.goal, x.team.dir, x.team.note, x.team.updated, x.teamConfirm, x.teamConfirmText, x.teamTools, x.team.models || null, x.team.roster || null, !!x.team.auto_roster, x.team.awaited || null]
+    : x.t ? [x.t.id, x.phase, x.title, x.t.phase_at, x.pinned, x.place, x.apart, x.organize]
+    : [x.s.id, x.phase, x.s.now, x.s.status, x.title, x.s.host, x.s.origin, (x.s.reach || ['-']).join(), canEnd(x.s), endingSessions.has(x.s.id), x.s.ask || null, x.s.last || '', x.pinned, x.hidden, x.place, !!x.apart, x.state, x.source, x.organize];
 
   // ---- the filters: by tool, and by where a thing runs. They last as long as the page is kept open.
-  let filter = { tool: '', source: '' }, resultsShown = 30, recentShown = 2, hiddenShown = false;
+  let filter = { tool: '', source: '', follow: false }, resultsShown = 30, recentShown = 2, hiddenShown = false;
   try { filter = Object.assign(filter, JSON.parse(sessionStorage.getItem('rcli-filter') || '{}')); } catch (error) { /* no storage */ }
   if (!SOURCE[filter.source]) filter.source = '';
-  const pass = x => (!filter.tool || x.tool === filter.tool) && (!filter.source || x.source === filter.source);
+  const hasTool = (x, tool) => x.team ? (x.teamTools || []).includes(tool) : x.tool === tool;
+  const pass = x => (!filter.tool || hasTool(x, filter.tool)) && (!filter.source || x.source === filter.source);
+  const passTasks = x => pass(x) && (!filter.follow || !!x.organize?.follow_up);
+  const taskWords = () => $('query').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const matchesTask = (x, asked) => asked.every(word => wordsOf(x).includes(word));
+  const listKey = x => x.team ? 'team:' + x.team.id : (x.s ? 'session:' + x.s.tool + ':' + x.s.id : 'terminal:' + x.t.id);
+  const storedPosition = key => 'rcli-list:' + location.pathname + ':' + key;
+  function saveListPosition() {
+    const key = history.state?.listKey || newId();
+    const rows = [...document.querySelectorAll('[data-list-key]')].filter(row => row.getClientRects().length);
+    const index = rows.findIndex(row => row.getBoundingClientRect().bottom > 0);
+    const anchors = index < 0 ? [] : [rows[index], rows[index + 1], rows[index - 1]].filter(Boolean)
+      .map(row => [row.dataset.listKey, row.getBoundingClientRect().top]);
+    try {
+      sessionStorage.setItem(storedPosition(key), JSON.stringify({ tab, project, cameFrom, filter, resultsShown, recentShown, shown, endedShown,
+        hiddenShown, projectFolds, query: $('query').value, search: $('search').value, y: scrollY, anchors }));
+      history.replaceState({ ...history.state, listKey: key }, '');
+    } catch (error) { /* Browsing still works without storage. */ }
+    return key;
+  }
+  function restoreListPosition(key, restoreFields = true) {
+    let state;
+    try { state = JSON.parse(sessionStorage.getItem(storedPosition(key))); } catch (error) { return false; }
+    if (!state) return false;
+    if (restoreFields) {
+      ({ tab, project, cameFrom, filter, resultsShown, recentShown, shown, endedShown, hiddenShown } = state);
+      Object.assign(projectFolds, state.projectFolds);
+      $('query').value = state.query;
+      $('search').value = state.search;
+      draw();
+    }
+    requestAnimationFrame(() => {
+      const visible = [...document.querySelectorAll('[data-list-key]')].filter(row => row.getClientRects().length);
+      for (const [id, top] of state.anchors) {
+        const row = visible.find(one => one.dataset.listKey === id);
+        if (row) { scrollBy(0, row.getBoundingClientRect().top - top); return; }
+      }
+      scrollTo(0, state.y);
+    });
+    return true;
+  }
+  function organizeCandidates() {
+    const asked = taskWords();
+    return things().filter(x => supportsOrganize(x.s) && !x.twice && !x.hidden && passTasks(x) && matchesTask(x, asked))
+      .map(x => ({ session: x.s.id, tool: x.s.tool }));
+  }
+  const supportsOrganize = s => !!s && ['codex', 'claude', 'agy'].includes(s.tool);
   // a project is one of a tool or of a kind by what its folder is used for, or by what is in it now
-  const passProject = (folder, inside) => (!filter.tool || (folder.tools || []).includes(filter.tool) || inside.some(x => x.tool === filter.tool))
+  const passProject = (folder, inside) => (!filter.tool || (folder.tools || []).includes(filter.tool) || inside.some(x => hasTool(x, filter.tool)))
     && (!filter.source || (folder.kinds || []).some(kind => sourceOfKind(kind) === filter.source) || inside.some(x => x.source === filter.source));
   function choose(change) {
     filter = Object.assign({}, filter, change);
@@ -943,11 +1246,14 @@
   function drawFilters(all) {
     // a row is offered only where it tells something apart, or to take back what was chosen
     const folders = data.device.projects || [];
-    const tools = Object.keys(TOOLS).filter(tool => tool === filter.tool || all.some(x => x.tool === tool) || folders.some(f => (f.tools || []).includes(tool)));
+    const tools = Object.keys(TOOLS).filter(tool => tool === filter.tool || all.some(x => hasTool(x, tool)) || folders.some(f => (f.tools || []).includes(tool)));
     const sources = Object.keys(SOURCE).filter(source => source === filter.source || all.some(x => x.source === source) || folders.some(f => (f.kinds || []).some(kind => sourceOfKind(kind) === source)));
     const offered = (tools.length > 1 ? tools : filter.tool ? [filter.tool] : []), places = (sources.length > 1 ? sources : filter.source ? [filter.source] : []);
-    const box = $('filters'), signature = JSON.stringify([offered, places, filter, TOOLS.shell]);
-    box.hidden = !offered.length && !places.length;
+    const canOrganize = tab === 'tasks' && (pageHost.has('organize') || filter.follow);
+    const followCount = canOrganize ? all.filter(x => !x.twice && !x.hidden && pass(x) && !!x.organize?.follow_up).length : 0;
+    const showFollow = canOrganize && (followCount > 0 || filter.follow);
+    const box = $('filters'), signature = JSON.stringify([offered, places, filter, TOOLS.shell, showFollow, followCount]);
+    box.hidden = !offered.length && !places.length && !showFollow;
     if (box.dataset.signature === signature) return;
     box.dataset.signature = signature;
     const MONO = { claude: 'CC', codex: 'CX', agy: 'AG', opencode: 'OC', qoder: 'QD', cline: 'CL', pi: 'PI' };
@@ -956,7 +1262,14 @@
       if (toolKey && MONO[toolKey]) { btn.dataset.tool = toolKey; btn.dataset.mono = MONO[toolKey]; }
       return btn;
     };
-    const row = [chip('全部', !filter.tool && !filter.source, () => choose({ tool: '', source: '' }))];
+    const row = [chip('全部', !filter.tool && !filter.source && (!showFollow || !filter.follow), () => choose({ tool: '', source: '', follow: false }))];
+    if (showFollow) {
+      const followBtn = el('button', {
+        type: 'button', id: 'follow-filter', className: filter.follow ? 'on' : '',
+        ariaPressed: String(!!filter.follow), onclick: () => choose({ follow: !filter.follow })
+      }, el('span', { textContent: '待跟进' }), followCount > 0 ? el('span', { className: 'chip-count', textContent: String(followCount) }) : '');
+      row.push(followBtn);
+    }
     offered.forEach(tool => row.push(chip(TOOLS[tool], filter.tool === tool, () => choose({ tool: filter.tool === tool ? '' : tool }), tool)));
     if (offered.length && places.length) row.push(el('i'));
     places.forEach(source => row.push(chip(SOURCE[source], filter.source === source, () => choose({ source: filter.source === source ? '' : source }))));
@@ -969,11 +1282,26 @@
     catch (error) { toast(error.message); }
     refresh();
   }
+  async function setFollowUp(s, followUp) {
+    if (!usable()) return toast('电脑离线，暂时无法修改');
+    try {
+      const answer = await api('api/organize', { id: newId(), verb: 'edit', tool: s.tool, session: s.id, follow_up: !!followUp });
+      s.organize = Object.assign({}, s.organize, answer && answer.item ? answer.item : { follow_up: !!followUp });
+      draw();
+      toast(followUp ? '已加入待跟进' : '已移出待跟进');
+    } catch (error) { toast(error.message); }
+    refresh();
+  }
   async function addFolder(path) {
     if (await run({ action: 'project_add', path, name: '', create: false }, '正在添加…')) { toast('已加为项目'); refresh(); }
   }
   async function manage(x) {
-    const s = x.s, choices = [];
+    if (window.RemoteSelect && window.RemoteSelect.active) return;
+    const s = x.s, choices = [{ label: '多选', value: 'select' }];
+    if (supportsOrganize(s) && pageHost.has('organize')) {
+      choices.push({ label: s.organize?.follow_up ? '移出待跟进' : '加入待跟进', value: 'follow_up' });
+      choices.push({ label: '整理这段对话', value: 'organize' });
+    }
     if (s && marks()) choices.push({ label: s.pinned ? '取消置顶' : '置顶', value: 'pin' });
     if (s && !x.t && marks() && (!s.live || s.hidden || s.now === false)) choices.push({ label: s.hidden ? '取消隐藏' : '从列表隐藏', value: 'hide' });
     if (s && !x.t && canEnd(s) && usable()) choices.push({ label: '结束电脑上的这段对话', value: 'finish', kind: 'danger' });
@@ -986,9 +1314,11 @@
     if (x.t && x.live) choices.push({ label: '结束终端', value: 'end', kind: 'danger' });
     // a saved conversation of a project that nothing has open can be put away (the computer keeps it recoverable)
     if (s && !x.t && !s.live && s.dir && usable() && (data.device.features || []).includes('delete')) choices.push({ label: '删除对话', value: 'delete', kind: 'danger' });
-    if (!choices.length) return;
     const choice = await ask(x.title, '', choices);
-    if (choice === 'pin') mark(s, { pinned: !s.pinned });
+    if (choice === 'select') window.RemoteSelect.start(x);
+    else if (choice === 'follow_up') setFollowUp(s, !s.organize?.follow_up);
+    else if (choice === 'organize') window.RemoteOrganize.open({ session: s.id, tool: s.tool });
+    else if (choice === 'pin') mark(s, { pinned: !s.pinned });
     else if (choice === 'hide') mark(s, s.hidden ? { hidden: false } : { hidden: true, pinned: false });
     else if (choice === 'add') addFolder(folder);
     else if (choice === 'enter') enter(x.project);
@@ -1052,15 +1382,47 @@
   const named = x => el('b', null, x.pinned ? el('i', { className: 'pin', html: ICON.pin }) : '', x.title);
   // where it is: its project, or the folder a conversation is open in when that is no project
   function placed(meta, x) {
+    if (x.organize?.follow_up) meta.append(pill('waiting', '待跟进'));
     if (!x.place) return;
     meta.append(el('span', { className: 'chip' + (x.apart ? ' apart' : ''), textContent: x.place, title: x.place, ariaLabel: (x.apart ? '文件夹：' : '项目：') + x.place }));
     if (x.apart) meta.append(el('span', { textContent: '未加入项目' }));
   }
   const card = x => {
-    const made = x.t ? terminalCard(x) : sessionCard(x);
+    const made = x.team ? teamCard(x) : x.t ? terminalCard(x) : sessionCard(x);
+    made.dataset.listKey = listKey(x);
+    if (x.team) return made;
+    const summary = x.organize?.summary;
+    const query = taskWords();
+    const matched = x.organize?.tags?.filter(tag => query.some(word => tag.toLowerCase().includes(word))) || [];
+    if (summary || matched.length) made.querySelector('.open .text')?.append(el('span', {
+      className: 'organized-summary',
+      textContent: matched.length ? '主题 · ' + matched.join('、') + (summary ? ' · ' + summary : '') : summary
+    }));
+    if (supportsOrganize(x.s) && pageHost.has('organize')) made.insertBefore(el('button', {
+      type: 'button', className: 'side organize-more', ariaLabel: '对话操作', title: '对话操作', textContent: '⋯',
+      onclick: () => manage(x)
+    }), made.querySelector('.ask'));
     if (!x.t && canEnd(x.s)) made.insertBefore(el('button', { type: 'button', className: 'side end-session', ariaLabel: '结束电脑上的这段对话', title: '结束对话', html: ICON.stop, disabled: !usable() || endingSessions.has(x.s.id), onclick: () => endConversation(x.s) }), made.querySelector('.ask'));
     return held(made, () => manage(x));
   };
+  function teamCard(x) {
+    const c = x.team, [kind, label] = teamStatusOf(x);
+    const meta = el('span', { className: 'meta' }, pill(kind, label));
+    placed(meta, x);
+    meta.append(el('span', { textContent: whereOf(x) + (x.at ? ' · ' + ago(x.at) : '') }));
+    const peekText = x.teamConfirmText || c.note || (c.state === 'running' && c.phase === 'verify' ? '领队正在验收执行成员改动与结果' : '');
+    const iconHtml = (window.RemoteTeams && window.RemoteTeams.TEAM) || ICON.together;
+    const openTeam = () => {
+      if (!usable()) return toast('电脑离线，暂时无法打开');
+      if (window.RemoteTeams && window.RemoteTeams.open) window.RemoteTeams.open(c.id, c);
+      else go('together', true);
+    };
+    return el('li', { className: 'card team-card ' + (x.live ? (kind === 'waiting' ? 'done' : kind) : 'ended'), 'data-team': c.id },
+      el('button', { type: 'button', className: 'open', onclick: openTeam },
+        el('span', { className: 'tool team', html: iconHtml }),
+        el('span', { className: 'text' }, named(x), meta, peekText ? el('span', { className: 'peek', textContent: peekText }) : ''),
+        el('span', { className: 'chev', html: ICON.chev })));
+  }
   // A terminal opened from the phone.
   function terminalCard(x) {
     const t = x.t, phase = x.phase, meta = el('span', { className: 'meta' }, pill(phase, PHASE[phase][0]));
@@ -1122,7 +1484,7 @@
     else if (x.hidden) meta.append(pill('locked', '已隐藏'));
     placed(meta, x);
     meta.append(el('span', { textContent: whereOf(x) + ' · ' + ago(s.updated) }));
-    return el('li', { className: 'card' }, el('button', { type: 'button', className: 'open', onclick: () => { if (!usable()) return toast('电脑离线，暂时无法打开'); if (s.live) takeOver(s); else goOn(s); } },
+    return el('li', { className: 'card' }, el('button', { type: 'button', className: 'open', onclick: () => { if (!usable()) return toast('电脑离线，暂时无法打开'); if (s.live) takeOver(s); else readHistory(s); } },
       el('span', { className: 'tool ' + s.tool, html: ICON[s.tool] }), el('span', { className: 'text' }, named(x), meta), el('span', { className: 'chev', html: ICON.chev })));
   }
   // Lists are rebuilt only when what they show has changed, so a press or a scroll is not interrupted every few seconds.
@@ -1130,6 +1492,7 @@
     if (list.dataset.signature === signature) return;
     list.dataset.signature = signature;
     list.replaceChildren(...cards);
+    if (window.RemoteSelect) window.RemoteSelect.paint(list);      // (cards made anew are marked again while choosing)
   }
   function applyProjectFold(key) {
     const head = document.querySelector('#project .section-head[data-fold="' + key + '"]');
@@ -1173,6 +1536,8 @@
     $('heading').textContent = project || TABS[tab];
     document.querySelector('#home .top').classList.toggle('large', !project);
     $('new-task').hidden = tab !== 'tasks'; $('settings').hidden = tab !== 'me';
+    $('organize').hidden = tab !== 'tasks' || !pageHost.has('organize');
+    $('organize').disabled = !ready;
     document.querySelectorAll('#tabs button').forEach(button => { if (button.dataset.tab === tab) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current'); });
     // conversations open on the computer are counted with the terminals, by how they stand
     const stands = (list, ...phases) => list.filter(x => x.live && phases.includes(x.phase)).length;
@@ -1198,27 +1563,38 @@
     if (!lists) { if (views[tab]) views[tab].draw(); return; }
 
     if (!project) {
-      const all = everything.filter(pass), asked = $('query').value.trim().toLowerCase().split(/\s+/).filter(Boolean), searching = asked.length > 0, tick = [stamp(1), ready], tasks = tab === 'tasks';
+      const tasks = tab === 'tasks', all = everything.filter(tasks ? passTasks : pass), asked = taskWords();
+      const searching = asked.length > 0 || tasks && filter.follow, tick = [stamp(1), ready];
       $('find').hidden = tasks ? !everything.length : names.length < 2;
-      $('query').placeholder = tasks ? '搜索对话、终端和项目' : '搜索项目';
+      $('query').placeholder = tasks && pageHost.has('organize') ? '搜索标题、主题或项目' : tasks ? '搜索对话、终端和项目' : '搜索项目';
       drawFilters(everything);
       $('results').hidden = !searching || !tasks; $('sections').hidden = searching || !tasks;
       $('tasks-empty').hidden = everything.length > 0; $('first-task').hidden = !ready;
       if (!tasks) { /* the projects only */ } else if (searching) {
         // everything is looked through, what is hidden too; what is open comes first
-        const found = all.filter(x => !x.twice && asked.every(word => wordsOf(x).includes(word))).sort((a, b) => (b.live - a.live) || (b.pinned - a.pinned) || (a.live ? byRank(a, b) : byTime(a, b)));
-        show($('results-list'), found.slice(0, resultsShown), tick);
+        const titleMatch = x => asked.every(word => [x.title, x.originalTitle].join('\n').toLowerCase().includes(word));
+        const found = all.filter(x => !x.twice && matchesTask(x, asked)).sort((a, b) => (titleMatch(b) - titleMatch(a)) || (b.live - a.live) || (b.pinned - a.pinned) || (a.live ? byRank(a, b) : byTime(a, b)));
+        $('results').querySelector('h2').textContent = !asked.length && filter.follow ? '待跟进' : '搜索结果';
+        show($('results-list'), found.slice(0, resultsShown), tick.concat(asked));
         $('results-summary').textContent = found.length ? found.length + ' 个' : '没有找到';
         $('more-results').hidden = found.length <= resultsShown;
       } else {
-        const listed = all.filter(x => !x.twice), needs = listed.filter(needsYou).sort(byOpen), rest = listed.filter(x => !needsYou(x));
+        const listed = all.filter(x => !x.twice), needs = listed.filter(needsYou).sort(byOpen);
+        const replies = listed.filter(x => x.live && x.phase === 'waiting' && !x.team).sort(byOpen);
+        const unseen = listed.filter(x => x.live && x.phase === 'done' && !x.team).sort(byOpen);
+        const rest = listed.filter(x => !needsYou(x) && !replies.includes(x) && !unseen.includes(x));
         const pinned = rest.filter(x => x.pinned && !x.live).sort(byTime), free = rest.filter(x => !x.pinned || x.live);
         const active = free.filter(working).sort(byOpen);
         const opened = free.filter(x => x.live && !working(x)).sort(byOpened);
-        const recent = free.filter(x => !x.live && ((x.state === 'history' && !x.hidden) || x.state === 'ended')).sort(byTime);
+        const recent = free.filter(x => !x.live && ((x.state === 'history' && !x.hidden) || x.state === 'ended'))
+          .sort((a, b) => (Number(!!b.organize?.follow_up) - Number(!!a.organize?.follow_up)) || byTime(a, b));
         $('needs').hidden = !needs.length;
         show($('needs-list'), needs, tick);
         $('needs-summary').textContent = needs.length + ' 个等你确认';
+        $('replies').hidden = !replies.length;
+        show($('replies').querySelector('ul'), replies, tick);
+        $('unseen').hidden = !unseen.length;
+        show($('unseen').querySelector('ul'), unseen, tick);
         $('pinned').hidden = !pinned.length;
         show($('pinned-list'), pinned, tick);
         $('pinned-summary').textContent = pinned.length + ' 个';
@@ -1232,7 +1608,7 @@
         show($('recent-list'), recent.slice(0, recentShown), [stamp(5), ready]);
         $('recent-summary').textContent = recent.length + ' 个';
         $('more-recent').hidden = recent.length <= recentShown;
-        $('nothing').hidden = !(filter.tool || filter.source) || needs.length + pinned.length + active.length + recent.length + opened.length > 0;
+        $('nothing').hidden = !(filter.tool || filter.source) || listed.length > 0;
       }
       // the projects: all of them, or those the search names
       // (with a filter chosen, those of that tool or kind)
@@ -1286,7 +1662,7 @@
     // what was pinned comes first; what was hidden is left out until it is asked for
     const saved = here.filter(x => !x.live && x.state === 'history').sort((a, b) => (b.pinned - a.pinned) || byTime(a, b)), put = saved.filter(x => x.hidden).length;
     const all = saved.filter(x => hiddenShown || !x.hidden), wanted = $('search').value.trim().toLowerCase();
-    const found = wanted ? all.filter(x => x.title.toLowerCase().includes(wanted)) : all;
+    const found = wanted ? all.filter(x => matchesTask(x, wanted.split(/\s+/))) : all;
     $('p-history').hidden = !saved.length;
     $('search').hidden = all.length <= 8;
     $('history-count').textContent = wanted ? found.length + ' / ' + all.length + ' 段' : all.length + ' 段';
@@ -1314,6 +1690,7 @@
   // (`own`: this page's part of the tab is meant, whoever has the tabs)
   function go(name, own) {
     if (!TABS[name]) return;
+    if (window.RemoteSelect) window.RemoteSelect.stop();
     if (!own && appTabs.includes(name)) { native.appPage(name); return; }
     const left = project;
     if (left) { project = ''; cameFrom = 'projects'; if (history.state && history.state.project) history.back(); }
@@ -1327,7 +1704,7 @@
   }
   // A project is entered from the list of projects, or from a card on 任务: the way back leads to where one came from.
   let cameFrom = 'projects';
-  function enter(name) { cameFrom = tab; tab = 'projects'; project = name; shown = 2; endedShown = 8; hiddenShown = false; Object.keys(projectFolds).forEach(key => { projectFolds[key] = false; }); $('search').value = ''; history.pushState({ project: name }, ''); scrollTo(0, 0); draw(); }
+  function enter(name) { cameFrom = tab; tab = 'projects'; project = name; shown = 16; endedShown = 8; hiddenShown = false; Object.keys(projectFolds).forEach(key => { projectFolds[key] = false; }); $('search').value = ''; history.pushState({ project: name }, ''); scrollTo(0, 0); draw(); }
   window.addEventListener('popstate', event => {
     const left = project;
     project = event.state && event.state.project || '';
@@ -1342,10 +1719,13 @@
   });
   $('new-task').addEventListener('click', () => beginAnywhere());
   $('first-task').addEventListener('click', () => beginAnywhere());
+  $('organize').addEventListener('click', () => window.RemoteOrganize.open({
+    targets: organizeCandidates(), filtered: !!($('query').value.trim() || filter.tool || filter.source || filter.follow)
+  }));
   // While something is typed the tabs make room: the keyboard takes the foot of the screen.
   document.addEventListener('focusin', event => { if (event.target.matches && event.target.matches('#home input, #home textarea')) document.body.classList.add('typing'); });
   document.addEventListener('focusout', () => document.body.classList.remove('typing'));
-  $('search').addEventListener('input', () => { shown = 2; draw(); });
+  $('search').addEventListener('input', () => { shown = 16; draw(); });
   $('more-history').addEventListener('click', () => { shown += 30; draw(); });
   $('more-ended').addEventListener('click', () => { endedShown += 30; draw(); });
   $('hidden-history').addEventListener('click', () => { hiddenShown = !hiddenShown; if (hiddenShown) { shown = Math.max(shown, 30); projectFolds.history = true; } draw(); });
@@ -1366,7 +1746,18 @@
       data = (asked && await asked) || await api('api/terminal');
       if (data.device.shell) TOOLS.shell = data.device.shell;
       if (first && views[tab] && views[tab].open) views[tab].open();
-      draw(); peeks();
+      const returnList = first ? startParams.get('backList') || history.state?.listKey : '';
+      if (!returnList || !restoreListPosition(returnList)) draw();
+      peeks();
+      if (window.RemoteTeams && window.RemoteTeams.sync) window.RemoteTeams.sync();
+      if (wantedTeam && tab !== 'together') {
+        const id = wantedTeam;
+        wantedTeam = '';
+        if (usable() && window.RemoteTeams && window.RemoteTeams.open) {
+          const card = ((data.device && data.device.team_cards) || []).find(c => c && c.id === id);
+          window.RemoteTeams.open(id, card || undefined);
+        }
+      }
       if (anew) {
         anew = false; history.replaceState(history.state, '', location.pathname + (project ? '?project=' + encodeURIComponent(project) : ''));
         beginAnywhere().then(leave);
@@ -1376,20 +1767,40 @@
         take = ''; history.replaceState(history.state, '', location.pathname + (project ? '?project=' + encodeURIComponent(project) : ''));
         if (wanted && usable()) (wanted.live ? takeOver(wanted) : start(wanted.tool, wanted.dir, wanted.id, false)).then(leave);
       }
+      if (readFromBench) {
+        const wanted = (data.sessions || []).find(s => s.id === readFromBench && s.tool === startParams.get('tool'));
+        readFromBench = '';
+        if (wanted) (wanted.live ? takeOver(wanted) : readHistory(wanted)).then(leave);
+        else toast('这段对话已不在当前列表');
+      }
+      if (organizeFromBench && window.RemoteOrganize) {
+        organizeFromBench = false;
+        if (!pageHost.has('organize') || !usable()) return toast('当前电脑暂时无法整理对话');
+        const sheet = window.RemoteOrganize.open({ session: startParams.get('session'), tool: startParams.get('tool') });
+        sheet.result.then(() => leave(false));
+      }
     }
     catch (error) { if (!$('home').hidden) { $('device-text').textContent = error.message; $('dot').className = 'off'; } }
     if (!$('home').hidden) timer = setTimeout(refresh, document.hidden ? 15000 : 2500);
   }
   document.addEventListener('visibilitychange', () => { if (!document.hidden && !$('home').hidden) refresh(); });
-  window.addEventListener('pageshow', event => { if (event.persisted && !$('home').hidden) refresh(); });      // back from a terminal
+  window.addEventListener('pageshow', event => {
+    if (!event.persisted || $('home').hidden) return;
+    const key = history.state?.listKey;
+    if (key) restoreListPosition(key, false);
+    refresh();
+  });
 
   // What the views of their own work with: the page's helpers, what the computer last said, and the ways into a
   // conversation. A view names its tab and says how it is opened (asked for what it shows) and drawn.
-  window.RemoteCliPage = {
-    $, el, svg, ICON, TOOLS, api, newId, toast, openSheet, ask, ago, base, things, whereOf, wayOf, usable, running, phaseOf, go, takeOver, open, start, chat, chatOk, held, saved, keep,
+  const pageHost = window.RemoteCliPage = {
+    $, el, svg, ICON, TOOLS, api, newId, toast, openSheet, closeReader, ask, ago, base, things, whereOf, wayOf, usable, running, phaseOf, go, takeOver, open, start, chat, chatOk, canEnd, held, saved, keep, loadMarkdown, markdownNode,
+    openSession: s => { if (!usable()) return toast('电脑离线，暂时无法打开'); return s.live ? takeOver(s) : readHistory(s); },
     get data() { return data; },
     get relayVersion() { return relayVersion; }, startAgyShell,
     get tab() { return tab; },
+    get project() { return project; },
+    get computerName() { return computerName; },
     has: feature => !!data && (data.device.features || []).includes(feature),
     refresh: () => refresh(),
     view(name, made) { views[name] = made; if (data) { if (tab === name && made.open) made.open(); draw(); } }

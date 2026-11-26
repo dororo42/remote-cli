@@ -52,6 +52,8 @@
 
   // ---- look
   const TEXT = { small: ['紧凑', '14px'], normal: ['标准', '15.5px'], large: ['大', '17px'], larger: ['特大', '19px'] };
+  const askedSkin = new URLSearchParams(location.search).get('skin');
+  if (askedSkin && (askedSkin === 'auto' || window.RemoteCliSkins[askedSkin])) keep('skin', askedSkin);
   function paint() {
     const skin = window.RemoteCliPaint(saved('skin', 'paper'));
     document.documentElement.style.fontSize = (TEXT[saved('text', 'normal')] || TEXT.normal)[1];
@@ -73,8 +75,8 @@
     autoButton.dataset.key = 'auto'; $('skins').append(autoButton);
     Object.keys(skins).forEach(key => {
       const s = skins[key], preview = el('i');
-      preview.style.background = s.t.background;
-      [[s.t.foreground, 22], [s.accent, 30], [s.t.green, 16], [s.t.yellow, 24], [s.t.red, 12]].forEach(([colour, height]) => { const bar = el('span'); bar.style.background = colour; bar.style.height = height + 'px'; preview.append(bar); });
+      preview.style.background = 'linear-gradient(135deg, ' + ((s.chat && s.chat.bg) || s.bg) + ' 52%, ' + s.t.background + ' 52%)';
+      [[(s.chat && s.chat.userBg) || s.accentSoft, 22], [s.accent, 30], [s.t.green, 16], [s.t.yellow, 24], [s.t.red, 14]].forEach(([colour, height]) => { const bar = el('span'); bar.style.background = colour; bar.style.height = height + 'px'; preview.append(bar); });
       const button = el('button', { type: 'button', onclick: () => { keep('skin', key); paint(); mark(); } }, preview, s.name + (s.light ? ' · 明亮' : ''));
       button.dataset.key = key; $('skins').append(button);
     });
@@ -121,10 +123,159 @@
     { name: 'ask', needs: 'reach', title: 'Codex 的确认请求交给手机', about: '电脑无人操作时由手机回答，电脑屏幕右下角有说明；关闭后只能在电脑上回答' },
     { name: 'wait', needs: 'reach', title: '对话停下后等手机消息', sheet: true, choices: [['0', '不等'], ['60', '1 分钟'], ['300', '5 分钟'], ['900', '15 分钟'], ['1800', '30 分钟']],
       explained: '不等：对话做完就停下，电脑上看不到任何变化；手机发的消息由电脑端送进这段对话，Codex 约一两秒，Claude Code 十几秒。选了时间：电脑无人操作满 1 分钟后，对话做完先等这么久，这期间发的消息立即送达；等的时候电脑上显示钩子正在运行，有人碰键盘或鼠标就结束。' },
-    { name: 'update', title: '自动检查更新', about: '有新版本时提示' }];
+    { name: 'update', title: '自动检查更新', about: '有新版本时提示' },
+    { name: 'channel', title: '电脑端更新渠道', about: '预发布版本更早拿到改动，正式版经过验收', choices: [['release', '正式版'], ['pre', '预发布']] }];
   let device = null, told = null, busy = false, problem = '';
+  let teamCatalog = null, teamCatalogLoading = false, teamCatalogError = '';
+  const defaults = window.RemoteTeamDefaults;
+  const SHORT = { claude: 'CC', codex: 'CX', agy: 'AG' };
+  const TONE = { claude: 'n-cc', codex: 'n-cx', agy: 'n-ag' };
   const name = line => line.name || KIND[line.kind][0];
   const has = feature => !!device && (device.features || []).includes(feature);
+  async function loadTeamModels(force) {
+    if (!defaults || !device || !device.online || !device.enabled || !has('teams-models')) return;
+    if (!force && (teamCatalog || teamCatalogLoading)) return;
+    teamCatalogLoading = true; teamCatalogError = '';
+    drawTeamDefaults();
+    try {
+      const res = await post('api/work', { id: newId(), action: 'team_models' });
+      teamCatalog = defaults.normalizeModels(res && res.models);
+      teamCatalogError = '';
+    } catch (error) {
+      teamCatalogError = error.message || '无法读取模型列表';
+    } finally {
+      teamCatalogLoading = false;
+      drawTeamDefaults();
+    }
+  }
+  function drawTeamDefaults() {
+    const section = $('part-team-defaults'), list = $('team-defaults'), note = $('team-defaults-note');
+    if (!section || !list || !note || !defaults) return;
+    const there = !!device && device.online && device.enabled;
+    const showSection = !!device && (has('teams') || has('teams-models'));
+    section.hidden = !showSection;
+    if (!showSection) return;
+    if (!there) {
+      list.hidden = true; note.hidden = false;
+      note.textContent = '电脑离线，连上后可查看和修改协作默认模型与思考深度。';
+      return;
+    }
+    if (!has('teams-models')) {
+      list.hidden = true; note.hidden = false;
+      note.textContent = '当前电脑端版本暂不支持配置协作默认模型，请更新电脑端。';
+      return;
+    }
+    const availableTools = defaults.TOOLS_ORDER.filter(tool => ((device.tools || []).includes(tool)) || (teamCatalog && (teamCatalog[tool] || []).length > 0));
+    const tools = availableTools.length ? availableTools : defaults.TOOLS_ORDER;
+    const prefs = defaults.readPrefs();
+    const effortSupported = has('teams-effort');
+    const items = [];
+    if (teamCatalogError) {
+      items.push(el('li', { className: 'team-default-actions' },
+        el('small', { textContent: '模型目录读取失败：' + teamCatalogError }),
+        el('button', { type: 'button', className: 'team-default-reset', textContent: teamCatalogLoading ? '读取中…' : '重试', disabled: teamCatalogLoading, onclick: () => loadTeamModels(true) })));
+    } else if (teamCatalogLoading && !teamCatalog) {
+      items.push(el('li', { className: 'team-default-actions' },
+        el('small', { textContent: '正在从电脑读取各工具可用模型与思考深度…' })));
+    }
+    tools.forEach(tool => {
+      const catalogList = (teamCatalog && teamCatalog[tool]) || [];
+      const currentModel = defaults.resolveModel(tool, teamCatalog, prefs);
+      const modelOptions = [['', '工具默认']].concat(catalogList.map(item => [item.id, item.label]));
+      if (currentModel && !catalogList.some(item => item.id === currentModel)) modelOptions.push([currentModel, currentModel]);
+      const modelSel = el('select', {
+        id: 'default-model-' + tool, className: 'team-default-select',
+        'aria-label': (defaults.TOOL_NAMES[tool] || tool) + ' 默认模型'
+      }, ...modelOptions.map(([val, label]) => el('option', { value: val, textContent: label, selected: val === currentModel })));
+      modelSel.addEventListener('change', () => {
+        const nextModel = modelSel.value;
+        defaults.setModelPref(tool, nextModel);
+        if (teamCatalog) {
+          const nextEfforts = defaults.effortListFor(tool, nextModel, teamCatalog);
+          const curPrefs = defaults.readPrefs();
+          if (curPrefs.efforts[tool] && !nextEfforts.includes(curPrefs.efforts[tool])) {
+            defaults.setEffortPref(tool, nextEfforts.includes('high') ? 'high' : '');
+          }
+        }
+        toast('已保存');
+        drawTeamDefaults();
+      });
+
+      const efforts = defaults.effortListFor(tool, currentModel, teamCatalog);
+      const currentEffort = effortSupported ? defaults.resolveEffort(tool, currentModel, teamCatalog, prefs) : '';
+      const effortSelectable = effortSupported && (efforts.length > 0 || (!!currentEffort && !teamCatalog));
+      const effortOptions = effortSelectable
+        ? [['', '工具默认']].concat(efforts.map(level => [level, defaults.effortLabel(level)]))
+        : [['', '工具默认']];
+      if (effortSelectable && currentEffort && !efforts.includes(currentEffort)) {
+        effortOptions.push([currentEffort, defaults.effortLabel(currentEffort)]);
+      }
+      const effortSel = el('select', {
+        id: 'default-effort-' + tool, className: 'team-default-select',
+        'aria-label': (defaults.TOOL_NAMES[tool] || tool) + ' 默认思考深度',
+        disabled: !effortSelectable
+      }, ...effortOptions.map(([val, label]) => el('option', { value: val, textContent: label, selected: val === (effortSelectable ? currentEffort : '') })));
+      if (effortSelectable) {
+        effortSel.addEventListener('change', () => {
+          defaults.setEffortPref(tool, effortSel.value);
+          toast('已保存');
+          drawTeamDefaults();
+        });
+      }
+
+      const fields = [
+        el('div', { className: 'team-default-field' }, el('label', { htmlFor: modelSel.id, textContent: '默认模型' }), modelSel),
+        el('div', { className: 'team-default-field' }, el('label', { htmlFor: effortSel.id, textContent: '思考深度' }), effortSel)
+      ];
+      const visualBlocks = [el('div', { className: 'team-default-fields' }, ...fields)];
+      if (effortSelectable && efforts.length) {
+        const effortPills = el('div', { className: 'param-pills', role: 'group', 'aria-label': (defaults.TOOL_NAMES[tool] || tool) + ' 思考深度快捷选择' },
+          ...[['', '默认']].concat(efforts.map(level => [level, defaults.shortEffortLabel(level)])).map(([val, label]) =>
+            el('button', {
+              type: 'button', className: 'param-pill', textContent: label,
+              'aria-pressed': String(val === currentEffort),
+              onclick: () => { defaults.setEffortPref(tool, val); toast('已保存'); drawTeamDefaults(); }
+            })));
+        visualBlocks.push(el('div', { className: 'param-visual-row' }, el('span', { className: 'param-visual-label', textContent: '思考档位' }), effortPills));
+      }
+      if (tool !== 'agy' && has('chat-params')) {
+        const maxMode = (device && device.max_mode) || (told && told.settings && told.settings.rights) || '';
+        const savedMode = (prefs.modes && prefs.modes[tool]) || '';
+        const allowedModes = defaults.MODE_ORDER.filter(m => defaults.modeAllowed(m, maxMode));
+        const modePills = el('div', { className: 'param-pills', role: 'group', 'aria-label': (defaults.TOOL_NAMES[tool] || tool) + ' 默认权限模式' },
+          ...[['', '跟随电脑']].concat(allowedModes.map(m => [m, defaults.MODE_LABELS[m]])).map(([val, label]) =>
+            el('button', {
+              type: 'button', className: 'param-pill', textContent: label,
+              'aria-pressed': String(val === savedMode),
+              onclick: () => { defaults.setModePref(tool, val); toast('已保存'); drawTeamDefaults(); }
+            })));
+        visualBlocks.push(el('div', { className: 'param-visual-row' }, el('span', { className: 'param-visual-label', textContent: '权限模式' }), modePills));
+      }
+      const hasCustom = Object.prototype.hasOwnProperty.call(prefs.models, tool) || Object.prototype.hasOwnProperty.call(prefs.efforts, tool) || !!(prefs.modes && prefs.modes[tool]);
+      const customTag = hasCustom
+        ? '已自定义 · 新建对话与协作自动带入'
+        : (teamCatalog && effortSupported && !efforts.length
+          ? (defaults.RECOMMENDED_HINTS[tool] || '推荐默认').replace(/\s*·\s*思考高$/, '') + ' · 当前目录未单独提供思考档位'
+          : (defaults.RECOMMENDED_HINTS[tool] || '新建对话与协作自动带入'));
+      items.push(el('li', { className: 'team-default-item' },
+        el('div', { className: 'team-default-head' },
+          el('span', { className: 'team-default-badge ' + (TONE[tool] || 'n-cx'), textContent: SHORT[tool] || 'AI' }),
+          el('div', { className: 'team-default-copy' },
+            el('b', { textContent: defaults.TOOL_NAMES[tool] || tool }),
+            el('small', { textContent: customTag }))),
+        ...visualBlocks));
+    });
+    items.push(el('li', { className: 'team-default-actions' },
+      el('small', { textContent: '新建对话、终端与协作都会使用这里保存的参数；对话中也可点参数胶囊随时切换。' }),
+      el('button', {
+        type: 'button', id: 'team-defaults-reset', className: 'team-default-reset',
+        textContent: '恢复推荐默认',
+        onclick: () => { defaults.resetPrefs(); toast('已恢复推荐默认'); drawTeamDefaults(); }
+      })));
+    list.hidden = false;
+    note.hidden = true;
+    list.replaceChildren(...items);
+  }
   function state(kind, title, words) {
     const box = $('state');
     box.hidden = !title; box.className = 'notice ' + kind;
@@ -184,6 +335,7 @@
     }
     $('settings').hidden = !rows.length; $('settings-note').hidden = !!rows.length; $('settings-note').textContent = why;
     $('settings').replaceChildren(...rows);
+    drawTeamDefaults();
   }
   // A setting with more choices than a row holds: what it is for, and the choices.
   function pick(setting, value) {
@@ -218,6 +370,17 @@
         const on = native.autoUpdate();
         rows.push(row(null, text('自动检查更新', '有新版本时提示'), el('button', { type: 'button', className: 'flip', role: 'switch', 'aria-checked': String(on === true), 'aria-label': '自动检查更新',
           onclick: () => { native.setAutoUpdate(!on); toast('已保存'); fixed(); } })));
+      }
+      if (native.previewUpdates && native.setPreviewUpdates) {
+        rows.push(row(null, text('接收预发布版本', '关闭时只接收正式版'), el('button', { type: 'button', className: 'flip', role: 'switch',
+          'aria-checked': String(native.previewUpdates() === true), 'aria-label': '接收预发布版本',
+          onclick: event => {
+            const control = event.currentTarget;
+            const on = control.getAttribute('aria-checked') !== 'true';
+            native.setPreviewUpdates(on);
+            control.setAttribute('aria-checked', String(on));
+            toast('已保存');
+          } })));
       }
       rows.push(row({ act: () => native.update() }, text('App 版本', native.version ? 'v' + native.version() : ''), el('span', { className: 'act', textContent: '检查更新' })));
       $('app').replaceChildren(...rows);
@@ -299,6 +462,7 @@
           else if (told.change.state) state('plain', '电脑正在切换线路', told.change.note);
         }
       } else told = null;
+      if (device.online && device.enabled && has('teams-models') && !teamCatalog && !teamCatalogLoading) loadTeamModels(false);
     } catch (error) { problem = error.message; if (!device) told = null; }
     draw();
   }

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent-linux"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import worktrees  # noqa: E402
 
 
@@ -28,6 +28,7 @@ class WorktreesTest(unittest.TestCase):
         git(self.repo, "init", "-q")
         git(self.repo, "config", "user.email", "test@example.com")
         git(self.repo, "config", "user.name", "test")
+        git(self.repo, "config", "core.autocrlf", "false")
         with open(os.path.join(self.repo, "app.txt"), "w", encoding="utf-8") as stream:
             stream.write("one\n")
         git(self.repo, "add", "-A")
@@ -40,9 +41,11 @@ class WorktreesTest(unittest.TestCase):
     def test_a_candidate_works_in_its_own_detached_copy(self):
         made = self.worktrees.create(self.repo, "c" * 24, "opencode")
         self.assertTrue(os.path.isdir(made["path"]))
+        self.assertTrue(self.worktrees.contains(made["path"]))
+        self.assertFalse(self.worktrees.contains(self.repo))
         head = git(self.repo, "rev-parse", "HEAD").strip()
         self.assertEqual(made["base_commit"], head)
-        self.assertIn("(detached", git(made["path"], "branch", "--show-current") or "(detached")
+        self.assertEqual(git(made["path"], "branch", "--show-current").strip(), "")
 
     def test_a_non_repository_folder_is_refused(self):
         plain = os.path.join(self.folder.name, "plain")
@@ -62,33 +65,35 @@ class WorktreesTest(unittest.TestCase):
         stat = self.worktrees.stat(made["path"], made["base_commit"])
         self.assertIn("2 个文件改动", stat)
 
-    def test_the_winner_is_applied_binary_safe_and_the_rest_cleaned(self):
+    def test_the_winner_is_applied_binary_safe_including_non_utf8_bytes(self):
         winner = self.worktrees.create(self.repo, "c" * 24, "codex")
         loser = self.worktrees.create(self.repo, "c" * 24, "claude")
         with open(os.path.join(winner["path"], "app.txt"), "wb") as stream:
             stream.write(b"one\ntwo\n\x00binary")
-        with open(os.path.join(winner["path"], "new.txt"), "wb") as stream:
-            stream.write(b"fresh\n")
+        with open(os.path.join(winner["path"], "latin1.txt"), "wb") as stream:
+            stream.write(b"caf\xe9\n")
         note = self.worktrees.apply(self.repo, winner["path"], winner["base_commit"])
         self.assertIn("2 个文件改动", note)
         with open(os.path.join(self.repo, "app.txt"), "rb") as stream:
             self.assertEqual(stream.read(), b"one\ntwo\n\x00binary")
+        with open(os.path.join(self.repo, "latin1.txt"), "rb") as stream:
+            self.assertEqual(stream.read(), b"caf\xe9\n")
         self.worktrees.remove_all(self.repo, "c" * 24)
         self.assertFalse(os.path.isdir(winner["path"]))
         self.assertFalse(os.path.isdir(loser["path"]))
         with open(os.path.join(self.repo, "app.txt"), "rb") as stream:
-            self.assertEqual(stream.read(), b"one\ntwo\n\x00binary")      # the pick kept its changes
+            self.assertEqual(stream.read(), b"one\ntwo\n\x00binary")
 
     def test_a_conflicting_main_folder_is_left_untouched(self):
         winner = self.worktrees.create(self.repo, "c" * 24, "codex")
         with open(os.path.join(winner["path"], "app.txt"), "w", encoding="utf-8") as stream:
             stream.write("candidate\n")
         with open(os.path.join(self.repo, "app.txt"), "w", encoding="utf-8") as stream:
-            stream.write("owner changed it first\n")                      # the owner edited the same file
+            stream.write("owner changed it first\n")
         with self.assertRaises(worktrees.OpError):
             self.worktrees.apply(self.repo, winner["path"], winner["base_commit"])
         with open(os.path.join(self.repo, "app.txt"), "r", encoding="utf-8") as stream:
-            self.assertEqual(stream.read(), "owner changed it first\n")   # untouched
+            self.assertEqual(stream.read(), "owner changed it first\n")
 
     def test_changes_in_says_nothing_for_a_clean_or_missing_folder(self):
         self.assertEqual(worktrees.changes_in(self.repo), "")

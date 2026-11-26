@@ -18,11 +18,14 @@ using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
+[assembly: System.Reflection.AssemblyFileVersion(RemoteCli.App.Version + ".0")]
+[assembly: System.Reflection.AssemblyInformationalVersion(RemoteCli.App.Version)]
+
 namespace RemoteCli {
 /// The program on the computer: a small window and a tray icon around the relay, the optional tunnel and the
 /// terminal agent. Everything it starts ends when it exits.
 public sealed partial class App : Form {
-    const string Version = "1.10.1";
+    internal const string Version = "1.32.0";
     // cloudflared pinned to one release, checked against the sha256 Cloudflare publishes
     // for the artifact (the digest field of the release API, cross-checked 2026-10-12).
     const string TunnelDownload = "https://github.com/cloudflare/cloudflared/releases/download/2026.10.0/cloudflared-windows-amd64.exe";
@@ -32,11 +35,20 @@ public sealed partial class App : Form {
     readonly string dataDir = TerminalAgent.DefaultData;
     readonly JavaScriptSerializer json = new JavaScriptSerializer();
     Dictionary<string, object> config;
-    string password = "", address = "";
+    string password = "", localPassword = "", address = "";
     Process relay, tunnel, kept;
     string keptUrl = "";
     TerminalAgent agent;
     int generation;
+    TunnelSupervisor tunnelSupervisor;
+    readonly RouteCatalog routeCatalog = new RouteCatalog(() => LanAddress());
+    readonly System.Windows.Forms.Timer tunnelHealthTimer = new System.Windows.Forms.Timer { Interval = 30 * 1000 };
+    bool localRelayUp;
+    int localRelayPort;
+    int tunnelRetries;
+    DateTime nextTunnelRetry = DateTime.MinValue;
+    DateTime lastEnvWake = DateTime.MinValue;
+    bool systemEventsHooked;
 
     readonly StatusLine status = new StatusLine(), sideStatus = new StatusLine(), sideAbove = new StatusLine();
     // What the side of the window says: how the phone's access stands and, when a tool is connected, which.
@@ -54,7 +66,7 @@ public sealed partial class App : Form {
     string offeredMark = "";
     readonly Switch enabledSwitch = new Switch(), autostartSwitch = new Switch(), autoUpdateSwitch = new Switch(), reachSwitch = new Switch(), askSwitch = new Switch();
     SettingRow reachRow, updateRow;
-    readonly Segmented rights = new Segmented { Items = new[] { "默认", "自动改文件", "只读" } }, protocol = new Segmented { Items = new[] { "自动", "HTTP/2" } };
+    readonly Segmented rights = new Segmented { Items = new[] { "默认", "自动改文件", "只读" } }, protocol = new Segmented { Items = new[] { "自动", "HTTP/2" } }, channelPick = new Segmented { Items = new[] { "正式版", "预发布" } };
     readonly System.Windows.Forms.Timer updateTimer = new System.Windows.Forms.Timer { Interval = 10 * 60 * 1000 }, quietTimer = new System.Windows.Forms.Timer { Interval = 5000 };
     ReleaseUpdate waitingUpdate;
     readonly List<Panel> pages = new List<Panel>();
@@ -80,11 +92,15 @@ public sealed partial class App : Form {
     bool trouble, preparing = true;
     static string ComputerName = Environment.MachineName;
     readonly NotifyIcon tray = new NotifyIcon();
+    DesktopConsole desktopConsole;
+    bool consoleAutoOpened;
     bool quitting, hinted, updating;
     ReleaseUpdate availableUpdate;
+    readonly UpdateChecks updateChecks = new UpdateChecks(channel => AutoUpdater.CheckAsync(Version, channel));
 
     string ConfigFile { get { return Path.Combine(dataDir, "config.json"); } }
     string PasswordFile { get { return Path.Combine(dataDir, "password.dpapi"); } }
+    string LocalPasswordFile { get { return Path.Combine(dataDir, "local-password.dpapi"); } }
     string TunnelFile { get { return Path.Combine(dataDir, "cloudflared.exe"); } }
     string ChildrenFile { get { return Path.Combine(dataDir, "children.json"); } }
     string KeptFile { get { return Path.Combine(dataDir, "tunnel.json"); } }
@@ -97,11 +113,14 @@ public sealed partial class App : Form {
         try { config = json.Deserialize<Dictionary<string, object>>(File.ReadAllText(ConfigFile, Encoding.UTF8)); } catch { config = null; }
         if (config == null) config = new Dictionary<string, object>();
         foreach (var item in new Dictionary<string, object> { { "Mode", "lan" }, { "Port", 8722 }, { "Server", "" }, { "OwnServer", "" }, { "RemoteEnabled", true },
-            { "RemoteMaxMode", "full" }, { "TunnelProtocol", "auto" }, { "AutoUpdate", false }, { "RemoteDirs", new object[0] }, { "UpdateCheckUtc", "" }, { "Relay", "" }, { "Skin", Theme.Default }, { "Reach", "" }, { "ReachHeard", new object[0] }, { "ReachWait", 0 }, { "ReachAsk", true }, { "ToolInstallSuggested", "" } })
+            { "RemoteMaxMode", "full" }, { "TunnelProtocol", "auto" }, { "AutoUpdate", false }, { "UpdateChannel", "release" }, { "RemoteDirs", new object[0] }, { "UpdateCheckUtc", "" }, { "Relay", "" }, { "Skin", Theme.Default }, { "Reach", "" }, { "ReachHeard", new object[0] }, { "ReachWait", 0 }, { "ReachAsk", true }, { "ToolInstallSuggested", "" }, { "ConsoleBounds", "" } })
             if (!config.ContainsKey(item.Key) || config[item.Key] == null) config[item.Key] = item.Value;
         if (Array.IndexOf(new[] { "lan", "cloud", "own", "public" }, Mode) < 0) config["Mode"] = "lan";
         try { password = Encoding.UTF8.GetString(ProtectedData.Unprotect(File.ReadAllBytes(PasswordFile), null, DataProtectionScope.CurrentUser)); } catch { password = ""; }
         if (password.Length == 0) SetPassword(NewPassword());
+        try { localPassword = Encoding.UTF8.GetString(ProtectedData.Unprotect(File.ReadAllBytes(LocalPasswordFile), null, DataProtectionScope.CurrentUser)); } catch { localPassword = ""; }
+        if (localPassword.Length == 0) WriteLocalPassword(Mode == "lan" || Mode == "cloud" ? password : NewPassword());
+        tunnelSupervisor = new TunnelSupervisor(dataDir);
     }
     // Settings are changed from the window and from the thread that connects, at a start with one's own relay at the
     // same moment: a change and the writing of the file are one step, one at a time. Every setting is there from
@@ -123,6 +142,7 @@ public sealed partial class App : Form {
     }
     void SetPassword(string value) {
         WritePassword(value);
+        if (Mode == "lan" || Mode == "cloud") WriteLocalPassword(value);
         // Phones that signed in with the old password must sign in again.
         try { File.Delete(Path.Combine(dataDir, "relay", "sessions.json")); } catch { }
     }
@@ -130,6 +150,10 @@ public sealed partial class App : Form {
     void WritePassword(string value) {
         password = value;
         File.WriteAllBytes(PasswordFile, ProtectedData.Protect(Encoding.UTF8.GetBytes(value), null, DataProtectionScope.CurrentUser));
+    }
+    void WriteLocalPassword(string value) {
+        localPassword = value;
+        File.WriteAllBytes(LocalPasswordFile, ProtectedData.Protect(Encoding.UTF8.GetBytes(value), null, DataProtectionScope.CurrentUser));
     }
     List<string> Dirs() { return ((System.Collections.IEnumerable)config["RemoteDirs"]).Cast<object>().Select(Convert.ToString).ToList(); }
 
@@ -148,7 +172,38 @@ public sealed partial class App : Form {
         } catch { }
     }
     // An update leaves the tunnel running: the new version takes it over, so the phone keeps the address it knows.
-    void StopChildren() { if (!updating) { Kill(tunnel); tunnel = null; } Kill(relay); relay = null; Remember(); }
+    void StopChildren() { if (!updating) { Kill(tunnel); tunnel = null; } Kill(relay); relay = null; localRelayUp = false; localRelayPort = 0; Remember(); }
+    void StopTunnelOnly() { if (!updating) { Kill(tunnel); tunnel = null; } Remember(); }
+
+    async Task<bool> EnsureLocalRelay(int port, bool widenNetwork) {
+        if (!File.Exists(Python)) return false;
+        if (relay != null && !relay.HasExited && localRelayUp && localRelayPort == port) return true;
+        if (relay != null) { Kill(relay); relay = null; localRelayUp = false; }
+        if (Listening(port)) return false;
+        if (localPassword.Length == 0) WriteLocalPassword(Mode == "lan" || Mode == "cloud" ? password : NewPassword());
+        relay = StartRelay(widenNetwork, port, localPassword);
+        Remember();
+        bool up = await Up(relay, port);
+        if (!up) { Kill(relay); relay = null; localRelayUp = false; localRelayPort = 0; Remember(); return false; }
+        localRelayUp = true; localRelayPort = port;
+        return true;
+    }
+
+    List<RouteInfo> CurrentRoutes() {
+        string mode = Mode;
+        string remoteUrl = mode == "cloud" ? address : mode == "own" ? Relays.Clean(Convert.ToString(config["OwnServer"]), true) : "";
+        return routeCatalog.Build(localRelayPort > 0 ? localRelayPort : Port, localRelayUp, mode, remoteUrl);
+    }
+
+    void SyncAgentLinks(string remoteServer = "", string remoteSecret = "") {
+        if (agent == null) return;
+        var endpoints = new List<RelayEndpoint>();
+        if (localRelayUp && localRelayPort > 0 && localPassword.Length > 0)
+            endpoints.Add(new RelayEndpoint { Name = "local", Origin = "http://127.0.0.1:" + localRelayPort, Password = localPassword });
+        if (!String.IsNullOrWhiteSpace(remoteServer) && !String.IsNullOrWhiteSpace(remoteSecret))
+            endpoints.Add(new RelayEndpoint { Name = "remote", Origin = remoteServer, Password = remoteSecret });
+        agent.SetLinks(endpoints);
+    }
     void Keep(string url, int port) {
         try {
             File.WriteAllText(KeptFile, json.Serialize(new Dictionary<string, object> { { "Pid", tunnel.Id }, { "Started", tunnel.StartTime.ToFileTimeUtc().ToString() }, { "Url", url },
@@ -230,13 +285,32 @@ public sealed partial class App : Form {
         for (int n = 0; n < 40 && !Listening(port); n++) { await Task.Delay(250); if (process.HasExited) break; }
         return Listening(port);
     }
-    // A tunnel to the program's own relay. `address` comes to the address it was given, or to nothing when it ended
-    // or gave none in forty seconds.
-    Process StartTunnel(int port, out Task<string> address) {
+    // cloudflared announces the URL before it connects to the edge. Both are needed to hand the line to a phone.
+    Process StartTunnel(int port, out Task<string> address, int ownerGeneration = -1) {
         var found = new TaskCompletionSource<string>();
-        var run = new ProcessStartInfo(TunnelFile, "tunnel --no-autoupdate" + (Convert.ToString(config["TunnelProtocol"]) == "http2" ? " --protocol http2" : "") + " --url http://127.0.0.1:" + port) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true, RedirectStandardOutput = true, WorkingDirectory = dataDir };
+        bool useHttp2 = tunnelSupervisor != null && tunnelSupervisor.ShouldUseHttp2(Convert.ToString(config["TunnelProtocol"]));
+        if (tunnelSupervisor != null) tunnelSupervisor.ResetRuntime();
+        var run = new ProcessStartInfo(TunnelFile, TunnelSupervisor.BuildArguments(port, useHttp2, withMetrics: true)) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true, RedirectStandardOutput = true, WorkingDirectory = dataDir };
         var process = new Process { StartInfo = run, EnableRaisingEvents = true };
-        DataReceivedEventHandler look = (s, e) => { if (e.Data == null) return; var m = Regex.Match(e.Data, @"https://[a-z0-9-]+\.trycloudflare\.com"); if (m.Success) found.TrySetResult(m.Value); };
+        string url = "";
+        bool registered = false;
+        var gate = new object();
+        DataReceivedEventHandler look = (s, e) => {
+            if (e.Data == null) return;
+            if (tunnelSupervisor != null && tunnelSupervisor.ObserveLogLine(e.Data)) {
+                if (ownerGeneration >= 0 && ownerGeneration == generation && !quitting && Mode == "cloud" && !Changing)
+                    BeginInvoke(new Action(() => { Say("公网隧道 QUIC 不稳定，正在自动切换 HTTP/2 重连…"); Reconnect(); }));
+            }
+            if (found.Task.IsCompleted) return;
+            lock (gate) {
+                if (url.Length == 0) {
+                    var match = Regex.Match(e.Data, @"https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com\b");
+                    if (match.Success) url = match.Value;
+                }
+                if (e.Data.Contains("Registered tunnel connection")) registered = true;
+                if (registered && url.Length > 0) found.TrySetResult(url);
+            }
+        };
         process.ErrorDataReceived += look; process.OutputDataReceived += look;
         process.Exited += (s, e) => found.TrySetResult("");
         process.Start(); process.BeginErrorReadLine(); process.BeginOutputReadLine();
@@ -244,9 +318,57 @@ public sealed partial class App : Form {
         return process;
     }
     // What is said when the tunnel in use ends by itself. `mine` is the generation it belongs to: one that was
-    // stopped on purpose belongs to an earlier one.
+    // stopped on purpose belongs to an earlier one. Schedules automatic exponential-backoff recovery while
+    // keeping the local relay (LAN / Tailscale / desktop console) running.
     EventHandler Lost(int mine) {
-        return (s, e) => { if (mine == generation && !quitting) { ShowAddress(""); Say("公网隧道断开了，点“重新连接”。经常断开时到“设置”把隧道协议改为 HTTP/2", true); } };
+        return (s, e) => {
+            if (mine != generation || quitting || Mode != "cloud" || Changing) return;
+            int waitSec = Math.Min(30, 3 * (1 << Math.Min(tunnelRetries, 3)));
+            tunnelRetries++;
+            nextTunnelRetry = DateTime.UtcNow.AddSeconds(waitSec);
+            ShowAddress("");
+            Say("公网隧道断开，" + waitSec + " 秒后自动重连（本机与局域网直连仍可用）", true);
+            Task.Delay(waitSec * 1000).ContinueWith(_ => {
+                if (mine == generation && !quitting && Mode == "cloud" && !Changing) Reconnect();
+            });
+        };
+    }
+
+    void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e) {
+        if (e.Mode == PowerModes.Resume) HandleEnvironmentWake();
+    }
+
+    void OnNetworkAddressChanged(object sender, EventArgs e) {
+        HandleEnvironmentWake();
+    }
+
+    void HandleEnvironmentWake() {
+        if (quitting || Changing) return;
+        DateTime now = DateTime.UtcNow;
+        if ((now - lastEnvWake).TotalSeconds < 2.5) return;
+        lastEnvWake = now;
+        Task.Run(() => {
+            try {
+                routeCatalog.RefreshAsync(true);
+                if (agent != null) agent.RefreshConnections();
+                if (quitting || Changing) return;
+                string mode = Mode;
+                if (mode == "lan" && localRelayUp) {
+                    string ip = LanAddress();
+                    if (ip.Length > 0) {
+                        string nextAddr = "http://" + ip + ":" + (localRelayPort > 0 ? localRelayPort : Port);
+                        if (!String.Equals(address, nextAddr, StringComparison.OrdinalIgnoreCase)) ShowAddress(nextAddr);
+                    }
+                } else if (mode == "cloud") {
+                    tunnelRetries = 0;
+                    nextTunnelRetry = DateTime.MinValue;
+                    bool needTunnel = tunnel == null || tunnel.HasExited || (address.Length > 0 && Gone(address));
+                    if (needTunnel && File.Exists(TunnelFile)) Reconnect();
+                } else if ((mode == "own" || mode == "public") && (relay == null || relay.HasExited)) {
+                    Reconnect();
+                }
+            } catch { }
+        });
     }
 
     // Starts what the chosen way of connecting needs. Runs off the window's thread.
@@ -254,10 +376,11 @@ public sealed partial class App : Form {
         int mine = ++generation;
         Process held = kept; kept = null;      // only the first start takes a tunnel over; "reconnect" always makes a new one
         ShowAddress("");
-        StopChildren();
         string mode = Mode;
+        int port = Port;
         try {
             if (mode == "own" || mode == "public") {
+                StopTunnelOnly();
                 Relay chosen = Remembered();
                 string server, wrong = "";
                 if (mode == "public") {
@@ -268,13 +391,16 @@ public sealed partial class App : Form {
                     wrong = relays.Space(chosen, out server, out secret);
                     if (mine != generation) return;
                     if (wrong.Length > 0) { Say(wrong, true); return; }
-                    if (secret != password) SetPassword(secret);
+                    if (secret != password) WritePassword(secret);
                 } else {
                     server = Relays.Clean(Convert.ToString(config["OwnServer"]), true);
                     if (server.Length == 0) { Say("尚未选择中转，请在“我的中转”中选择或添加", true); return; }
                 }
+                // Keep the local relay alive beside the remote relay so desktop and LAN/Tailscale phones connect directly.
+                await EnsureLocalRelay(port, true);
+                if (mine != generation) return;
                 Keep("Server", server);
-                if (agent != null) agent.Reset();
+                SyncAgentLinks(server, password);
                 ShowAddress(server);
                 if (mode == "own") {
                     // Whether it works is found out here and said: the address, the certificate or the password.
@@ -283,22 +409,39 @@ public sealed partial class App : Form {
                     if (mine != generation) return;
                 }
                 string name = chosen != null ? chosen.Name : new Uri(server).Authority;
-                Say(wrong.Length > 0 ? wrong : mode == "public" ? "已连上公共中转“" + name + "”，地址固定不变。手机 App 扫码连接" : "已连上中转“" + name + "”，地址固定不变。手机 App 扫码或输入地址连接", wrong.Length > 0);
+                string directHint = localRelayUp ? "（本机与局域网直连同时就绪）" : "";
+                Say(wrong.Length > 0 ? wrong : mode == "public" ? "已连上公共中转“" + name + "”，地址固定不变" + directHint + "。手机 App 扫码连接" : "已连上中转“" + name + "”，地址固定不变" + directHint + "。手机 App 扫码或输入地址连接", wrong.Length > 0);
                 return;
             }
-            if (!File.Exists(Python)) { Say("安装不完整：缺少 " + Python, true); return; }
-            int port = Port;
-            if (Listening(port)) { Say("端口 " + port + " 已被别的程序占用，请到“设置”里换一个端口", true); return; }
-            relay = StartRelay(mode == "lan", port, password);
-            Remember();
-            bool up = await Up(relay, port);
-            if (mine != generation) return;
-            if (!up) { Say("本机服务没有启动成功", true); return; }
-            Keep("Server", "http://127.0.0.1:" + port);
-            if (agent != null) agent.Reset();
-            if (mode == "lan") {
+            if (mode == "cloud") {
+                StopTunnelOnly();
+                if (!File.Exists(Python)) { Say("安装不完整：缺少 " + Python, true); return; }
+                WriteLocalPassword(password);
+                bool relayReady = await EnsureLocalRelay(port, true);
+                if (mine != generation) return;
+                if (!relayReady) {
+                    if (Listening(port)) { Say("端口 " + port + " 已被别的程序占用，请到“设置”里换一个端口", true); return; }
+                    Say("本机服务没有启动成功", true);
+                    return;
+                }
+                Keep("Server", "http://127.0.0.1:" + port);
+                SyncAgentLinks();
+            } else {
+                StopChildren();
+                if (!File.Exists(Python)) { Say("安装不完整：缺少 " + Python, true); return; }
+                if (Listening(port)) { Say("端口 " + port + " 已被别的程序占用，请到“设置”里换一个端口", true); return; }
                 string ip = LanAddress();
                 if (ip.Length == 0) { Say("未找到局域网地址，请先连接 Wi-Fi 或网线", true); return; }
+                WriteLocalPassword(password);
+                // Listen on LAN too so phones on the same Wi-Fi/Tailscale can upgrade from tunnel to direct automatically.
+                relay = StartRelay(true, port, localPassword);
+                Remember();
+                bool up = await Up(relay, port);
+                if (mine != generation) return;
+                if (!up) { StopChildren(); Say("本机服务没有启动成功", true); return; }
+                localRelayUp = true; localRelayPort = port;
+                Keep("Server", "http://127.0.0.1:" + port);
+                SyncAgentLinks();
                 ShowAddress("http://" + ip + ":" + port);
                 Say("局域网直连已就绪，用 App 扫码。连接失败可点“连接诊断”");
                 return;
@@ -308,6 +451,7 @@ public sealed partial class App : Form {
             if (held != null && !held.HasExited && !Gone(keptUrl)) {
                 if (mine != generation) return;
                 tunnel = held; tunnel.Exited += lost; tunnel.EnableRaisingEvents = true;
+                tunnelRetries = 0; nextTunnelRetry = DateTime.MinValue;
                 Remember();
                 ShowAddress(keptUrl);
                 Say("公网隧道已就绪，地址和上次相同，手机不用重新扫码");
@@ -315,16 +459,30 @@ public sealed partial class App : Form {
             }
             Say("正在建立公网隧道…");
             Task<string> given;
-            tunnel = StartTunnel(port, out given);
+            tunnel = StartTunnel(port, out given, mine);
             tunnel.Exited += lost;
             Remember();
             string url = await given;
             if (mine != generation) return;
-            if (url.Length == 0) { Kill(tunnel); Say("公网隧道没有建立成功，请检查网络后重试", true); return; }
+            if (url.Length == 0) {
+                tunnel.Exited -= lost;
+                StopTunnelOnly();
+                int waitSec = Math.Min(30, 5 * (1 << Math.Min(tunnelRetries, 2)));
+                tunnelRetries++;
+                nextTunnelRetry = DateTime.UtcNow.AddSeconds(waitSec);
+                Say("公网隧道暂时不可用，" + waitSec + " 秒后自动重试（本机与局域网直连仍可用）", true);
+                return;
+            }
+            tunnelRetries = 0; nextTunnelRetry = DateTime.MinValue;
             Keep(url, port);
             ShowAddress(url);
-            Say("公网隧道已就绪。手机在任何网络下用 App 扫码；更新程序后地址不变");
-        } catch (Exception error) { Say("启动失败：" + error.Message, true); }
+            Say("公网隧道已就绪（局域网直连同时可用）。手机在任何网络下用 App 扫码；更新程序后地址不变");
+        } catch (Exception error) {
+            if (mine != generation) return;
+            if (mode == "lan") StopChildren();
+            else if (mode == "cloud") StopTunnelOnly();
+            Say("启动失败：" + error.Message, true);
+        }
         finally { if (held != null && held != tunnel) Kill(held); }
     }
     void Reconnect() { Task.Run(() => Connect()); }
@@ -408,6 +566,9 @@ public sealed partial class App : Form {
         toast.Left = pages[0].Left + (pages[0].Width - toast.Width) / 2;
         toast.Visible = true; toast.BringToFront();
         toastTimer.Stop(); toastTimer.Start();
+        if (!Visible && desktopConsole != null && !desktopConsole.IsDisposed && desktopConsole.Visible) {
+            desktopConsole.ShowToast(text);
+        }
     }
     void Copy(string text, string what) {
         if (String.IsNullOrEmpty(text)) return;
@@ -521,7 +682,7 @@ public sealed partial class App : Form {
                 if (!relay.Public) { relays.Save(relay); draft = null; }
                 lock (saving) { if (!relay.Public) config["OwnServer"] = relay.Url; config["Relay"] = relay.Id; Keep("Mode", relay.Public ? "public" : "own"); }
                 relayTab = false; relayNote = ""; shown = null;
-                SetPassword(secret); ShowMode(); Reconnect();
+                WritePassword(secret); ShowMode(); Reconnect();
             }));
         });
     }
@@ -574,6 +735,7 @@ public sealed partial class App : Form {
         ShowProjects(); activityMark = "\n"; RefreshActivity();
         Say(said.Length > 0 ? said : "正在启动…", trouble);
         ShowMode();
+        if (desktopConsole != null && !desktopConsole.IsDisposed) desktopConsole.ApplyTheme();
         Invalidate(true);
     }
     Action projectsShown = () => { };
@@ -665,26 +827,122 @@ public sealed partial class App : Form {
         if (!ReferenceEquals(sideStatus.Font, small)) sideStatus.Font = small;
         if (two) { sideAbove.Set(sideLine, sideColour); sideStatus.Set(sideTools, Theme.Good); } else sideStatus.Set(sideLine, sideColour);
     }
-    // A window on this computer for the very pages the phone uses. The terminals in it are the same ones the phone
-    // shows, so a terminal can be looked at and typed into from both at once, and nothing has to be handed over.
+    // A window on this computer for the very pages the phone uses. The terminals and collaboration tasks in it are the
+    // same ones the phone shows, so everything stays in sync on both devices without handing anything over.
     // The window signs in with a ticket the relay gives out for one use: the password is never part of an address.
-    void OpenWindow(string terminal) {
-        string origin = Convert.ToString(config["Server"]).TrimEnd('/');
-        if (origin.Length == 0 || password.Length == 0) { Toast("电脑后台还没有准备好，请稍后再试"); return; }
+    internal const string NewTeamQuery = "?tab=together&do=team";
+    internal static string WindowUrl(string origin, string query, string ticket) {
+        string root = (origin ?? "").TrimEnd('/');
+        string search = String.IsNullOrEmpty(query) ? "" : (query.StartsWith("?") ? query : "?" + query);
+        return root + "/" + search + "#t=" + Uri.EscapeDataString(ticket ?? "");
+    }
+    void OpenWeb(string query, bool console = false) {
+        string origin = localRelayUp && localRelayPort > 0 ? "http://127.0.0.1:" + localRelayPort : Convert.ToString(config["Server"]).TrimEnd('/');
+        string secret = localRelayUp && localRelayPort > 0 && localPassword.Length > 0 ? localPassword : password;
+        if (origin.Length == 0 || secret.Length == 0) { Toast("电脑后台还没有准备好，请稍后再试"); return; }
         Task.Run(() => {
             try {
-                string token = Convert.ToString(Ask(origin + "/api/login", new Dictionary<string, object> { { "password", password } }, "")["token"]);
+                string token = Convert.ToString(Ask(origin + "/api/login", new Dictionary<string, object> { { "password", secret } }, "")["token"]);
                 string ticket = Convert.ToString(Ask(origin + "/api/ticket", new Dictionary<string, object>(), token)["ticket"]);
-                string url = origin + "/" + (terminal != null ? "?open=" + terminal : "") + "#t=" + Uri.EscapeDataString(ticket);
+                string search = String.IsNullOrEmpty(query) ? "" : (query.StartsWith("?") ? query : "?" + query);
+                string url = console
+                    ? origin.TrimEnd('/') + "/console/" + search + "#t=" + Uri.EscapeDataString(ticket ?? "")
+                    : WindowUrl(origin, query, ticket);
                 string browser = AppBrowser();
+                string size = console ? "1280,840" : "480,880";
                 // A browser's "app" window has no address bar and keeps its sign-in in a folder of its own.
-                if (browser != null) Process.Start(new ProcessStartInfo(browser, "--app=\"" + url + "\" --user-data-dir=\"" + Path.Combine(dataDir, "window") + "\" --window-size=480,880 --no-first-run --no-default-browser-check") { UseShellExecute = false });
+                if (browser != null) Process.Start(new ProcessStartInfo(browser, "--app=\"" + url + "\" --user-data-dir=\"" + Path.Combine(dataDir, "window") + "\" --window-size=" + size + " --no-first-run --no-default-browser-check") { UseShellExecute = false });
                 else Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
             } catch (Exception error) {
                 BeginInvoke(new Action(() => Toast("窗口没有打开：" + error.Message)));
             }
         });
     }
+    static bool CanUseDesktopConsole() {
+        try { return DesktopConsole.IsRuntimeAvailable(); } catch { return false; }
+    }
+    Rectangle ReadConsoleBounds(out FormWindowState state) {
+        state = FormWindowState.Normal;
+        try {
+            string raw = Convert.ToString(config["ConsoleBounds"]);
+            string[] parts = (raw ?? "").Split(',');
+            if (parts.Length >= 4) {
+                int x = Int32.Parse(parts[0]), y = Int32.Parse(parts[1]), w = Int32.Parse(parts[2]), h = Int32.Parse(parts[3]);
+                if (parts.Length >= 5 && parts[4] == "max") state = FormWindowState.Maximized;
+                return new Rectangle(x, y, w, h);
+            }
+        } catch { }
+        return Rectangle.Empty;
+    }
+    void SaveConsoleBounds(Rectangle rect, FormWindowState state) {
+        Keep("ConsoleBounds", String.Format("{0},{1},{2},{3},{4}", rect.X, rect.Y, rect.Width, rect.Height, state == FormWindowState.Maximized ? "max" : "norm"));
+    }
+    DesktopConsole EnsureDesktopConsoleVisible() {
+        if (desktopConsole == null || desktopConsole.IsDisposed) {
+            FormWindowState savedState;
+            Rectangle savedBounds = ReadConsoleBounds(out savedState);
+            desktopConsole = new DesktopConsole(
+                dataDir,
+                savedBounds,
+                savedState,
+                () => { Go(0); Reveal(); },
+                () => { Go(3); Reveal(); },
+                () => CheckForUpdate(true),
+                PickFolderFromConsole,
+                () => ToolInstaller.Show(desktopConsole != null && !desktopConsole.IsDisposed ? (Form)desktopConsole : (Form)this, dataDir),
+                SyncSkinFromConsole,
+                SaveConsoleBounds);
+        }
+        desktopConsole.Show();
+        if (desktopConsole.WindowState == FormWindowState.Minimized) desktopConsole.WindowState = FormWindowState.Normal;
+        desktopConsole.Activate();
+        return desktopConsole;
+    }
+    void PickFolderFromConsole() {
+        IWin32Window owner = desktopConsole != null && !desktopConsole.IsDisposed && desktopConsole.Visible ? (IWin32Window)desktopConsole : this;
+        using (var dialog = new FolderBrowserDialog { Description = "选择要添加到总控台的项目文件夹" }) {
+            if (dialog.ShowDialog(owner) == DialogResult.OK) {
+                AddProject(dialog.SelectedPath, true);
+                if (desktopConsole != null && !desktopConsole.IsDisposed) desktopConsole.NotifyRefresh();
+            }
+        }
+    }
+    void SyncSkinFromConsole(string skinName) {
+        if (String.IsNullOrEmpty(skinName)) return;
+        if (Array.IndexOf(Theme.Names, skinName) >= 0 && Theme.Skin != skinName) {
+            Keep("Skin", skinName);
+            Wear(skinName);
+        }
+    }
+    void OpenConsole(string openId = "", string tab = "") {
+        string origin = localRelayUp && localRelayPort > 0 ? "http://127.0.0.1:" + localRelayPort : Convert.ToString(config["Server"]).TrimEnd('/');
+        string secret = localRelayUp && localRelayPort > 0 && localPassword.Length > 0 ? localPassword : password;
+        if (!CanUseDesktopConsole()) {
+            if (origin.Length == 0 || secret.Length == 0) { Toast("电脑后台还没有准备好，请稍后再试"); return; }
+            string q = !String.IsNullOrEmpty(openId) ? "?open=" + openId : !String.IsNullOrEmpty(tab) ? "?tab=" + tab : "";
+            OpenWeb(q, true);
+            return;
+        }
+        var console = EnsureDesktopConsoleVisible();
+        if (origin.Length == 0 || secret.Length == 0) {
+            console.SetStatusText("正在启动本机服务，稍后自动进入总控台…");
+            return;
+        }
+        Task.Run(() => {
+            try {
+                string token = Convert.ToString(Ask(origin + "/api/login", new Dictionary<string, object> { { "password", secret } }, "")["token"]);
+                string ticket = Convert.ToString(Ask(origin + "/api/ticket", new Dictionary<string, object>(), token)["ticket"]);
+                BeginInvoke(new Action(() => {
+                    if (quitting) return;
+                    EnsureDesktopConsoleVisible().NavigateTo(origin, ticket, openId, tab, Convert.ToString(config["Skin"]));
+                }));
+            } catch (Exception error) {
+                BeginInvoke(new Action(() => Toast("桌面总控台没有打开：" + error.Message)));
+            }
+        });
+    }
+    void OpenWindow(string terminal) { OpenConsole(terminal ?? "", ""); }
+    void OpenNewTeam() { OpenConsole("", "together"); }
     Dictionary<string, object> Ask(string url, Dictionary<string, object> payload, string token) {
         var request = (HttpWebRequest)WebRequest.Create(url); request.Method = "POST"; request.ContentType = "application/json"; request.Timeout = 8000;
         if (token.Length > 0) request.Headers["Authorization"] = "Bearer " + token;
@@ -738,10 +996,12 @@ public sealed partial class App : Form {
         kept = Kept();
         KillLeftovers();
         Text = "Remote AI"; Font = Theme.Text();
-        AutoScaleMode = AutoScaleMode.None;      // positions below are for 100%; the whole window is scaled once at the end
+        SuspendLayout();
+        AutoScaleDimensions = new SizeF(96, 96);
+        AutoScaleMode = AutoScaleMode.Dpi;
         ClientSize = new Size(SideWidth + PageWidth, WindowHeight); FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false; StartPosition = FormStartPosition.CenterScreen;
         BackColor = Theme.Bg; ForeColor = Theme.Ink;
-        Icon = Theme.MarkIcon(32);
+        Theme.ApplyIcon(this);
 
         // ---- side bar
         var side = Place(this, new Panel { BackColor = Theme.Side }, 0, 0, SideWidth, WindowHeight);
@@ -755,6 +1015,7 @@ public sealed partial class App : Form {
             item.Click += (s, e) => Go(index);
             nav.Add(item);
         }
+        Action(side, "打开桌面总控台", Theme.IconTerminal, ButtonKind.Primary, 12, 290, SideWidth - 24, 38, (s, e) => OpenConsole());
         Place(side, sideAbove, 18, WindowHeight - 106, SideWidth - 30, 22); sideAbove.BackColor = Theme.Side; sideAbove.Visible = false;
         sideAbove.Font = Theme.Text(); sideAbove.Tag = Theme.Text(8.25f);     // the line of the tools is the longer one, in smaller letters
         Place(side, sideStatus, 18, WindowHeight - 84, SideWidth - 30, 22); sideStatus.BackColor = Theme.Side; sideStatus.Font = sideAbove.Font; ShowSide();
@@ -789,7 +1050,7 @@ public sealed partial class App : Form {
             if (wanted == Mode) { ShowMode(); return; }       // back from only looking at that tab: what is running stays
             if (Held()) return;
             // The password of a place at a relay for everyone is known to that relay: this computer's own relay gets another.
-            if (Mode == "public") SetPassword(NewPassword());
+            if (Mode == "public") { WritePassword(localPassword.Length > 0 ? localPassword : NewPassword()); if (localPassword.Length == 0) WriteLocalPassword(password); }
             Keep("Mode", wanted); ShowMode(); Reconnect();
         };
         Note(way, "地址", 20, 172, 200, 18, Theme.Muted, 8.5f, true);
@@ -812,6 +1073,7 @@ public sealed partial class App : Form {
             if (!Confirm("换一个密码？", "换密码后，已连接的手机需要重新扫码。", "换密码", false)) return;
             SetPassword(NewPassword()); Reconnect(); Toast("密码已更新");
         });
+        Action(connect, "发起协作任务", Theme.IconAdd, ButtonKind.Normal, 530, 456, 150, 34, (s, e) => OpenNewTeam());
         Note(connect, "手机只能在“项目”中添加的文件夹内启动终端；终端启动后拥有与本机操作相同的权限，可以访问整台电脑。", 28, 506, 652, 36, Theme.Faint, 8.5f);
 
         // ---- page: projects
@@ -866,12 +1128,13 @@ public sealed partial class App : Form {
         var activityPage = Page("活动", "正在执行或正开着的终端和对话。共用终端双击可在电脑上打开，手机端仍可查看和输入，无需交接。");
         var liveCard = Place(activityPage, new Card(), 28, 92, 652, 362);
         Place(liveCard, activity, 8, 8, 636, 346);
-        activity.EmptyTitle = "现在没有开着的终端或对话"; activity.EmptyAbout = "点下面的“新建或查看全部”，或在手机上选一个项目新建终端，\n它就会出现在这里，两边都能用。";
+        activity.EmptyTitle = "现在没有开着的终端或对话"; activity.EmptyAbout = "点下面的“发起协作任务”或“新建或查看全部”，或在手机上选一个项目新建终端，\n它就会出现在这里，两边都能用。";
         activity.DoubleClick += (s, e) => OpenActivity();
         activity.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; OpenActivity(); } };
         Action(activityPage, "在电脑上打开", Theme.IconTerminal, ButtonKind.Primary, 28, 468, 150, 36, (s, e) => OpenActivity());
-        Action(activityPage, "新建或查看全部", Theme.IconOpen, ButtonKind.Normal, 188, 468, 164, 36, (s, e) => OpenWindow(null));
-        Action(activityPage, "转成独立窗口", "", ButtonKind.Ghost, 362, 468, 130, 36, (s, e) => TakeoverActivity());
+        Action(activityPage, "发起协作任务", Theme.IconAdd, ButtonKind.Normal, 188, 468, 150, 36, (s, e) => OpenNewTeam());
+        Action(activityPage, "新建或查看全部", Theme.IconOpen, ButtonKind.Normal, 348, 468, 164, 36, (s, e) => OpenWindow(null));
+        Action(activityPage, "转成独立窗口", "", ButtonKind.Ghost, 522, 468, 130, 36, (s, e) => TakeoverActivity());
         Place(activityPage, activityNote, 28, 518, 652, 20); activityNote.BackColor = Theme.Bg; activityNote.ForeColor = Theme.Muted;
 
         // ---- page: settings
@@ -928,6 +1191,10 @@ public sealed partial class App : Form {
         askRow.Tip(tips, AskFor);
         updateButton = new RoundButton { Text = "检查更新", Glyph = Theme.IconRefresh };
         updateButton.Click += (s, e) => CheckForUpdate(true);
+        // which releases are looked for, beside the button that looks: the full releases unless pre-releases are chosen
+        channelPick.Changed += (s, e) => Set("channel", AutoUpdater.Channels[channelPick.Chosen]);
+        var updateControls = new Panel { BackColor = Theme.Panel };
+        Place(updateControls, channelPick, 0, 0, 140, 32); Place(updateControls, updateButton, 148, 0, 150, 32);
         var all = new[] {
             new SettingRow("允许手机访问", "关闭后手机立即不能操作，正在运行的终端不受影响", enabledSwitch, 46, 26),
             new SettingRow("登录 Windows 后自动启动", "开机后在托盘里运行，不弹出窗口", autostartSwitch, 46, 26),
@@ -939,7 +1206,7 @@ public sealed partial class App : Form {
             new SettingRow("本机端口", "局域网直连和公网隧道使用，被占用时换一个", portBox, 96, 32),
             new SettingRow("外观", "和手机 App 相同的几种配色，默认与 App 一致", skinPick, 170, 32),
             new SettingRow("自动检查更新", "开启后定期检查，有新版本时提示", autoUpdateSwitch, 46, 26),
-            (updateRow = new SettingRow("版本 " + Version, "从 GitHub 发布页检查并安装新版本；手机上也可以发起", updateButton, 150, 32)) };
+            (updateRow = new SettingRow("版本 " + Version, UpdateAbout, updateControls, 298, 32)) };
         for (int i = 0; i < all.Length; i++) Place(rows, all[i], 2, 6 + i * 41, 648, 41);
         Action(settings, "打开数据文件夹", Theme.IconOpen, ButtonKind.Normal, 28, 552, 150, 36, (s, e) => { try { Process.Start(new ProcessStartInfo("explorer.exe", "\"" + dataDir + "\"")); } catch (Exception) { } });
         Action(settings, "项目主页", Theme.IconGlobe, ButtonKind.Ghost, 186, 552, 110, 36, (s, e) => { try { Process.Start(new ProcessStartInfo("https://github.com/KangWang42/remote-ai") { UseShellExecute = true }); } catch (Exception) { } });
@@ -951,10 +1218,13 @@ public sealed partial class App : Form {
         toast.Visible = false; toast.BackColor = Theme.Ink; toast.ForeColor = Theme.OnAccent; toast.TextAlign = ContentAlignment.MiddleCenter; toast.Font = Theme.Text(9f, true);
         toastTimer.Interval = 1600; toastTimer.Tick += (s, e) => { toastTimer.Stop(); toast.Visible = false; };
         activityTimer.Interval = 2000; activityTimer.Tick += (s, e) => { RefreshActivity(); if (pages.Count > 1 && pages[1].Visible && projectPick.Chosen != 0) ShowProjects(); };
-        tray.Icon = Theme.MarkIcon(32); tray.Visible = true; tray.Text = "Remote AI";
-        tray.DoubleClick += (s, e) => Reveal();
+        tray.Icon = Theme.TrayIcon(); tray.Visible = true; tray.Text = "Remote AI";
+        tray.DoubleClick += (s, e) => { if (CanUseDesktopConsole()) OpenConsole(); else Reveal(); };
         tray.ContextMenuStrip = new ContextMenuStrip();
-        tray.ContextMenuStrip.Items.Add("显示窗口", null, (s, e) => Reveal());
+        tray.ContextMenuStrip.Items.Add("打开桌面总控台", null, (s, e) => OpenConsole());
+        tray.ContextMenuStrip.Items.Add("连接与扫码设置", null, (s, e) => { Go(0); Reveal(); });
+        tray.ContextMenuStrip.Items.Add("后台设置与更新", null, (s, e) => { Go(3); Reveal(); });
+        tray.ContextMenuStrip.Items.Add("发起协作任务", null, (s, e) => OpenNewTeam());
         tray.ContextMenuStrip.Items.Add("复制地址", null, (s, e) => { if (address.Length > 0 && Mode != "public") try { Clipboard.SetText(address); } catch (ExternalException) { } });
         tray.ContextMenuStrip.Items.Add("重新连接", null, (s, e) => Again());
         tray.ContextMenuStrip.Items.Add("-");
@@ -970,12 +1240,14 @@ public sealed partial class App : Form {
         // now, and the skin chosen in the settings is put on.
         parts = Theme.Parts(this);
         if (Convert.ToString(config["Skin"]) != Theme.Default) Wear(Convert.ToString(config["Skin"]));
-        using (var g = CreateGraphics()) {
-            float factor = g.DpiX / 96f;
-            if (factor > 1.01f) { Scale(new SizeF(factor, factor)); folders.ItemHeight = (int)(54 * factor); activity.ItemHeight = (int)(54 * factor); }
-        }
+        ResumeLayout(true);
+        Action sizeRows = () => { folders.ItemHeight = activity.ItemHeight = LogicalToDeviceUnits(54); };
+        HandleCreated += (s, e) => sizeRows();
+        DpiChanged += (s, e) => sizeRows();
+        sizeRows();
         Shown += (s, e) => {
             agent = new TerminalAgent(dataDir) { Version = Version };
+            agent.RoutesProvider = CurrentRoutes;
             // The phone may ask for the update: it is looked for and installed at once, whatever the terminals are doing.
             agent.UpdateRequested = () => BeginInvoke(new Action(() => CheckForUpdate(false, true)));
             agent.Computer = Itself;
@@ -1020,7 +1292,44 @@ public sealed partial class App : Form {
                 await InstallUpdate(found);
             };
             updateTimer.Start(); quietTimer.Start();
-            Task.Run(async () => { await Connect(); await agent.Run(); });
+            tunnelHealthTimer.Tick += (t, a) => {
+                if (Mode != "cloud" || Changing || quitting || tunnelSupervisor == null) return;
+                if (tunnel == null || tunnel.HasExited) {
+                    if (File.Exists(TunnelFile) && DateTime.UtcNow >= nextTunnelRetry) {
+                        Say("检测到公网隧道未连接，正在自动重连…");
+                        Reconnect();
+                    }
+                    return;
+                }
+                int mine = generation;
+                string currentUrl = address;
+                Task.Run(() => {
+                    bool localOk = tunnelSupervisor.CheckLocalReady();
+                    bool stuck = !localOk && tunnelSupervisor.IsStuckNotReady();
+                    bool gone = !stuck && currentUrl.Length > 0 && Gone(currentUrl);
+                    if ((stuck || gone) && mine == generation && !quitting && Mode == "cloud" && !Changing) {
+                        BeginInvoke(new Action(() => { Say("检测到公网隧道异常，正在自动重连…"); Reconnect(); }));
+                    }
+                });
+            };
+            tunnelHealthTimer.Start();
+            if (!systemEventsHooked) {
+                systemEventsHooked = true;
+                try { SystemEvents.PowerModeChanged += OnPowerModeChanged; } catch { }
+                try { NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged; } catch { }
+            }
+            routeCatalog.RefreshAsync(true);
+            Task.Run(async () => {
+                await Connect();
+                if (!consoleAutoOpened && !offstage && !quitting && localRelayUp && CanUseDesktopConsole()
+                    && !Environment.GetCommandLineArgs().Contains("--classic")
+                    && !Environment.GetCommandLineArgs().Contains("--hidden")
+                    && String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("REMOTECLI_DATA"))) {
+                    consoleAutoOpened = true;
+                    try { BeginInvoke(new Action(() => OpenConsole())); } catch (InvalidOperationException) { }
+                }
+                await agent.Run();
+            });
             activityTimer.Start();
             if (!offstage && !Environment.GetCommandLineArgs().Contains("--hidden") && String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("REMOTECLI_DATA")) && Convert.ToString(config["ToolInstallSuggested"]).Length == 0) {
                 Keep("ToolInstallSuggested", true);
@@ -1043,8 +1352,13 @@ public sealed partial class App : Form {
             Keep("UpdateCheckUtc", DateTime.UtcNow.ToString("o"));
         }
         updateButton.Enabled = false; if (manual) Toast("正在检查 GitHub 最新版本…");
+        UpdateChecks.Answer answer = null;
         try {
-            ReleaseUpdate found = await AutoUpdater.CheckAsync(Version); availableUpdate = found;
+            answer = await updateChecks.Run(Convert.ToString(config["UpdateChannel"]));
+            // of the channel before: nothing is said of it, and the one chosen now is looked at instead (it could not be while this was under way)
+            if (!updateChecks.Holds(answer)) return;
+            if (answer.Error != null) { updateButton.Text = "检查更新"; if (manual) Toast("检查更新失败：" + answer.Error.Message); return; }
+            ReleaseUpdate found = answer.Update; availableUpdate = found;
             if (agent != null) agent.Newer = found == null ? "" : found.Version;
             if (found == null) { updateButton.Text = "已是最新版"; updateButton.Glyph = Theme.IconCheck; if (manual) Toast("已是最新版"); return; }
             updateButton.Text = "更新到 v" + found.Version; updateButton.Kind = ButtonKind.Primary; updateButton.Glyph = Theme.IconDownload; nav[3].SetBadge("新");
@@ -1052,7 +1366,8 @@ public sealed partial class App : Form {
             else if (step == "ask") {
                 // a terminal that is at work is said: the restart cuts into what it is doing, and it goes on with its conversation afterwards
                 bool working = agent != null && !agent.Quiet(20);
-                if (Confirm("发现新版本 v" + found.Version, (working ? "有终端正在工作，更新会打断它手上的这一步。" : "") + "现在下载并重启更新吗？手机会断开几秒，终端随后接回原对话，公网隧道的地址不变。", "下载并更新", false)) { waitingUpdate = null; updateButton.Enabled = true; await InstallUpdate(found); }
+                bool agreed = Confirm("发现新版本 v" + found.Version, (working ? "有终端正在工作，更新会打断它手上的这一步。" : "") + "现在下载并重启更新吗？手机会断开几秒，终端随后接回原对话，公网隧道的地址不变。", "下载并更新", false);
+                if (agreed && updateChecks.Holds(answer)) { waitingUpdate = null; updateButton.Enabled = true; await InstallUpdate(found); }     // (another channel may be chosen from the phone while the question is open)
             }
             // found by itself: said once for a version, in the window and at the tray; nothing is installed until someone asks
             else if (toldUpdate != found.Version) {
@@ -1061,15 +1376,18 @@ public sealed partial class App : Form {
                 if (!Visible) try { tray.ShowBalloonTip(6000, "Remote AI 有新版本 v" + found.Version, "打开窗口，在“设置”里更新。", ToolTipIcon.Info); } catch (InvalidOperationException) { }
             }
             ShowUpdate();
-        } catch (Exception error) { updateButton.Text = "检查更新"; if (manual) Toast("检查更新失败：" + error.Message); }
-        finally { updateButton.Enabled = true; }
+        } finally {
+            updateButton.Enabled = true;
+            if (answer != null && !updateChecks.Holds(answer)) CheckForUpdate(false);
+        }
     }
+    const string UpdateAbout = "从 GitHub 检查并安装；手机上也可发起";
     // What the row of the version says: that there is a newer one, or that one waits for the phone to finish changing the line.
     void ShowUpdate() {
         if (updateRow == null) return;
         if (waitingUpdate != null) updateRow.Say("v" + waitingUpdate.Version + " 在手机切换线路完成后安装", Theme.Busy);
         else if (availableUpdate != null) updateRow.Say("有新版本 v" + availableUpdate.Version, Theme.Busy);
-        else updateRow.Say("从 GitHub 发布页检查并安装；手机上也可以发起", Theme.Muted);
+        else updateRow.Say(UpdateAbout, Theme.Muted);
     }
     async Task InstallUpdate(ReleaseUpdate found) {
         if (Changing) { waitingUpdate = found; ShowUpdate(); Toast("手机正在切换连接线路，切换完成后自动更新"); return; }      // the program does not restart under a phone that is changing the line
@@ -1083,7 +1401,17 @@ public sealed partial class App : Form {
         } catch (Exception error) { updateButton.Enabled = true; updateButton.Text = "更新失败"; Say("更新失败：" + error.Message, true); }
     }
     void Reveal() { Show(); WindowState = FormWindowState.Normal; Activate(); }
-    void Shutdown() { generation++; tray.Visible = false; StopChildren(); Abandon(); }
+    void Shutdown() {
+        generation++;
+        if (systemEventsHooked) {
+            systemEventsHooked = false;
+            try { SystemEvents.PowerModeChanged -= OnPowerModeChanged; } catch { }
+            try { NetworkChange.NetworkAddressChanged -= OnNetworkAddressChanged; } catch { }
+        }
+        tray.Visible = false;
+        if (desktopConsole != null && !desktopConsole.IsDisposed) { desktopConsole.ForceClose(); desktopConsole = null; }
+        StopChildren(); Abandon();
+    }
     void Quit() {
         if (!Confirm("退出 Remote AI？", "退出后手机不能再连接，正在运行的终端会结束。", "退出", true)) return;
         quitting = true; Shutdown();
@@ -1094,7 +1422,11 @@ public sealed partial class App : Form {
     // under its label when it has one. Returns what was filled in, or null when the question was not agreed to.
     string[] Dialog(string title, string text, string yes, bool danger, string[] labels, string[] values) {
         using (var dialog = new Form { Text = "Remote AI", FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent,
-                                       MinimizeBox = false, MaximizeBox = false, ShowInTaskbar = false, Font = Theme.Text(), BackColor = Theme.Bg, ForeColor = Theme.Ink, AutoScaleMode = AutoScaleMode.None, Icon = Icon }) {
+                                       MinimizeBox = false, MaximizeBox = false, ShowInTaskbar = false, Font = Theme.Text(), BackColor = Theme.Bg, ForeColor = Theme.Ink }) {
+            dialog.SuspendLayout();
+            dialog.AutoScaleDimensions = new SizeF(96, 96);
+            dialog.AutoScaleMode = AutoScaleMode.Dpi;
+            Theme.ApplyIcon(dialog);
             dialog.HandleCreated += (s, e) => Theme.Title(dialog.Handle);
             Place(dialog, Theme.Label(title, Theme.Ink, Theme.Bg, 11.5f, true), 24, 22, 372, 26);
             Place(dialog, Theme.Label(text, Theme.Muted, Theme.Bg), 24, 52, 372, 40);
@@ -1113,15 +1445,17 @@ public sealed partial class App : Form {
             int wide = yes.Length > 4 ? 128 : 96;
             Place(dialog, cancel, 396 - wide - 8 - 96, y, 96, 34); Place(dialog, ok, 396 - wide, y, wide, 34);
             dialog.AcceptButton = ok; dialog.CancelButton = cancel;
-            using (var g = dialog.CreateGraphics()) { float factor = g.DpiX / 96f; if (factor > 1.01f) dialog.Scale(new SizeF(factor, factor)); }
+            dialog.ResumeLayout(true);
             if (boxes.Count > 0) dialog.Shown += (s, e) => { boxes[0].Box.Focus(); boxes[0].Box.SelectAll(); };
-            return dialog.ShowDialog(Visible ? this : null) == DialogResult.OK ? boxes.Select(b => b.Box.Text).ToArray() : null;
+            IWin32Window owner = Visible
+                ? (IWin32Window)this
+                : (desktopConsole != null && !desktopConsole.IsDisposed && desktopConsole.Visible ? (IWin32Window)desktopConsole : null);
+            return dialog.ShowDialog(owner) == DialogResult.OK ? boxes.Select(b => b.Box.Text).ToArray() : null;
         }
     }
     bool Confirm(string title, string text, string yes, bool danger) { return Dialog(title, text, yes, danger, null, null) != null; }
     string Ask(string title, string text, string value) { var filled = Dialog(title, text, "确定", false, new[] { "" }, new[] { value }); return filled == null ? "" : filled[0]; }
 
-    [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
     [STAThread] public static int Main(string[] args) {
         // --qr <text> <file.png>: writes the picture the window would show; used by the tests.
         if (args.Length == 3 && args[0] == "--qr") { using (var picture = Picture(args[1], 8)) { if (picture == null) return 2; picture.Save(args[2], ImageFormat.Png); } return 0; }
@@ -1131,7 +1465,6 @@ public sealed partial class App : Form {
         using (var single = new Mutex(true, "Local\\RemoteCliApp" + (String.IsNullOrWhiteSpace(elsewhere) ? "" : "-" + Math.Abs(elsewhere.ToLowerInvariant().GetHashCode())), out created)) {
             if (!created) { MessageBox.Show("Remote AI 已经在运行，请看屏幕右下角的托盘图标。", "Remote AI"); return 0; }
             ServicePointManager.DefaultConnectionLimit = 8;      // the held request and the reports run side by side
-            SetProcessDPIAware();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             if (args.Length >= 2 && args[0] == "--screenshot") ComputerName = "my-computer";       // a published picture must not carry this computer's name
@@ -1191,6 +1524,19 @@ public sealed partial class App : Form {
             // --offstage: the program runs as usual where nobody sees it or can press it, for a test that plays the phone.
             if (args.Contains("--offstage")) { offstage = true; window.StartPosition = FormStartPosition.Manual; window.Location = new Point(-30000, -30000); window.ShowInTaskbar = false; window.tray.Visible = false; }
             if (args.Contains("--hidden")) { window.WindowState = FormWindowState.Minimized; window.ShowInTaskbar = false; window.Shown += (s, e) => { window.Hide(); window.ShowInTaskbar = true; }; }
+            else if (!args.Contains("--offstage") && !args.Contains("--classic") && String.IsNullOrWhiteSpace(elsewhere) && CanUseDesktopConsole()) {
+                // Direct desktop console launch: keep the legacy QR/settings dialog hidden until requested.
+                window.WindowState = FormWindowState.Minimized;
+                window.ShowInTaskbar = false;
+                window.Opacity = 0;
+                window.Shown += (s, e) => {
+                    window.Hide();
+                    window.ShowInTaskbar = true;
+                    window.Opacity = 1;
+                    window.WindowState = FormWindowState.Normal;
+                    window.EnsureDesktopConsoleVisible();
+                };
+            }
             Application.Run(window);
         }
         return 0;

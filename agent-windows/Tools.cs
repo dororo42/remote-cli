@@ -10,8 +10,11 @@ namespace RemoteCli {
 /// One object per tool; the agent asks it and does not compare tool names. A tool that is added is one more class
 /// here and one entry in `All` (and its lines in `Ways.Of`, its reading of the lists, its chat driver).
 public abstract class Tool {
-    public static readonly Tool Claude = new ClaudeTool(), Codex = new CodexTool(), Agy = new AgyTool(), Shell = new ShellTool();
-    public static readonly Tool[] All = { Claude, Codex, Agy, Shell };
+    public static readonly Tool Claude = new ClaudeTool(), Codex = new CodexTool(), Agy = new AgyTool(),
+        Gemini = new GeminiTool(), OpenCode = new OpenCodeTool(), Cursor = new CursorTool(),
+        Qoder = new QoderTool(), Cline = new ClineTool(), Pi = new PiTool(),
+        Kiro = new KiroTool(), Copilot = new CopilotTool(), Shell = new ShellTool();
+    public static readonly Tool[] All = { Claude, Codex, Agy, Gemini, OpenCode, Cursor, Qoder, Cline, Pi, Kiro, Copilot, Shell };
 
     /// The tool by its name, null for one that is not known.
     public static Tool Of(string name) { return All.FirstOrDefault(t => t.Name == name); }
@@ -26,6 +29,8 @@ public abstract class Tool {
 
     public abstract string Name { get; }
     public abstract string Label { get; }
+    /// Executable base names to probe on PATH (without .exe/.cmd).
+    public virtual string[] Binaries { get { return new[] { Name }; } }
     /// Keeps conversations under an id that can be gone on with (a shell keeps none).
     public virtual bool Converses { get { return true; } }
     /// Runs as a conversation through its structured mode too (Chats.cs).
@@ -50,7 +55,7 @@ public abstract class Tool {
     }
 
     /// What follows the program's path on its command line.
-    public abstract string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh);
+    public abstract string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh, string model = "", string effort = "");
     /// The file it keeps a conversation in, as far as it can say without the reading of the lists; null where none.
     public virtual string Transcript(string session, string root) { return null; }
     /// Whether a program on this computer has the conversation open now.
@@ -89,9 +94,11 @@ sealed class ClaudeTool : Tool {
         }
     }
 
-    public override string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh) {
+    public override string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh, string model = "", string effort = "") {
         return (session.Length > 0 ? (fresh ? " --session-id " : " --resume ") + session : history ? " --resume" : "")
-            + (mode == "read" ? " --permission-mode plan" : mode == "edit" ? " --permission-mode acceptEdits" : "");
+            + (mode == "read" ? " --permission-mode plan" : mode == "edit" ? " --permission-mode acceptEdits" : "")
+            + (!String.IsNullOrEmpty(model) ? " --model " + model : "")
+            + (!String.IsNullOrEmpty(effort) ? " --effort " + effort : "");
     }
     public override string Transcript(string session, string root) {
         string file = Path.Combine(ClaudeSessions.Home, "projects", TerminalAgent.ProjectFolder(root), session + ".jsonl");
@@ -140,9 +147,11 @@ sealed class CodexTool : Tool {
         foreach (var item in waiting) reach.Outbox.Deliver(item.Id, text => CodexQueue.Send(launcher, session, text));
     }
 
-    public override string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh) {
+    public override string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh, string model = "", string effort = "") {
         return (session.Length > 0 ? (fork ? " fork " : " resume ") + session : history ? " resume --include-non-interactive" : "")
-            + (noDaemon ? " --no-daemon" : "") + (mode == "read" ? " -s read-only" : mode == "edit" ? " -s workspace-write" : "");
+            + (noDaemon ? " --no-daemon" : "") + (mode == "read" ? " -s read-only" : mode == "edit" ? " -s workspace-write" : "")
+            + (!String.IsNullOrEmpty(model) ? " -m " + model : "")
+            + (!String.IsNullOrEmpty(effort) ? " -c model_reasoning_effort=" + effort : "");
     }
     public override string Transcript(string session, string root) {
         string folder = Path.Combine(CodexSessions.Home, "sessions");
@@ -171,9 +180,11 @@ sealed class AgyTool : Tool {
     public override Chat CreateChat(string folder, Action<string> emit) { return new AgyChat(folder, emit); }
 
     // Its own choice of mode stays: Remote AI's read/edit modes are not given to it.
-    public override string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh) {
+    public override string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh, string model = "", string effort = "") {
         if (history || fork || fresh) throw new ArgumentException("请在 Antigravity CLI 内选择历史对话");
-        return session.Length > 0 ? " --conversation " + session : "";
+        return (session.Length > 0 ? " --conversation " + session : "")
+            + (!String.IsNullOrEmpty(model) ? " --model " + model : "")
+            + (!String.IsNullOrEmpty(effort) ? " --effort " + effort : "");
     }
     public override string Transcript(string session, string root) { return Antigravity.TranscriptPath(session); }
     public override bool Open(string session) { return AgySessions.Inspect(session).Live; }
@@ -189,10 +200,81 @@ sealed class AgyTool : Tool {
     public override void End(string session, int[] roots, Dictionary<int, int> parents) { AgySessions.Takeover(session, roots, parents); }
 }
 
+sealed class GeminiTool : Tool {
+    public override string Name { get { return "gemini"; } }
+    public override string Label { get { return "Gemini CLI"; } }
+    public override bool Converses { get { return false; } }
+    public override string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh, string model = "", string effort = "") {
+        return (history ? " --resume" : "")
+            + (mode == "read" ? " --approval-mode plan" : mode == "edit" ? " --approval-mode auto_edit" : "")
+            + (!String.IsNullOrEmpty(model) ? " -m " + model : "");
+    }
+}
+
+sealed class OpenCodeTool : Tool {
+    public override string Name { get { return "opencode"; } }
+    public override string Label { get { return "OpenCode"; } }
+    public override bool Converses { get { return false; } }
+    public override string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh, string model = "", string effort = "") {
+        return (!String.IsNullOrEmpty(model) ? " -m " + model : "");
+    }
+}
+
+sealed class CursorTool : Tool {
+    public override string Name { get { return "cursor"; } }
+    public override string Label { get { return "Cursor Agent"; } }
+    public override string[] Binaries { get { return new[] { "cursor-agent", "agent" }; } }
+    public override bool Converses { get { return false; } }
+    public override string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh, string model = "", string effort = "") {
+        return (!String.IsNullOrEmpty(model) ? " --model " + model : "");
+    }
+}
+
+sealed class QoderTool : Tool {
+    public override string Name { get { return "qoder"; } }
+    public override string Label { get { return "Qoder"; } }
+    public override string[] Binaries { get { return new[] { "qodercli", "qoder" }; } }
+    public override bool Converses { get { return false; } }
+    public override string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh, string model = "", string effort = "") {
+        return (mode == "read" ? " --permission-mode plan" : mode == "edit" ? " --permission-mode accept_edits" : "");
+    }
+}
+
+sealed class ClineTool : Tool {
+    public override string Name { get { return "cline"; } }
+    public override string Label { get { return "Cline"; } }
+    public override bool Converses { get { return false; } }
+    public override string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh, string model = "", string effort = "") {
+        return mode == "read" ? " --plan" : "";
+    }
+}
+
+sealed class PiTool : Tool {
+    public override string Name { get { return "pi"; } }
+    public override string Label { get { return "Pi"; } }
+    public override bool Converses { get { return false; } }
+    public override string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh, string model = "", string effort = "") { return ""; }
+}
+
+sealed class KiroTool : Tool {
+    public override string Name { get { return "kiro"; } }
+    public override string Label { get { return "Kiro CLI"; } }
+    public override string[] Binaries { get { return new[] { "kiro-cli", "kiro" }; } }
+    public override bool Converses { get { return false; } }
+    public override string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh, string model = "", string effort = "") { return ""; }
+}
+
+sealed class CopilotTool : Tool {
+    public override string Name { get { return "copilot"; } }
+    public override string Label { get { return "Copilot CLI"; } }
+    public override bool Converses { get { return false; } }
+    public override string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh, string model = "", string effort = "") { return ""; }
+}
+
 sealed class ShellTool : Tool {
     public override string Name { get { return "shell"; } }
     public override string Label { get { return "PowerShell"; } }
     public override bool Converses { get { return false; } }
-    public override string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh) { return " -NoLogo -NoExit"; }
+    public override string Arguments(string session, bool history, string mode, bool fork, bool noDaemon, bool fresh, string model = "", string effort = "") { return " -NoLogo -NoExit"; }
 }
 }

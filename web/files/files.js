@@ -17,6 +17,9 @@
   const sheetOfPaper = '<path d="M7 3.5h7l4.5 4.5v11a1.5 1.5 0 0 1-1.5 1.5H7A1.5 1.5 0 0 1 5.5 19V5A1.5 1.5 0 0 1 7 3.5z"/><path d="M14 3.5V8h4.5"/>';
   const ICON = {
     back: svg('<path d="M15 5l-7 7 7 7"/>'), more: svg('<circle cx="5" cy="12" r="1.3" fill="currentColor"/><circle cx="12" cy="12" r="1.3" fill="currentColor"/><circle cx="19" cy="12" r="1.3" fill="currentColor"/>'),
+    upload: svg('<path d="M12 15.5V4.5M7.5 9L12 4.5 16.5 9M4.5 15.5v2.5a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-2.5"/>', 20),
+    download: svg('<path d="M12 4.5v11M7.5 11L12 15.5 16.5 11M4.5 16v2a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-2"/>', 18),
+    close: svg('<path d="M7 7l10 10M17 7L7 17"/>', 16),
     chev: svg('<path d="M9 6l6 6-6 6"/>', 18),
     folder: svg('<path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2.2h7a2 2 0 0 1 2 2v7.8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>'),
     code: svg('<path d="M8.5 8l-4 4 4 4M15.5 8l4 4-4 4M13.2 5.5l-2.4 13"/>'),
@@ -46,17 +49,6 @@
   }
   let toastTimer = 0;
   function toast(text) { const box = $('toast'); box.textContent = text; box.hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => { box.hidden = true; }, 3000); }
-  function choose(title, choices) {
-    const form = $('sheet-form'), sheet = $('sheet');
-    form.textContent = '';
-    form.append(el('h3', { textContent: title }));
-    choices.forEach(c => form.append(el('button', { type: 'button', className: 'choice', onclick: () => { sheet.close(); c.act(); } },
-      el('span', null, c.label, c.sub ? el('small', { textContent: c.sub }) : ''), c.on ? el('i', { className: 'tick', textContent: '✓' }) : '')));
-    form.append(el('button', { type: 'button', className: 'cancel', textContent: '取消', onclick: () => sheet.close() }));
-    sheet.onclick = event => { if (event.target === sheet) sheet.close(); };
-    sheet.showModal();
-  }
-
   // ---- look
   const TEXT = { small: '14px', normal: '15.5px', large: '17px', larger: '19px' };
   function paintFiles() {
@@ -73,10 +65,7 @@
   }
   paintFiles();
   if (window.RemoteCliOnSystemTheme) window.RemoteCliOnSystemTheme(paintFiles);
-  const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.content = skin.t.background;
-  if (native && native.chrome) native.chrome(skin.t.background);
-  $('back').innerHTML = ICON.back; $('more').innerHTML = ICON.more;
+  $('back').innerHTML = ICON.back; $('upload').innerHTML = ICON.upload; $('more').innerHTML = ICON.more; $('transfer-close').innerHTML = ICON.close;
 
   // ---- asking the computer
   let run = 0;        // what is shown now; an answer for something left behind is dropped
@@ -152,8 +141,23 @@
   const from = asked.get('from') === 'terminal' ? 'terminal' : '';
   const address = p => '?dir=' + encodeURIComponent(dir) + (from ? '&from=' + from : '') + (p.path ? '&path=' + encodeURIComponent(p.path) : '') + (p.file ? '&file=' + encodeURIComponent(p.file) : '');
   const join = (folder, name) => folder ? folder + '/' + name : name;
-  function go(next) { next.depth = ((history.state && history.state.depth) || 0) + 1; place = next; history.pushState(next, '', address(next)); scrollTo(0, 0); show(); }
-  window.addEventListener('popstate', event => { place = event.state || { path: asked.get('path') || '', file: asked.get('file') || '' }; show(); });
+  function go(next) {
+    const folderChanged = next.path !== place.path;
+    next.depth = ((history.state && history.state.depth) || 0) + 1;
+    place = next;
+    if (folderChanged) $('search').value = '';
+    history.pushState(next, '', address(next));
+    scrollTo(0, 0);
+    show();
+  }
+  window.addEventListener('popstate', event => {
+    if (event.state && event.state.rs) return;                                    // a step of the open sheet's
+    const prevPath = place.path, next = event.state || { path: asked.get('path') || '', file: asked.get('file') || '' };
+    if (next.path === place.path && next.file === place.file) return;             // the sheet's steps undone: still here
+    place = next;
+    if (place.path !== prevPath) $('search').value = '';
+    show();
+  });
   $('back').addEventListener('click', () => {
     if (history.state) return history.back();                                     // a step taken on this page
     if (place.file) return go({ path: place.path, file: '' });                   // a file opened by a link: its folder
@@ -164,8 +168,8 @@
   function leave() { if (from && history.length > 1) history.back(); else location.href = '../?project=' + encodeURIComponent(dir); }
   function show() {
     run++;
-    $('download').hidden = !place.file;
     $('upload').hidden = !!place.file;
+    if (!saving && !uploading) { $('transfer').hidden = true; $('transfer').classList.remove('error'); }
     $('problem').hidden = true; $('progress').hidden = true;
     for (const url of handed.splice(0)) URL.revokeObjectURL(url);
     if (place.file) showFile(run); else showFolder(run);
@@ -202,13 +206,15 @@
   }
   function crumbs() {
     const parts = place.path ? place.path.split('/') : [], nav = $('crumbs');
-    nav.replaceChildren(el('button', { type: 'button', textContent: dir, disabled: !parts.length, onclick: () => go({ path: '', file: '' }) }));
+    nav.hidden = !parts.length;
+    if (!parts.length) { nav.replaceChildren(); return; }
+    nav.replaceChildren(el('button', { type: 'button', textContent: dir, onclick: () => go({ path: '', file: '' }) }));
     parts.forEach((name, at) => nav.append(el('span', { html: ICON.chev }), el('button', { type: 'button', textContent: name, disabled: at === parts.length - 1,
       onclick: () => go({ path: parts.slice(0, at + 1).join('/'), file: '' }) })));
     nav.scrollLeft = nav.scrollWidth;
   }
   async function showFolder(mine) {
-    $('file').hidden = true; $('folder').hidden = false; $('tabs').hidden = true;
+    $('file').hidden = true; $('folder').hidden = false; $('views').hidden = true;
     $('heading').textContent = place.path ? place.path.split('/').pop() : dir;
     document.title = $('heading').textContent + ' · 文件';
     crumbs();
@@ -348,7 +354,7 @@
     return box;
   }
   function tabs(list, start) {
-    const bar = $('tabs');
+    const bar = $('views');
     bar.hidden = list.filter(t => t.label).length < 2;
     const pick = async at => {
       Array.from(bar.children).forEach((b, n) => b.setAttribute('aria-selected', String(n === at)));
@@ -360,11 +366,11 @@
   }
   async function showFile(mine) {
     const path = join(place.path, place.file), kind = K.kind(place.file);
-    $('folder').hidden = true; $('file').hidden = false; $('tabs').hidden = true;
+    $('folder').hidden = true; $('file').hidden = false; $('views').hidden = true;
     $('view').textContent = ''; $('loading').hidden = false;
     $('heading').textContent = place.file; $('where').textContent = '';
     document.title = place.file + ' · 文件';
-    current = { path, kind, bytes: null, text: null };
+    current = { path, kind, bytes: null, text: null, unpreviewable: false, hasCode: false };
     try {
       // A file of a kind this page does not know is looked at by its first piece: text is shown, anything else is named.
       const first = await ask('file_read', path, 0);
@@ -372,9 +378,10 @@
       $('where').textContent = K.size(first.size) + ' · ' + ago(first.modified);
       let view = kind.view, language = kind.language;
       if (!view && K.readable(bytesOf(first.data))) { view = 'code'; language = 'plaintext'; }
-      if (!view) { $('loading').hidden = true; return $('view').replaceChildren(unknown(first.size, '这种文件不能在这里预览。')); }
+      if (!view) { current.unpreviewable = true; $('loading').hidden = true; return $('view').replaceChildren(unknown(first.size, '这种文件不能在这里预览。')); }
       const limit = kind.limit || 3e6;
-      if (first.size > limit) { $('loading').hidden = true; return $('view').replaceChildren(unknown(first.size, '文件有 ' + K.size(first.size) + '，超过了预览的上限 ' + K.size(limit) + '。')); }
+      if (first.size > limit) { current.unpreviewable = true; $('loading').hidden = true; return $('view').replaceChildren(unknown(first.size, '文件有 ' + K.size(first.size) + '，超过了预览的上限 ' + K.size(limit) + '。')); }
+      current.hasCode = view === 'code' || view === 'markdown' || kind.ext === 'svg';
       const got = await read(path, limit, mine, first);
       if (mine !== run) return;
       current.bytes = got.bytes;
@@ -406,20 +413,37 @@
   // phone's Download folder, each piece handed on as it arrives; in a browser as an ordinary download.
   const SAVE_LIMIT = 300 * 1024 * 1024;
   let saving = false, uploading = null, cancelled = false, pickedFolder = '';
+  function setBusy(busy) {
+    $('upload').disabled = busy;
+    const saveButton = document.querySelector('.unknown button');
+    if (saveButton) saveButton.disabled = busy;
+  }
   function transfer(text, at, size) {
-    $('transfer').hidden = false;
+    const box = $('transfer');
+    box.hidden = false;
+    box.classList.remove('error');
+    $('transfer-text').setAttribute('role', 'status');
     $('transfer-text').textContent = text;
+    $('transfer-close').hidden = true;
     $('transfer-bar').hidden = false;
     $('transfer-bar').value = Math.round(100 * at / Math.max(1, size));
     $('transfer-cancel').hidden = false;
-    $('upload').disabled = $('download').disabled = true;
+    setBusy(true);
   }
-  function transferDone(text) {
-    $('transfer').hidden = false;
+  function transferDone(text, failed) {
+    const box = $('transfer');
+    box.hidden = false;
+    box.classList.toggle('error', !!failed);
+    $('transfer-text').setAttribute('role', failed ? 'alert' : 'status');
     $('transfer-text').textContent = text;
     $('transfer-bar').hidden = $('transfer-cancel').hidden = true;
-    $('upload').disabled = $('download').disabled = false;
+    $('transfer-close').hidden = false;
+    setBusy(false);
   }
+  $('transfer-close').onclick = () => {
+    $('transfer').hidden = true;
+    $('transfer').classList.remove('error');
+  };
   $('transfer-cancel').onclick = () => {
     cancelled = true;
     if (uploading) uploading.cancel();
@@ -446,10 +470,9 @@
       uploading = null;
       folders.delete(folder);
       if (!place.file && place.path === folder) show();
-      transferDone('已上传 ' + done + '/' + files.length + ' 个文件到 ' + join(dir, folder) + (failure ? '。' + failure : '。'));
+      transferDone('已上传 ' + done + '/' + files.length + ' 个文件到 ' + join(dir, folder) + (failure ? '。' + failure : '。'), !!failure && !cancelled);
     }
   };
-  $('download').onclick = save;
   window.addEventListener('beforeunload', event => {
     if (saving || uploading) { event.preventDefault(); event.returnValue = ''; }
   });
@@ -459,7 +482,7 @@
     const path = join(place.path, place.file), name = place.file, parts = [];
     saving = true; cancelled = false; $('transfer-cancel').disabled = false;
     transfer('正在准备下载 ' + name, 0, 1);
-    let outcome = '';
+    let outcome = '', failed = false;
     try {
       let piece = await ask('file_read', path, 0), at = 0;
       const size = piece.size, modified = piece.modified;
@@ -478,7 +501,7 @@
       if (native) {
         const where = native.saveEnd();
         if (!where) throw new Error('没有保存成功，请检查手机的存储空间');
-        choose('已保存到手机', [{ label: '打开', sub: '用手机上的应用打开 ' + name, act: () => native.openSaved() }, { label: '知道了', sub: '文件在：' + where, act: () => {} }]);
+        savedSheet(name, where);
       } else {
         const url = URL.createObjectURL(new Blob(parts, { type: 'application/octet-stream' }));
         el('a', { href: url, download: name }).click();
@@ -488,25 +511,61 @@
     } catch (error) {
       if (native && native.saveCancel) native.saveCancel();
       outcome = error.message || '没有保存';
-    } finally { saving = false; transferDone(outcome); }
+      failed = !cancelled;
+    } finally { saving = false; transferDone(outcome, failed); }
   }
 
-  // ---- the menu
-  $('more').addEventListener('click', () => {
-    const list = [];
-    if (place.file) {
-      if (current && (current.kind.view === 'code' || current.kind.view === 'markdown' || current.kind.ext === 'svg' || !current.kind.view))
-        list.push({ label: '长行自动换行', sub: '关闭时可以左右滑动看完整的一行', on: wrap, act: () => { wrap = !wrap; keep('files-wrap', wrap ? '1' : ''); document.querySelectorAll('.code').forEach(c => c.classList.toggle('wrap', wrap)); } });
-      list.push({ label: '复制文件路径', sub: join(dir, join(place.path, place.file)), act: async () => { try { await navigator.clipboard.writeText(join(place.path, place.file)); toast('已复制'); } catch (error) { toast('这里不能复制'); } } });
-      list.push({ label: native ? '保存到手机' : '保存到这台设备', sub: native ? '放进手机的“下载 / RemoteAI”，之后可以用别的应用打开' : '作为浏览器的下载', act: save });
-    } else {
-      [['name', '按名称排列'], ['time', '最近修改的在前'], ['size', '最大的在前']].forEach(([key, label]) => list.push({ label, on: sort === key, act: () => { sort = key; keep('files-sort', key); show(); } }));
-      list.push({ label: '显示隐藏的文件', sub: '以 . 开头的和系统隐藏的', on: hidden, act: () => { hidden = !hidden; keep('files-hidden', hidden ? '1' : ''); show(); } });
-    }
-    if (from) list.push({ label: '回到终端', sub: '终端一直在电脑上运行', act: () => { const steps = (history.state && history.state.depth) || 0; history.go(-steps - 1); } });
-    list.push({ label: '回到项目', sub: dir, act: () => { location.href = '../?project=' + encodeURIComponent(dir); } });
-    choose(place.file ? '文件' : '文件夹', list);
-  });
+  // ---- the menu, and what is said after saving: pages of the sheet the other pages use (../ui/sheet.js)
+  function savedSheet(name, where) {
+    const kit = window.RemoteSheet.ui;
+    window.RemoteSheet.open({ title: '已保存到手机', build(p) {
+      p.body.append(kit.summary(name + '\n' + where, '', 'folder'));
+      const open = kit.go('用手机上的应用打开', async () => { p.sheet.close(null); native.openSaved(); }, { id: 'saved-open' });
+      p.foot.append(...open.nodes);
+    } });
+  }
+  function menuPage(depth) {
+    const kit = window.RemoteSheet.ui;
+    const rowsGroup = (...rows) => {
+      const box = kit.group(...rows);
+      if (rows.length > 1) box.classList.add('inset');
+      return box;
+    };
+    return { title: place.file ? '文件' : '文件夹', build(p) {
+      if (place.file) {
+        const actions = [];
+        if (!current || !current.unpreviewable) {
+          actions.push(kit.row({ icon: 'download', tint: 'file', html: ICON.download, label: native ? '保存到手机' : '下载文件', id: 'menu-download', disabled: saving || !!uploading, act: () => {
+            p.sheet.close(null);
+            save();
+          } }));
+        }
+        actions.push(kit.row({ icon: 'copy', tint: 'copy', label: '复制路径', id: 'menu-copy', act: async () => {
+          p.sheet.close(null);
+          toast(await window.RemoteSheet.copy(join(place.path, place.file)) ? '已复制' : '这里不能复制');
+        } }));
+        p.body.append(kit.section('文件操作', rowsGroup(...actions)));
+        if (current && current.hasCode) {
+          p.body.append(kit.section('阅读', rowsGroup(kit.row({
+            icon: 'lines', tint: 'muted', label: '长行自动换行', id: 'menu-wrap',
+            end: kit.toggle(wrap, on => { wrap = on; keep('files-wrap', on ? '1' : ''); document.querySelectorAll('.code').forEach(c => c.classList.toggle('wrap', on)); }, '长行自动换行')
+          }))));
+        }
+      } else {
+        p.body.append(kit.section('排列', kit.seg([['name', '名称'], ['time', '修改时间'], ['size', '大小']], sort, key => { sort = key; keep('files-sort', key); show(); }, { label: '排列', full: true })));
+        p.body.append(kit.section('列表', rowsGroup(
+          kit.row({ icon: 'hide', tint: 'muted', label: '显示隐藏的文件', id: 'menu-hidden', end: kit.toggle(hidden, on => { hidden = on; keep('files-hidden', on ? '1' : ''); show(); }, '显示隐藏的文件') }),
+          kit.row({ icon: 'refresh', tint: 'muted', label: '刷新', id: 'menu-refresh', act: () => { p.sheet.close(null); folders.delete(place.path); show(); toast('正在刷新…'); } })
+        )));
+      }
+      const away = [];
+      // back to the terminal: the steps taken on this page, the sheet's own, and the one that came here
+      if (from) away.push(kit.row({ icon: 'term', tint: 'good', label: '回到终端', id: 'menu-terminal', act: () => { const steps = depth + p.sheet.entries + 1; p.sheet.close(null, true); history.go(-steps); } }));
+      away.push(kit.row({ icon: 'folder', tint: 'file', label: '回到项目', value: dir, id: 'menu-project', act: () => { p.sheet.close(null, true); location.href = '../?project=' + encodeURIComponent(dir); } }));
+      p.body.append(kit.section('返回', rowsGroup(...away)));
+    } };
+  }
+  $('more').addEventListener('click', () => window.RemoteSheet.open(menuPage((history.state && history.state.depth) || 0), place.file ? '文件选项' : '文件夹选项'));
 
   if (!dir) location.replace('../'); else show();
 })();

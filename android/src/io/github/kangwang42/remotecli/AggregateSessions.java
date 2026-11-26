@@ -34,9 +34,41 @@ final class AggregateSessions {
          * A conversation that a program on the computer has open, of which its tool tells (the relay's `reach`): it
          * is at work there like a terminal, and stands among the tasks by how it stands. canSay: a message can be left for it.
          */
-        boolean reached, canSay, canTakeover;
+        boolean reached, canSay, canTakeover, canAnswer;
         String endWay;          // null for older computers without per-action capabilities
+        String askId = "", askText = "", answerWay = "";
+        /** Collaboration task parent card fields (`device.team_cards`), and child membership (`team`). */
+        boolean team, teamConfirm;
+        String teamId = "", teamMode = "", teamPhase = "", teamNote = "";
+        final List<String> teamTools = new ArrayList<>(), teamAwaited = new ArrayList<>();
+        final Map<String, String> teamModels = new LinkedHashMap<>();
+        /** Whether this entry matches a tool filter ("" for any). */
+        boolean matchesTool(String filterTool) {
+            if (filterTool == null || filterTool.isEmpty()) return true;
+            return team ? teamTools.contains(filterTool) : filterTool.equals(displayTool());
+        }
+        static Entry teamCard(String id, String dir, String goal, String mode, String state, String phase,
+                              String note, long updated, boolean confirm, List<String> tools,
+                              Map<String, String> models, List<String> awaited) {
+            long updatedMs = updated > 0 && updated < 10_000_000_000L ? updated * 1000L : updated;
+            String primaryTool = tools == null || tools.isEmpty() ? "" : tools.get(0);
+            boolean active = confirm || "running".equals(state) || "choose".equals(state) || "paused".equals(state);
+            Entry e = new Entry(false, id == null ? "" : id, dir == null ? "" : dir, goal == null ? "" : goal,
+                primaryTool, state == null ? "" : state, phase == null ? "" : phase, "", active, "", "", "", false, updatedMs);
+            e.team = true;
+            e.teamMode = mode == null ? "" : mode;
+            e.teamPhase = phase == null ? "" : phase;
+            e.teamNote = note == null ? "" : note;
+            e.teamConfirm = confirm;
+            e.said = e.teamNote;
+            e.used = updatedMs;
+            if (tools != null) e.teamTools.addAll(tools);
+            if (models != null) e.teamModels.putAll(models);
+            if (awaited != null) e.teamAwaited.addAll(awaited);
+            return e;
+        }
         boolean canEnd(boolean supported) {
+            if (team) return false;
             return terminal ? running() : supported && live && attached.isEmpty() && (endWay == null ? canTakeover : "process".equals(endWay));
         }
         /**
@@ -52,6 +84,9 @@ final class AggregateSessions {
         String folder = "";
         /** What the owner said of the conversation, kept by the computer: it stands first, or is left out of the lists. */
         boolean pinned, hidden;
+        String organizedTitle = "", originalTitle = "", organizeSummary = "";
+        List<String> organizeTags = Collections.emptyList();
+        boolean followUp;
         boolean apart() { return project.isEmpty() && !folder.isEmpty(); }
         /** Where it is, in a word: its project, or the name of the folder it is open in. */
         String place() {
@@ -65,13 +100,14 @@ final class AggregateSessions {
          * app, an editor). One that no program has open is told by what started it; "" where the computer does not say.
          */
         String source() {
+            if (team) return "app";
             if (terminal) return chat ? "app" : "term";
             // the computer says by what it is used (a command line inside an editor's terminal is a terminal's)
             if (!live || !kind.isEmpty()) return sourceOfKind(kind);
             return origin.contains("桌面版") || origin.contains("后台服务") || "shared".equals(host) || (!origin.isEmpty() && !"命令行".equals(origin) && !"电脑独立终端".equals(origin)) ? "app" : "term";
         }
         /** The conversation a mark is kept of: a terminal's own, or the saved one itself; "" for a terminal without one. */
-        String conversation() { return terminal ? session : id; }
+        String conversation() { return team ? "" : terminal ? session : id; }
         Entry(boolean terminal, String id, String project, String title, String tool, String state,
               String phase, String status, boolean live, String host, String attached, String session) {
             this(terminal, id, project, title, tool, state, phase, status, live, host, attached, session, false, 0);
@@ -85,9 +121,13 @@ final class AggregateSessions {
             this.done = done; this.at = at;
         }
         boolean running() {
+            if (team) return teamConfirm || "choose".equals(state) || "running".equals(state);
             return terminal ? "running".equals(state) || "starting".equals(state) : live && now && ("cli".equals(host) || reached);
         }
-        boolean open() { return terminal ? running() : live; }
+        boolean open() {
+            if (team) return teamConfirm || "choose".equals(state) || "running".equals(state) || "paused".equals(state);
+            return terminal ? running() : live;
+        }
         /**
          * A phone terminal is confirm, done, busy, starting, idle or ended; a saved conversation is pc-busy, pc-idle,
          * held (a program has it and nobody is at it), locked, remote, unknown or history, and one whose tool tells of it is confirm, waiting (it has stopped and
@@ -95,6 +135,7 @@ final class AggregateSessions {
          * finished work is "done" until then, as in the pages.
          */
         String kind(Map<String, Long> seen) {
+            if (team) return teamKind(state, teamPhase, teamConfirm);
             if (!terminal) {
                 if (!live) return "history";
                 if (!now) return "held";
@@ -122,11 +163,64 @@ final class AggregateSessions {
             return tool;
         }
         String toolName() { String shown = displayTool(); return "shell".equals(shown) ? (shell.isEmpty() ? "PowerShell" : shell) : AggregateSessions.toolName(shown); }
-        String shownTitle() { return title.isEmpty() ? toolName() : title; }
+        String shownTitle() { return !organizedTitle.isEmpty() ? organizedTitle : title.isEmpty() ? (team ? "协作任务" : toolName()) : title; }
+    }
+    static String teamModeLabel(String mode) {
+        if ("lead".equals(mode)) return "分工协作";
+        if ("compare".equals(mode)) return "比稿";
+        return "写审";
+    }
+    static String teamWho(Entry entry) {
+        StringBuilder sb = new StringBuilder("协作 · ").append(teamModeLabel(entry.teamMode));
+        if (!entry.teamTools.isEmpty()) {
+            sb.append(" · ");
+            if ("review".equals(entry.teamMode) && entry.teamTools.size() >= 2) {
+                sb.append(toolName(entry.teamTools.get(0))).append(" 写 · ").append(toolName(entry.teamTools.get(1))).append(" 审");
+            } else if ("compare".equals(entry.teamMode)) {
+                for (int i = 0; i < entry.teamTools.size(); i++) {
+                    if (i > 0) sb.append(" vs ");
+                    sb.append(toolName(entry.teamTools.get(i)));
+                }
+            } else {
+                sb.append(toolName(entry.teamTools.get(0)));
+                if (entry.teamTools.size() > 1) {
+                    sb.append(" 带 ");
+                    for (int i = 1; i < entry.teamTools.size(); i++) {
+                        if (i > 1) sb.append("、");
+                        sb.append(toolName(entry.teamTools.get(i)));
+                    }
+                }
+            }
+        }
+        return sb.toString();
+    }
+    static String teamKind(String state, String phase, boolean confirm) {
+        if (confirm) return "confirm";
+        switch (state) {
+            case "choose": return "team-choose";
+            case "paused": return "team-paused";
+            case "stopped": return "team-stopped";
+            case "failed": return "team-failed";
+            case "running":
+                if ("decision".equals(phase)) return "team-decision";
+                if ("verify".equals(phase)) return "team-verify";
+                if ("discuss".equals(phase)) return "team-discuss";
+                return "team-running";
+            default: return "team-done";
+        }
     }
     static String label(String kind) {
         switch (kind) {
             case "confirm": return "等你确认";
+            case "team-choose": return "待选方案";
+            case "team-decision": return "领队处理中";
+            case "team-verify": return "领队验收";
+            case "team-discuss": return "讨论方案";
+            case "team-running": return "进行中";
+            case "team-paused": return "已暂停";
+            case "team-done": return "已完成";
+            case "team-stopped": return "已停止";
+            case "team-failed": return "没有开始";
             case "done": return "已完成";
             case "waiting": return "等你的消息";
             case "stopped": return "已停下";
@@ -145,8 +239,16 @@ final class AggregateSessions {
     }
     /** What needs the user comes first, in the order the pages use. */
     static int rank(String kind) {
-        int at = Arrays.asList("confirm", "done", "waiting", "busy", "starting", "idle", "stopped", "pc-busy", "pc-idle").indexOf(kind);
-        return at < 0 ? 9 : at;
+        if ("confirm".equals(kind) || "team-choose".equals(kind)) return 0;
+        if ("done".equals(kind)) return 1;
+        if ("waiting".equals(kind)) return 2;
+        if ("busy".equals(kind) || activeTeam(kind)) return 3;
+        if ("starting".equals(kind)) return 4;
+        if ("idle".equals(kind) || "team-paused".equals(kind)) return 5;
+        if ("stopped".equals(kind)) return 6;
+        if ("pc-busy".equals(kind)) return 7;
+        if ("pc-idle".equals(kind)) return 8;
+        return 9;
     }
     /** How long ago, in the words the pages use; nothing for a time that is not known. */
     static String ago(long then, long now) {
@@ -159,11 +261,17 @@ final class AggregateSessions {
     static String sourceOfKind(String kind) { return kind == null || kind.isEmpty() ? "" : "终端".equals(kind) ? "term" : "app"; }
     /** By what a thing runs and where it is, in the words of a card: "手机终端 · thesis", "Codex 桌面版 · notes（未加入项目）". */
     static String where(Entry entry) {
+        if (entry.team) {
+            String who = teamWho(entry);
+            String place = entry.place();
+            return place.isEmpty() ? who : who + " · " + place;
+        }
         String runs = location(entry);
         String place = entry.place() + (entry.apart() ? "（未加入项目）" : "");
         return runs.isEmpty() ? place : place.isEmpty() ? runs : runs + " · " + place;
     }
     static String location(Entry entry) {
+        if (entry.team) return teamWho(entry);
         // a terminal of the phone's; the program that has a conversation open (and whether it is an editor's terminal);
         // for one that is only saved, by what it was started
         return entry.terminal ? (entry.running() ? (entry.chat ? "手机对话" : "手机终端") : "")
@@ -180,12 +288,25 @@ final class AggregateSessions {
         boolean running() { return entry.running(); }
         /** What a search looks through. */
         String words() {
-            return (entry.shownTitle() + '\n' + entry.place() + '\n' + entry.toolName() + '\n' + sourceLabel(entry.source()) + '\n' + (entry.terminal && entry.running() ? (entry.chat ? "手机对话\n" : "手机终端\n") : "") + entry.origin + '\n' + entry.kind + '\n' + computer + '\n' + label(kind)
+            if (entry.team) {
+                StringBuilder sb = new StringBuilder();
+                sb.append(entry.shownTitle()).append('\n').append(entry.place()).append('\n').append("协作任务\n")
+                  .append(teamModeLabel(entry.teamMode)).append('\n').append(entry.teamNote).append('\n')
+                  .append(computer).append('\n').append(label(kind)).append('\n').append(sourceLabel(entry.source()));
+                for (String t : entry.teamTools) sb.append('\n').append(toolName(t)).append('\n').append(t);
+                for (String m : entry.teamModels.values()) sb.append('\n').append(m);
+                return sb.toString().toLowerCase(java.util.Locale.ROOT);
+            }
+            return (entry.shownTitle() + '\n' + entry.originalTitle + '\n' + entry.organizeSummary + '\n' + String.join("\n", entry.organizeTags) + '\n' + entry.place() + '\n' + entry.toolName() + '\n' + sourceLabel(entry.source()) + '\n' + (entry.terminal && entry.running() ? (entry.chat ? "手机对话\n" : "手机终端\n") : "") + entry.origin + '\n' + entry.kind + '\n' + computer + '\n' + label(kind)
                 + (entry.apart() ? "\n未加入项目" : "") + (entry.pinned ? "\n置顶" : "") + (entry.hidden ? "\n已隐藏" : "")).toLowerCase(java.util.Locale.ROOT);
         }
     }
-    static boolean needs(String kind) { return "confirm".equals(kind); }
-    static boolean working(String kind) { return "busy".equals(kind) || "starting".equals(kind) || "pc-busy".equals(kind); }
+    static boolean needs(String kind) { return "confirm".equals(kind) || "team-choose".equals(kind); }
+    static boolean activeTeam(String kind) {
+        return "team-running".equals(kind) || "team-decision".equals(kind) || "team-verify".equals(kind) || "team-discuss".equals(kind);
+    }
+    static boolean working(String kind) { return "busy".equals(kind) || "starting".equals(kind) || "pc-busy".equals(kind) || activeTeam(kind); }
+    static boolean isPast(String kind) { return "ended".equals(kind) || "history".equals(kind) || "team-done".equals(kind) || "team-stopped".equals(kind) || "team-failed".equals(kind); }
     static int compareOpened(Entry a, Entry b) {
         return a.pinned != b.pinned ? (a.pinned ? -1 : 1)
             : a.terminal != b.terminal ? (a.terminal ? 1 : -1) : Long.compare(recent(b), recent(a));
@@ -196,25 +317,29 @@ final class AggregateSessions {
      * what is hidden too. tool and source narrow every list ("" for any).
      */
     static final class Board {
-        final List<Thing> needs = new ArrayList<>(), pinned = new ArrayList<>(), active = new ArrayList<>(), opened = new ArrayList<>(), recent = new ArrayList<>(), found = new ArrayList<>();
+        final List<Thing> needs = new ArrayList<>(), replies = new ArrayList<>(), unseen = new ArrayList<>(), pinned = new ArrayList<>(), active = new ArrayList<>(), opened = new ArrayList<>(), recent = new ArrayList<>(), found = new ArrayList<>();
         boolean searched;
         final Set<String> tools = new java.util.LinkedHashSet<>(), sources = new java.util.LinkedHashSet<>();     // what there is to tell apart by, before narrowing
     }
     static Board board(List<Thing> things, String query, String tool, String source) {
+        return board(things, query, tool, source, false);
+    }
+    static Board board(List<Thing> things, String query, String tool, String source, boolean followOnly) {
         Board board = new Board();
         // an ended terminal whose conversation is listed is found there, to be gone on with: it is not listed twice
         Set<String> saved = new HashSet<>();
-        for (Thing thing : things) if (!thing.entry.terminal) saved.add(thing.url + '\n' + thing.entry.tool + '\n' + thing.entry.id);
+        for (Thing thing : things) if (!thing.entry.terminal && !thing.entry.team) saved.add(thing.url + '\n' + thing.entry.tool + '\n' + thing.entry.id);
         List<String> words = new ArrayList<>();
         for (String word : query.trim().toLowerCase(java.util.Locale.ROOT).split("\\s+")) if (!word.isEmpty()) words.add(word);
-        board.searched = !words.isEmpty();
-        for (String known : new String[]{"claude", "codex", "agy", "opencode", "qoder", "cline", "pi", "shell"}) for (Thing thing : things) if (known.equals(thing.entry.displayTool())) { board.tools.add(known); break; }
+        board.searched = !words.isEmpty() || followOnly;
+        for (String known : new String[]{"claude", "codex", "agy", "opencode", "qoder", "cline", "pi", "shell"}) for (Thing thing : things) if (thing.entry.matchesTool(known)) { board.tools.add(known); break; }
         for (String known : new String[]{"term", "app"}) for (Thing thing : things) if (known.equals(thing.entry.source())) { board.sources.add(known); break; }
         for (Thing thing : things) {
             Entry entry = thing.entry;
-            if (!tool.isEmpty() && !tool.equals(entry.displayTool()) || !source.isEmpty() && !source.equals(entry.source())) continue;
+            if (!entry.matchesTool(tool) || !source.isEmpty() && !source.equals(entry.source())) continue;
+            if (followOnly && !entry.followUp) continue;
             if (entry.terminal && !entry.running() && !entry.session.isEmpty() && saved.contains(thing.url + '\n' + entry.tool + '\n' + entry.session)) continue;
-            boolean past = "ended".equals(thing.kind) || "history".equals(thing.kind);
+            boolean past = isPast(thing.kind);
             if (board.searched) {
                 String all = thing.words();
                 boolean has = true;
@@ -222,6 +347,8 @@ final class AggregateSessions {
                 if (has) board.found.add(thing);
             }
             else if (thing.running() && needs(thing.kind)) board.needs.add(thing);
+            else if (entry.open() && "waiting".equals(thing.kind)) board.replies.add(thing);
+            else if (entry.open() && "done".equals(thing.kind)) board.unseen.add(thing);
             else if (entry.open() && working(thing.kind)) board.active.add(thing);
             else if (entry.open()) board.opened.add(thing);
             else if (entry.pinned && past) board.pinned.add(thing);
@@ -233,9 +360,18 @@ final class AggregateSessions {
         Comparator<Thing> open = (a, b) -> a.entry.open() != b.entry.open() ? (a.entry.open() ? -1 : 1) : a.entry.open() ? standing.compare(a, b) : lately.compare(a, b);
         Comparator<Thing> pinnedFirst = (a, b) -> a.entry.pinned != b.entry.pinned ? (a.entry.pinned ? -1 : 1) : standing.compare(a, b);
         Comparator<Thing> opened = (a, b) -> compareOpened(a.entry, b.entry);
-        Collections.sort(board.needs, pinnedFirst); Collections.sort(board.active, pinnedFirst); Collections.sort(board.opened, opened);
-        Collections.sort(board.pinned, open); Collections.sort(board.found, open); Collections.sort(board.recent, lately);
+        Collections.sort(board.needs, pinnedFirst); Collections.sort(board.replies, pinnedFirst); Collections.sort(board.unseen, pinnedFirst);
+        Collections.sort(board.active, pinnedFirst); Collections.sort(board.opened, opened);
+        Collections.sort(board.pinned, open);
+        board.found.sort(Comparator.comparing((Thing item) -> !titleMatches(item.entry, words)).thenComparing(open));
+        Collections.sort(board.recent, lately);
         return board;
+    }
+
+    private static boolean titleMatches(Entry entry, List<String> words) {
+        String title = (entry.shownTitle() + '\n' + entry.originalTitle).toLowerCase(java.util.Locale.ROOT);
+        for (String word : words) if (!title.contains(word)) return false;
+        return true;
     }
 
     static final class Project {
@@ -259,9 +395,43 @@ final class AggregateSessions {
     static List<Project> projects(List<String> folders, List<Entry> entries) {
         LinkedHashMap<String, Project> groups = new LinkedHashMap<>();
         for (String name : folders) if (!name.isEmpty() && !groups.containsKey(name)) groups.put(name, new Project(name));
-        Set<String> phoneSessions = new HashSet<>();
-        for (Entry entry : entries) if (entry.terminal && entry.running() && !entry.session.isEmpty()) phoneSessions.add(entry.tool + ":" + entry.session);
+        LinkedHashMap<String, Entry> teamCards = new LinkedHashMap<>();
+        for (Entry entry : entries) if (entry.team && !entry.id.isEmpty() && !teamCards.containsKey(entry.id)) teamCards.put(entry.id, entry);
+        Map<String, String> sessionTeams = new LinkedHashMap<>();
+        for (Entry entry : entries) if (!entry.team && !entry.terminal && !entry.teamId.isEmpty() && teamCards.containsKey(entry.teamId)) sessionTeams.put(entry.tool + ":" + entry.id, entry.teamId);
+        // Propagate any live child confirmation to its parent collaboration task card.
         for (Entry entry : entries) {
+            if (entry.team) continue;
+            String ownerTeam = !entry.teamId.isEmpty() && teamCards.containsKey(entry.teamId) ? entry.teamId
+                : (entry.terminal && !entry.session.isEmpty() ? sessionTeams.get(entry.tool + ":" + entry.session) : null);
+            if (ownerTeam != null && entry.open() && "confirm".equals(entry.kind(null))) {
+                Entry parent = teamCards.get(ownerTeam);
+                if (parent != null) parent.teamConfirm = true;
+            }
+        }
+        Set<String> phoneSessions = new HashSet<>();
+        for (Entry entry : entries) {
+            if (entry.team) continue;
+            String ownerTeam = !entry.teamId.isEmpty() && teamCards.containsKey(entry.teamId) ? entry.teamId
+                : (entry.terminal && !entry.session.isEmpty() ? sessionTeams.get(entry.tool + ":" + entry.session) : null);
+            if (ownerTeam != null) continue;
+            if (entry.terminal && entry.running() && !entry.session.isEmpty()) phoneSessions.add(entry.tool + ":" + entry.session);
+        }
+        Set<String> addedTeams = new HashSet<>();
+        for (Entry entry : entries) {
+            if (entry.team) {
+                if (entry.id.isEmpty() || !addedTeams.add(entry.id)) continue;
+                if (entry.project.isEmpty()) continue;
+                if (!groups.containsKey(entry.project)) groups.put(entry.project, new Project(entry.project));
+                Project group = groups.get(entry.project);
+                group.tools.addAll(entry.teamTools);
+                group.sources.add("app");
+                (entry.open() ? group.active : group.history).add(entry);
+                continue;
+            }
+            String ownerTeam = !entry.teamId.isEmpty() && teamCards.containsKey(entry.teamId) ? entry.teamId
+                : (entry.terminal && !entry.session.isEmpty() ? sessionTeams.get(entry.tool + ":" + entry.session) : null);
+            if (ownerTeam != null) continue;
             // what is open where there is no project stands in a group without a name, the last one
             if (entry.project.isEmpty()) continue;
             if (!groups.containsKey(entry.project)) groups.put(entry.project, new Project(entry.project));
@@ -274,6 +444,15 @@ final class AggregateSessions {
         }
         Project apart = new Project("");
         for (Entry entry : entries) {
+            if (entry.team) {
+                if (entry.project.isEmpty() && !entry.id.isEmpty() && !addedTeams.contains(entry.id) && addedTeams.add(entry.id)) {
+                    (entry.open() ? apart.active : apart.history).add(entry);
+                }
+                continue;
+            }
+            String ownerTeam = !entry.teamId.isEmpty() && teamCards.containsKey(entry.teamId) ? entry.teamId
+                : (entry.terminal && !entry.session.isEmpty() ? sessionTeams.get(entry.tool + ":" + entry.session) : null);
+            if (ownerTeam != null) continue;
             if (!entry.apart() || !entry.terminal && (!entry.live || !entry.attached.isEmpty() || phoneSessions.contains(entry.tool + ":" + entry.id))) continue;
             (entry.open() ? apart.active : entry.terminal ? apart.ended : apart.history).add(entry);
         }
@@ -291,7 +470,7 @@ final class AggregateSessions {
         int[] counts = new int[4];
         for (Project project : projects) for (Entry entry : project.active) {
             String kind = entry.kind(seen);
-            if ("confirm".equals(kind)) counts[0]++;
+            if (needs(kind)) counts[0]++;
             else if (working(kind)) counts[2]++;
             else counts[1]++;
             counts[3]++;
@@ -315,6 +494,10 @@ final class AggregateSessions {
                     add(key, entry.id); add(key, entry.shownTitle()); add(key, entry.tool);
                     add(key, label(entry.kind(seen))); add(key, entry.host); add(key, entry.origin);
                     add(key, entry.folder); add(key, entry.endWay == null ? "legacy" : entry.endWay); key.append(entry.pinned ? 'p' : '-').append(entry.hidden ? 'h' : '-').append(entry.canTakeover ? 'e' : '-');
+                    if (entry.team) {
+                        key.append('T'); add(key, entry.teamMode); add(key, entry.teamPhase); add(key, entry.teamNote); key.append(entry.teamConfirm ? 'c' : '-');
+                        add(key, entry.teamTools.toString()); add(key, entry.teamModels.toString());
+                    }
                     if (entries == project.history || entries == project.ended) add(key, ago(recent(entry), System.currentTimeMillis()));
                 }
             }

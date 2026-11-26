@@ -52,6 +52,14 @@ public abstract class Chat : IRunning {
     protected Quotas quotas;
     /// Optional local MCP server attached to this conversation (Peers.cs); disposed when the conversation ends.
     protected McpServer mcp;
+    /// The model it is started with (Models.cs), "" for its tool's own default.
+    protected string model = "";
+    /// The reasoning effort tier it is started with (Models.cs), "" for its tool's own default.
+    protected string effort = "";
+    /// Started only to read which models its tool offers (`Models`): it opens no conversation where it need not.
+    protected bool listing;
+    Models.Choice[] offered;
+    readonly ManualResetEvent offeredSeen = new ManualResetEvent(false);
 
     public sealed class McpServer : IDisposable {
         readonly Action onDispose;
@@ -91,6 +99,7 @@ public abstract class Chat : IRunning {
     protected sealed class Asked {
         public string Id, Text; public object Request; public string Kind = ""; public bool Always;
         public List<string> Choices = new List<string>();
+        public Action<string> OnReply;
     }
 
     protected Chat(string tool, string folder, Action<string> emit) {
@@ -100,22 +109,57 @@ public abstract class Chat : IRunning {
 
     /// Starts the conversation: the saved one `session` gone on with (`resume`), else a new one (named `session`
     /// where the tool lets its id be chosen). `mode` is the computer's widest allowed way of working (full, edit,
-    /// read), as for its terminals.
-    public static Chat Open(string tool, string launcher, string folder, string session, bool resume, string mode, Action<string> emit, Quotas quotas = null, McpServer mcp = null) {
+    /// read), as for its terminals. `model` is the tool's name of a model it offers (Models.cs), "" for its default.
+    /// `effort` is an optional reasoning effort tier advertised by the tool (Models.cs), "" for its default.
+    public static Chat Open(string tool, string launcher, string folder, string session, bool resume, string mode, Action<string> emit, Quotas quotas = null, McpServer mcp = null, string model = "", string effort = "") {
         Tool kind = RemoteCli.Tool.Of(tool);
-        if (kind == null || !kind.Chats) { if (mcp != null) mcp.Dispose(); throw new ArgumentException("这个工具不支持对话"); }
+        model = model ?? "";
+        effort = (effort ?? "").Trim().ToLowerInvariant();
+        if (kind == null || !kind.Chats || (model.Length > 0 && !Models.Valid(model)) || (effort.Length > 0 && !Models.ValidEffort(effort))) {
+            if (mcp != null) mcp.Dispose();
+            throw new ArgumentException(kind == null || !kind.Chats ? "这个工具不支持对话" : effort.Length > 0 && !Models.ValidEffort(effort) ? "思考深度无效" : "模型名称无效");
+        }
         Chat chat = kind.CreateChat(folder, emit);
         chat.quotas = quotas;
         chat.mcp = mcp;
+        chat.model = model;
+        chat.effort = effort;
         try { chat.Begin(launcher, session ?? "", resume, mode ?? ""); }
         catch { chat.Dispose(); throw; }
         return chat;
+    }
+    /// The models a chat tool offers, as it lists them itself: started in `folder` read only, asked, and ended. Null
+    /// where it said nothing within `ms`.
+    public static Models.Choice[] ListModels(string tool, string launcher, string folder, int ms) {
+        Tool kind = RemoteCli.Tool.Of(tool);
+        if (kind == null || !kind.Chats) throw new ArgumentException("这个工具不支持对话");
+        Chat chat = kind.CreateChat(folder, _ => { });
+        chat.listing = true;
+        try {
+            chat.Begin(launcher, "", false, "read");
+            return chat.offeredSeen.WaitOne(ms) ? chat.offered : null;
+        } finally { chat.Dispose(); }
+    }
+    /// What its tool said it offers (once; a tool that lists none gives an empty list).
+    protected void Offer(IEnumerable<Models.Choice> choices) {
+        if (offered != null) return;
+        offered = (choices ?? new Models.Choice[0]).ToArray();
+        offeredSeen.Set();
+    }
+    /// The conversation could not be opened: said, and a turn that was waiting for it ends failed, so that whoever
+    /// waits for that turn (Teams.cs) is told.
+    protected void Unopened(string why, bool waited) {
+        Note(why);
+        if (waited) TurnEnded("failed", why);
+        State("ended");
+        Closed = true;
+        if (listing) offeredSeen.Set();     // (nothing known: asked again later)
     }
 
     protected abstract void Begin(string launcher, string session, bool resume, string mode);
     /// Hands what was written on the phone to the conversation: at once when it waits, else as soon as the tool takes
     /// it while it works. `id` is the phone's number for it, given back with the message once the tool has it.
-    public abstract void Say(string text, string id);
+    public abstract void Say(string text, string id, IList<Attachment> attachments = null);
     /// Stops what it is at now. The conversation stays, and is told the next thing as before.
     public abstract void Stop();
     /// Answers what it asks: allow, always (allow, and from now on the same without asking), deny; or, where it
@@ -132,9 +176,63 @@ public abstract class Chat : IRunning {
             Event(new Dictionary<string, object> { { "t", "answered" }, { "id", ask }, { "decision", decision } });
             if (asks.Count == 0 && Status == "confirm") State("busy");
         }
-        Reply(asked, decision);
+        if (asked.OnReply != null) asked.OnReply(decision);
+        else Reply(asked, decision);
     }
     protected abstract void Reply(Asked asked, string decision);
+    /// Asks the phone to confirm an in-chat action initiated by Remote AI itself (e.g. promoting the conversation to
+    /// a collaboration task) and waits until the user answers, the call is cancelled, the chat stops, or the timeout
+    /// expires. Always shows allow/deny without "always" so collaboration is never silently auto-started.
+    public bool Confirm(string kind, string title, string text, CancellationToken cancel, int timeoutSeconds = 240) {
+        var done = new ManualResetEventSlim(false);
+        string decision = "";
+        string askId;
+        lock (gate) {
+            if (Closed || disposed || Status == "ended") return false;
+            askId = Ask(null, kind, title, text, false, null, d => { decision = d ?? ""; done.Set(); });
+        }
+        try {
+            DateTime deadline = DateTime.UtcNow.AddSeconds(Math.Max(5, timeoutSeconds));
+            while (!done.Wait(150)) {
+                if (cancel.IsCancellationRequested || Closed || disposed || DateTime.UtcNow >= deadline) {
+                    WithdrawInternal(askId);
+                    return false;
+                }
+            }
+            return decision == "allow";
+        } finally {
+            done.Dispose();
+        }
+    }
+    /// Emits a lightweight system note inside this conversation stream (thread-safe).
+    public void Notice(string text) {
+        if (String.IsNullOrWhiteSpace(text)) return;
+        lock (gate) { if (!Closed && !disposed) Note(text); }
+    }
+    void WithdrawInternal(string askId) {
+        Action<string> notify = null;
+        lock (gate) {
+            Asked asked;
+            if (!asks.TryGetValue(askId, out asked)) return;
+            asks.Remove(askId);
+            Event(new Dictionary<string, object> { { "t", "answered" }, { "id", askId }, { "decision", "gone" } });
+            if (asks.Count == 0 && Status == "confirm") State("busy");
+            notify = asked.OnReply;
+        }
+        if (notify != null) try { notify("gone"); } catch (Exception) { }
+    }
+    protected void CancelConfirmations() {
+        var callbacks = new List<Action<string>>();
+        lock (gate) {
+            foreach (var one in asks.Values.Where(a => a.OnReply != null).ToArray()) {
+                asks.Remove(one.Id);
+                Event(new Dictionary<string, object> { { "t", "answered" }, { "id", one.Id }, { "decision", "gone" } });
+                callbacks.Add(one.OnReply);
+            }
+            if (asks.Count == 0 && Status == "confirm") State("busy");
+        }
+        foreach (var cb in callbacks) try { cb("gone"); } catch (Exception) { }
+    }
 
     // ---- the tool's program
     protected void Run(string launcher, string args, IDictionary<string, string> extraEnv = null) {
@@ -179,9 +277,13 @@ public abstract class Chat : IRunning {
         try { process.WaitForExit(5000); exit = process.ExitCode; } catch { }
         Action<string, string> notify = null;
         string crashNote = "";
+        var droppedReplies = new List<Action<string>>();
         lock (gate) {
             OnEnded();
-            foreach (var asked in asks.Keys.ToArray()) Event(new Dictionary<string, object> { { "t", "answered" }, { "id", asked }, { "decision", "gone" } });
+            foreach (var one in asks.Values.ToArray()) {
+                Event(new Dictionary<string, object> { { "t", "answered" }, { "id", one.Id }, { "decision", "gone" } });
+                if (one.OnReply != null) droppedReplies.Add(one.OnReply);
+            }
             asks.Clear();
             bool midTurn = !disposed && (Status == "busy" || Status == "confirm");
             if (!disposed && exit.HasValue && exit.Value != 0) {
@@ -198,9 +300,11 @@ public abstract class Chat : IRunning {
             State("ended");
             Flush();
             Closed = true; Drained = true;
+            if (listing) offeredSeen.Set();
         }
         var seat = Interlocked.Exchange(ref mcp, null);
         if (seat != null) seat.Dispose();
+        foreach (var cb in droppedReplies) try { cb("gone"); } catch (Exception) { }
         if (notify != null) ThreadPool.QueueUserWorkItem(_ => { try { notify("failed", crashNote); } catch (Exception) { } });
     }
     public void Write(string text) { throw new InvalidOperationException("对话不接受终端输入"); }
@@ -210,7 +314,7 @@ public abstract class Chat : IRunning {
         flusher.Dispose();
         var seat = Interlocked.Exchange(ref mcp, null);
         if (seat != null) seat.Dispose();
-        try { if (process != null && !process.HasExited) using (Process kill = Process.Start(new ProcessStartInfo("taskkill.exe", "/PID " + process.Id + " /T /F") { UseShellExecute = false, CreateNoWindow = true })) kill.WaitForExit(10000); } catch { }
+        try { if (process != null && !process.HasExited) ProcessText.KillProcessTree(process.Id, 10000); } catch { }
         if (process == null) { Closed = true; Drained = true; }
     }
 
@@ -251,7 +355,7 @@ public abstract class Chat : IRunning {
         if (kind == "out") {
             int had; printed.TryGetValue(id, out had);
             if (had >= OutputMost) return;
-            if (had + text.Length > OutputMost) text = text.Substring(0, OutputMost - had) + "\n…";
+            if (had + text.Length > OutputMost) text = ProcessText.SliceSafeChars(text, OutputMost - had) + "\n…";
             printed[id] = had + text.Length;
         }
         if (kind == "more" && id == wordsId) words.Append(text);
@@ -287,12 +391,15 @@ public abstract class Chat : IRunning {
     /// How many commands the tool now runs in the background of this conversation, as the tool says it.
     protected void Background(int running) { background = Math.Max(0, running); }
     protected void Note(string text) { Event(new Dictionary<string, object> { { "t", "note" }, { "text", text }, { "at", Now() } }); }
-    protected void TurnEnded(string how, string error) {
+    protected void TurnEndedQuiet(string how, string error) {
         LastError = error ?? "";
         var turn = new Dictionary<string, object> { { "t", "turn" }, { "end", how }, { "at", Now() } };
         if (!String.IsNullOrEmpty(error)) turn["error"] = error;
         Event(turn);
         stopping = false;
+    }
+    protected void TurnEnded(string how, string error) {
+        TurnEndedQuiet(how, error);
         if (how == "done" && background > 0) return;
         var turned = Turned;
         if (turned != null) {
@@ -304,8 +411,8 @@ public abstract class Chat : IRunning {
             ThreadPool.QueueUserWorkItem(_ => { try { turned(how, said); } catch (Exception) { } });
         }
     }
-    protected string Ask(object request, string kind, string title, string text, bool always, IList<string> choices = null) {
-        var asked = new Asked { Id = Guid.NewGuid().ToString("N").Substring(0, 16), Request = request, Kind = kind, Text = (title + (text.Length > 0 ? "\n" + text : "")).Trim(), Always = always };
+    protected string Ask(object request, string kind, string title, string text, bool always, IList<string> choices = null, Action<string> onReply = null) {
+        var asked = new Asked { Id = Guid.NewGuid().ToString("N").Substring(0, 16), Request = request, Kind = kind, Text = (title + (text.Length > 0 ? "\n" + text : "")).Trim(), Always = always, OnReply = onReply };
         var options = new List<object>();
         if (choices != null && choices.Count > 0) {
             asked.Choices.AddRange(choices);
@@ -327,15 +434,23 @@ public abstract class Chat : IRunning {
         string line = text.Split('\n').Select(one => one.Trim()).LastOrDefault(one => one.Length > 0) ?? "";
         if (whole != null || line.Length > 0) Said = line.Length > 200 ? line.Substring(0, 200) : line;
     }
-    /// What a step gave back, for a step whose output was not passed on as it came: its last lines, as a terminal
-    /// would show them at its end.
+    /// What a step gave back, for a step whose output was not passed on as it came: normalized terminal output
+    /// with head-tail folding so both the initial root-cause lines and the trailing summary stay visible.
     public static string Shown(string back) {
-        back = (back ?? "").Replace("\r\n", "\n").Trim('\n', '\r');
-        if (back.Length > 6000) back = "…\n" + back.Substring(back.Length - 6000);
+        back = ProcessText.NormalizeTerminal(back ?? "").Trim('\n', '\r');
+        if (back.Length == 0) return "";
+        if (back.Length > 6000) back = ProcessText.FoldHeadTail(back, 6000);
         var lines = back.Split('\n');
-        return lines.Length > 40 ? "…\n" + String.Join("\n", lines.Skip(lines.Length - 40)) : back;
+        if (lines.Length > 48) {
+            int head = 16, tail = 30;
+            int omitted = lines.Length - head - tail;
+            back = String.Join("\n", lines.Take(head))
+                + "\n…（已折叠中间 " + omitted + " 行，共 " + lines.Length + " 行）…\n"
+                + String.Join("\n", lines.Skip(lines.Length - tail));
+        }
+        return back;
     }
-    protected static string Cut(string text, int most) { text = text ?? ""; return text.Length > most ? text.Substring(0, most) + "…" : text; }
+    protected static string Cut(string text, int most) { return ProcessText.TruncateSafe(text, most, "…"); }
     /// A step named as the tools' windows name it: what it is, and what for, where the tool says it.
     public static string Brief(object name, object given) {
         var input = given as Dictionary<string, object>; string about = "";
@@ -358,13 +473,17 @@ public sealed class ClaudeChat : Chat {
     readonly Dictionary<int, string> blocks = new Dictionary<int, string>();     // block index -> item, in the message being written
     readonly Dictionary<string, string> steps = new Dictionary<string, string>();   // tool_use id -> item
     readonly Queue<KeyValuePair<string, string>> said = new Queue<KeyValuePair<string, string>>();   // what the phone said, and its number, until it is given back
+    sealed class Queued { public string Text, Id; public IList<Attachment> Attachments; }
+    readonly Queue<Queued> afterStop = new Queue<Queued>();
     int requests;
 
-    public static string Arguments(string session, bool resume, string mode, string mcpConfig = null) {
+    public static string Arguments(string session, bool resume, string mode, string mcpConfig = null, string model = "", string effort = "") {
         return "-p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --replay-user-messages --permission-prompt-tool stdio"
             + (resume ? " --resume " : " --session-id ") + session
             + (mode == "read" ? " --permission-mode plan" : mode == "edit" ? " --permission-mode acceptEdits" : "")
-            + (!String.IsNullOrEmpty(mcpConfig) ? " --mcp-config \"" + mcpConfig + "\"" : "");
+            + (!String.IsNullOrEmpty(mcpConfig) ? " --mcp-config \"" + mcpConfig + "\"" : "")
+            + (!String.IsNullOrEmpty(model) ? " --model " + model : "")      // (a safe name, Models.Valid)
+            + (!String.IsNullOrEmpty(effort) ? " --effort " + effort : "");  // (a safe tier, Models.ValidEffort)
     }
     protected override void Begin(string launcher, string session, bool resume, string mode) {
         if (session.Length == 0) { if (resume) throw new ArgumentException("对话编号无效"); session = Guid.NewGuid().ToString(); }
@@ -372,16 +491,31 @@ public sealed class ClaudeChat : Chat {
         lock (gate) Known(session);
         string cfg = mcp != null && !String.IsNullOrEmpty(mcp.ConfigFile) ? mcp.ConfigFile : null;
         var extraEnv = cfg != null ? new Dictionary<string, string> { { "MCP_TOOL_TIMEOUT", "300000" } } : null;
-        Run(launcher, Arguments(session, resume, mode, cfg), extraEnv);
+        Run(launcher, Arguments(session, resume, mode, cfg, model, effort), extraEnv);
         Send(new Dictionary<string, object> { { "type", "control_request" }, { "request_id", "init-" + (++requests) }, { "request", new Dictionary<string, object> { { "subtype", "initialize" } } } });
         lock (gate) State("idle");
     }
-    public override void Say(string text, string id) {
-        lock (gate) { said.Enqueue(new KeyValuePair<string, string>(text, id ?? "")); if (Status != "confirm") State("busy"); }
-        Send(new Dictionary<string, object> { { "type", "user" }, { "message", new Dictionary<string, object> { { "role", "user" }, { "content", text } } } });
+    public override void Say(string text, string id, IList<Attachment> attachments = null) {
+        string shown = Attachments.WithText(text, attachments);
+        lock (gate) {
+            if (Closed || Status == "ended") throw new InvalidOperationException("对话已结束");
+            if (stopping) {
+                afterStop.Enqueue(new Queued { Text = text, Id = id ?? "", Attachments = attachments });
+                if (Status != "confirm") State("busy");
+                return;
+            }
+            said.Enqueue(new KeyValuePair<string, string>(shown, id ?? ""));
+            if (Status != "confirm") State("busy");
+        }
+        SendUser(shown, attachments);
+    }
+    void SendUser(string shown, IList<Attachment> attachments) {
+        object content = attachments != null && attachments.Count > 0 ? (object)Attachments.ClaudeContent(shown, attachments) : shown;
+        Send(new Dictionary<string, object> { { "type", "user" }, { "message", new Dictionary<string, object> { { "role", "user" }, { "content", content } } } });
     }
     public override void Stop() {
-        lock (gate) { if (Status != "busy" && Status != "confirm") throw new InvalidOperationException("它现在没有在执行"); stopping = true; }
+        lock (gate) { if (Status != "busy" && Status != "confirm") throw new InvalidOperationException("它现在没有在执行"); stopping = true; afterStop.Clear(); }
+        CancelConfirmations();
         Send(new Dictionary<string, object> { { "type", "control_request" }, { "request_id", "stop-" + (++requests) }, { "request", new Dictionary<string, object> { { "subtype", "interrupt" } } } });
     }
     protected override void Received(Dictionary<string, object> m) {
@@ -391,19 +525,67 @@ public sealed class ClaudeChat : Chat {
             else if (Text(m, "subtype") == "status" && Text(m, "status") == "requesting" && Status == "idle") State("busy");
             // the commands it runs in the background (Claude Code 2.1.322: the whole list, each time it changes); when
             // one ends it goes on by itself, in a turn of its own
-            else if (Text(m, "subtype") == "background_tasks_changed") { var tasks = At(m, "tasks") as System.Collections.ICollection; Background(tasks == null ? 0 : tasks.Count); }
+            else if (Text(m, "subtype") == "background_tasks_changed") {
+                // Watchers stay alive across turns. An awaited agent reports into its tool
+                // call. Neither produces a later turn for the collaboration to wait for.
+                Background(Many(m, "tasks").Count(task => !true.Equals(At(task, "ambient")) && !true.Equals(At(task, "awaited"))));
+            }
             return;
         }
         if (type == "stream_event") { Streamed(At(m, "event")); return; }
         if (type == "assistant") { Whole(At(m, "message")); return; }
         if (type == "user") { Came(m); return; }
         if (type == "control_request") { Permission(m); return; }
+        // the answer to `initialize` names the models it offers (`models`: value, displayName, supportedEffortLevels), as its SDK reads them
+        if (type == "control_response") {
+            var response = At(m, "response");
+            if (Text(response, "request_id").StartsWith("init-", StringComparison.Ordinal) && At(At(response, "response"), "models") != null) {
+                var rawModels = Many(At(response, "response"), "models").ToList();
+                var defaultEntry = rawModels.FirstOrDefault(one => Text(one, "value") == "default");
+                string defaultResolved = defaultEntry != null ? Text(defaultEntry, "resolvedModel") : "";
+                bool markedDefault = false;
+                var choices = new List<Models.Choice>();
+                foreach (var one in rawModels) {
+                    string val = Text(one, "value");
+                    if (val == "default") continue;
+                    bool supportsEffort = !false.Equals(At(one, "supportsEffort"));
+                    var efforts = supportsEffort ? Many(one, "supportedEffortLevels").Select(Convert.ToString).ToArray() : new string[0];
+                    bool isDefault = !markedDefault && defaultResolved.Length > 0 && Text(one, "resolvedModel") == defaultResolved;
+                    if (isDefault) markedDefault = true;
+                    choices.Add(new Models.Choice { Id = val, Label = Text(one, "displayName"), Efforts = efforts, IsDefault = isDefault });
+                }
+                Offer(choices);
+            }
+            else if (listing && Text(response, "request_id").StartsWith("init-", StringComparison.Ordinal)) Offer(null);
+            return;
+        }
         if (type == "control_cancel_request") { Withdrawn(Text(m, "request_id")); return; }
         // with each turn, how much of the account's limits is used (Claude Code 2.1.322)
         if (type == "rate_limit_event") { if (quotas != null) quotas.Note("claude", Quotas.FromClaudeEvent(At(m, "rate_limit_info"))); return; }
         if (type == "result") {
             string subtype = Text(m, "subtype");
             bool ok = subtype == "success" && !true.Equals(At(m, "is_error"));
+            if (stopping && afterStop.Count > 0) {
+                TurnEndedQuiet("stopped", "");
+                blocks.Clear();
+                var texts = new List<string>();
+                var allAttachments = new List<Attachment>();
+                string firstId = "";
+                while (afterStop.Count > 0) {
+                    var next = afterStop.Dequeue();
+                    string piece = Attachments.WithText(next.Text, next.Attachments);
+                    if (piece.Length > 0) texts.Add(piece);
+                    if (next.Attachments != null) allAttachments.AddRange(next.Attachments);
+                    if (firstId.Length == 0 && next.Id.Length > 0) firstId = next.Id;
+                }
+                if (texts.Count > 0) {
+                    string merged = String.Join("\n\n", texts.ToArray());
+                    said.Enqueue(new KeyValuePair<string, string>(merged, firstId));
+                    SendUser(merged, allAttachments.Count > 0 ? allAttachments : null);
+                }
+                State(asks.Count > 0 ? "confirm" : "busy");
+                return;
+            }
             TurnEnded(stopping && !ok ? "stopped" : ok ? "done" : "failed", ok || stopping ? "" : Text(m, "result").Length > 0 ? Cut(Text(m, "result"), 600) : subtype);
             blocks.Clear();
             State(asks.Count > 0 ? "confirm" : "idle");
@@ -446,6 +628,10 @@ public sealed class ClaudeChat : Chat {
                     string question = Text(input, "question");
                     title = Peers.StepTitle(Text(input, "tool"), question);
                     if (question.Length > 0) more["detail"] = Cut(question, 2000);
+                } else if (toolName == "mcp__" + Peers.ServerName + "__" + Peers.CollabToolName || toolName.EndsWith("__" + Peers.CollabToolName, StringComparison.Ordinal)) {
+                    string goal = Text(input, "goal");
+                    title = Peers.CollabStepTitle(Text(input, "mode"), goal);
+                    if (goal.Length > 0) more["detail"] = Cut(goal, 2000);
                 } else {
                     title = Brief(At(part, "name"), input);
                     string command = Text(input, "command");
@@ -493,8 +679,8 @@ public sealed class ClaudeChat : Chat {
         }
         string name = Text(request, "tool_name"), shown = Text(request, "display_name");
         var input = At(request, "input");
-        // Built-in read-only peer consultation runs without asking the phone for permission each time.
-        if (mcp != null && name == "mcp__" + mcp.Name + "__" + Peers.ToolName) {
+        // Built-in Remote AI MCP tools run through Remote AI's own controls (`ask_ai` is read-only; `start_collaboration` shows Remote AI's own confirmation card).
+        if (mcp != null && (name == "mcp__" + mcp.Name + "__" + Peers.ToolName || name == "mcp__" + mcp.Name + "__" + Peers.CollabToolName)) {
             Respond(id, new Dictionary<string, object> { { "behavior", "allow" }, { "updatedInput", input ?? new Dictionary<string, object>() } }, null);
             return;
         }
@@ -607,7 +793,12 @@ public sealed class CodexChat : JsonRpcChat {
     public CodexChat(string folder, Action<string> emit) : base("codex", folder, emit) { }
     string turn = "";
     string mode = "";
-    readonly List<KeyValuePair<string, string>> early = new List<KeyValuePair<string, string>>();     // said before the conversation was there
+    sealed class Early {
+        public string Text, Id;
+        public IList<Attachment> Attachments;
+    }
+    readonly List<Early> early = new List<Early>();     // said before the conversation was there
+    readonly List<Early> afterStop = new List<Early>(); // said while the current turn is being interrupted
 
     static string TomlString(string value) {
         value = value ?? "";
@@ -632,39 +823,87 @@ public sealed class CodexChat : JsonRpcChat {
         var given = new Dictionary<string, object> { { "cwd", Folder } };
         if (mode == "read") given["sandbox"] = "read-only"; else if (mode == "edit") given["sandbox"] = "workspace-write";
         if (session.Length > 0) given["threadId"] = session;
+        if (model.Length > 0) given["model"] = model;       // (thread/start and thread/resume both take it)
+        if (effort.Length > 0) given["config"] = new Dictionary<string, object> { { "model_reasoning_effort", effort } };
         Call("initialize", new Dictionary<string, object> { { "clientInfo", new Dictionary<string, object> { { "name", "remote-ai" }, { "title", "Remote AI" }, { "version", "1" } } } }, initAnswer => {
-            if (At(initAnswer, "error") != null) { Note("Codex 初始化失败：" + Text(At(initAnswer, "error"), "message")); State("ended"); return; }
+            if (At(initAnswer, "error") != null) { Unopened("Codex 初始化失败：" + Text(At(initAnswer, "error"), "message"), early.Count > 0); return; }
             Notify("initialized", new Dictionary<string, object>());
+            if (listing) {
+                // the models it lists, without a conversation (hidden ones are left out, as its own pickers do)
+                Call("model/list", new Dictionary<string, object>(), answer => Offer(Many(At(answer, "result"), "data").Where(one => !(At(one, "hidden") is bool && (bool)At(one, "hidden")))
+                    .Select(one => new Models.Choice {
+                        Id = Text(one, "id").Length > 0 ? Text(one, "id") : Text(one, "model"),
+                        Label = Text(one, "displayName"),
+                        Efforts = Many(one, "supportedReasoningEfforts").Select(e => Text(e, "reasoningEffort")).Where(e => e.Length > 0).ToArray(),
+                        DefaultEffort = Text(one, "defaultReasoningEffort"),
+                        IsDefault = true.Equals(At(one, "isDefault"))
+                    })));
+                return;
+            }
             Call(session.Length > 0 ? "thread/resume" : "thread/start", given, answer => {
                 string thread = Text(At(At(answer, "result"), "thread"), "id");
-                if (thread.Length == 0) { Note("Codex 没有打开这段对话：" + Text(At(answer, "error"), "message")); State("ended"); return; }
+                if (thread.Length == 0) { Unopened("Codex 没有打开这段对话：" + Text(At(answer, "error"), "message"), early.Count > 0); early.Clear(); return; }
                 Known(thread);
                 State(Status == "busy" ? "busy" : "idle");
-                foreach (var one in early.ToArray()) Start(one.Key, one.Value);
-                early.Clear();
+                if (early.Count > 0) {
+                    var batch = early.ToArray();
+                    early.Clear();
+                    StartBatch(batch);
+                }
             });
         });
     }
-    static List<object> Words(string text) { return new List<object> { new Dictionary<string, object> { { "type", "text" }, { "text", text }, { "text_elements", new object[0] } } }; }
-    public override void Say(string text, string id) {
+    void StartBatch(Early[] batch) {
+        if (batch == null || batch.Length == 0) return;
+        if (batch.Length == 1) { Start(batch[0].Text, batch[0].Id, batch[0].Attachments); return; }
+        var texts = new List<string>();
+        var allAttachments = new List<Attachment>();
+        string firstId = "";
+        foreach (var one in batch) {
+            string piece = (one.Text ?? "").Trim();
+            if (piece.Length > 0) texts.Add(piece);
+            if (one.Attachments != null) allAttachments.AddRange(one.Attachments);
+            if (firstId.Length == 0 && one.Id.Length > 0) firstId = one.Id;
+        }
+        if (texts.Count > 0 || allAttachments.Count > 0)
+            Start(String.Join("\n\n", texts.ToArray()), firstId, allAttachments.Count > 0 ? allAttachments : null);
+    }
+    // The local Codex app-server probe could not complete a turn/start request on this machine.
+    // Per the protocol contract, keep the absolute-path text and omit native image blocks until verified.
+    static List<object> Words(string text, IList<Attachment> attachments = null) {
+        string shown = Attachments.WithText(text, attachments);
+        return new List<object> { new Dictionary<string, object> { { "type", "text" }, { "text", shown }, { "text_elements", new object[0] } } };
+    }
+    public override void Say(string text, string id, IList<Attachment> attachments = null) {
         lock (gate) {
-            if (Session.Length == 0) { early.Add(new KeyValuePair<string, string>(text, id ?? "")); State("busy"); return; }
+            if (Closed || Status == "ended") throw new InvalidOperationException("对话已结束");
+            if (Session.Length == 0) { early.Add(new Early { Text = text, Id = id ?? "", Attachments = attachments }); State("busy"); return; }
             if (turn.Length > 0) {
+                if (stopping) { afterStop.Add(new Early { Text = text, Id = id ?? "", Attachments = attachments }); State("busy"); return; }
                 // it is at work: the words join the turn, as its own window's box does
-                Call("turn/steer", new Dictionary<string, object> { { "threadId", Session }, { "expectedTurnId", turn }, { "input", Words(text) }, { "clientUserMessageId", Client(id) } }, answer => {
-                    if (At(answer, "error") != null) Start(text, id);       // the turn had just ended: a new one
+                Call("turn/steer", new Dictionary<string, object> { { "threadId", Session }, { "expectedTurnId", turn }, { "input", Words(text, attachments) }, { "clientUserMessageId", Client(id) } }, answer => {
+                    if (At(answer, "error") != null) Start(text, id, attachments);       // the turn had just ended: a new one
                 });
                 return;
             }
-            Start(text, id);
+            Start(text, id, attachments);
         }
     }
     static string Client(string id) { return String.IsNullOrEmpty(id) ? Guid.NewGuid().ToString("N") : id; }
-    void Start(string text, string id) {
+    void Start(string text, string id, IList<Attachment> attachments = null) {
         State("busy");
-        Call("turn/start", new Dictionary<string, object> { { "threadId", Session }, { "input", Words(text) }, { "clientUserMessageId", Client(id) } }, answer => {
+        var turnParams = new Dictionary<string, object> { { "threadId", Session }, { "input", Words(text, attachments) }, { "clientUserMessageId", Client(id) } };
+        if (model.Length > 0) turnParams["model"] = model;
+        if (effort.Length > 0) turnParams["effort"] = effort;
+        Call("turn/start", turnParams, answer => {
             var error = At(answer, "error");
-            if (error != null) { Note("Codex 没有收下这句话：" + Text(error, "message")); State(turn.Length > 0 ? "busy" : "idle"); return; }
+            if (error != null) {
+                string msg = "Codex 没有收下这句话：" + Text(error, "message");
+                Note(msg);
+                if (turn.Length == 0) TurnEnded("failed", msg);
+                State(turn.Length > 0 ? "busy" : "idle");
+                return;
+            }
             string started = Text(At(At(answer, "result"), "turn"), "id");
             if (started.Length > 0 && turn.Length == 0) turn = started;
         });
@@ -673,8 +912,10 @@ public sealed class CodexChat : JsonRpcChat {
         lock (gate) {
             if (turn.Length == 0) throw new InvalidOperationException("它现在没有在执行");
             stopping = true;
+            afterStop.Clear();
             Call("turn/interrupt", new Dictionary<string, object> { { "threadId", Session }, { "turnId", turn } }, _ => { });
         }
+        CancelConfirmations();
     }
     protected override void Notified(string method, object p) {
         switch (method) {
@@ -682,7 +923,15 @@ public sealed class CodexChat : JsonRpcChat {
             case "turn/completed": {
                 var done = At(p, "turn"); string status = Text(done, "status");
                 if (Text(done, "id") == turn || turn.Length == 0) turn = "";
+                var queuedNext = afterStop.Count > 0 ? afterStop.ToArray() : null;
+                afterStop.Clear();
+                if (queuedNext != null && status == "interrupted") {
+                    TurnEndedQuiet("stopped", "");
+                    StartBatch(queuedNext);
+                    break;
+                }
                 TurnEnded(status == "completed" ? "done" : status == "interrupted" ? "stopped" : "failed", status == "failed" ? Text(At(done, "error"), "message") : "");
+                if (queuedNext != null) StartBatch(queuedNext);
                 State(asks.Count > 0 ? "confirm" : turn.Length > 0 ? "busy" : "idle");
                 break;
             }
@@ -702,7 +951,7 @@ public sealed class CodexChat : JsonRpcChat {
                 break;
             }
             case "error": Note(Text(At(p, "error"), "message").Length > 0 ? Text(At(p, "error"), "message") : "Codex 出错"); break;
-            case "account/rateLimits/updated": if (quotas != null) quotas.Note("codex", Quotas.FromCodex(At(p, "rateLimits"))); break;
+            case "account/rateLimits/updated": if (quotas != null) quotas.NoteCodexEvent(At(p, "rateLimits")); break;
         }
     }
     readonly HashSet<string> thoughts = new HashSet<string>();
@@ -739,6 +988,11 @@ public sealed class CodexChat : JsonRpcChat {
                 string question = Text(argsObj, "question");
                 title = Peers.StepTitle(Text(argsObj, "tool"), question);
                 if (question.Length > 0) more["detail"] = Cut(question, 2000);
+            } else if (toolName == Peers.CollabToolName) {
+                var argsObj = At(item, "arguments");
+                string goal = Text(argsObj, "goal");
+                title = Peers.CollabStepTitle(Text(argsObj, "mode"), goal);
+                if (goal.Length > 0) more["detail"] = Cut(goal, 2000);
             } else {
                 title = Text(item, "server") + "：" + toolName;
             }

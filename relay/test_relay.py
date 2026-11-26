@@ -116,6 +116,59 @@ class TerminalRelayTests(unittest.TestCase):
         with self.assertRaisesRegex(RemoteError, "不支持此操作"):
             self.relay.command({"action": "stop", "id": "4" * 32, "terminal": screen}, now=1013)
 
+    def test_a_conversation_is_reopened_the_other_way_with_what_it_had(self):
+        sid = "11111111-2222-3333-4444-555555555555"
+        self.info["features"] = ["chat"]
+        self.relay.agent({"info": self.info}, now=1001)
+        start = {"action": "start", "id": "a" * 32, "tool": "claude", "dir": "demo", "history": False, "form": "chat", "text": "看看结算页"}
+        chat = self.relay.command(start, now=1002)["terminal"]
+        listed = {"id": chat, "state": "running", "form": "chat", "status": "idle", "session": sid, "model": "opus", "mode": "edit"}
+        self.relay.agent({"info": self.info, "acks": [{"id": start["id"]}], "terminals": [listed]}, now=1003)
+        screen = {"action": "start", "id": "b" * 32, "tool": "claude", "dir": "demo", "reopen": chat}
+        with self.assertRaisesRegex(RemoteError, "不支持切换视图"):
+            self.relay.command(screen, now=1004)
+        self.info["features"] = ["chat", "reopen"]
+        self.relay.agent({"info": self.info, "terminals": [listed]}, now=1004)
+        for wrong in ({"form": "chat"}, {"session": sid}, {"takeover": True}, {"tool": "codex"}, {"reopen": "c" * 32}):
+            with self.assertRaises(RemoteError):
+                self.relay.command(dict(screen, id="e" * 32, **wrong), now=1005)
+        self.relay.agent({"info": self.info, "terminals": [dict(listed, status="busy")]}, now=1005)
+        reopened = self.relay.command(screen, now=1006)
+        terminals = {t["id"]: t for t in self.relay.overview(now=1006)["terminals"]}
+        new = terminals[reopened["terminal"]]
+        self.assertEqual((new["session"], new["model"], new["mode"], new.get("form", "")), (sid, "opus", "edit", ""))
+        operation = self.relay.agent({"info": self.info, "terminals": [listed]}, now=1007)["operations"][-1]
+        self.assertEqual((operation["action"], operation["reopen"]), ("start", chat))
+        # the computer refused it: the conversation stays where it was
+        self.relay.agent({"info": self.info, "acks": [{"id": screen["id"], "error": "对话正在执行或等待确认"}], "terminals": [listed]}, now=1008)
+        terminals = {t["id"]: t for t in self.relay.overview(now=1008)["terminals"]}
+        self.assertEqual(terminals.get(reopened["terminal"], {"state": "closed"})["state"], "closed")
+        self.assertEqual(terminals[chat]["state"], "running")
+
+    def test_model_change_reopens_only_an_idle_chat_and_keeps_permissions(self):
+        self.info["features"] = ["chat", "reopen"]
+        self.relay.agent({"info": self.info}, now=1001)
+        start = dict(action="start", id="a" * 32, tool="claude", dir="demo", form="chat")
+        terminal = self.relay.command(start, now=1002)["terminal"]
+        session = "11111111-2222-3333-4444-555555555555"
+        original = dict(id=terminal, session=session, state="running", form="chat", mode="read", model="opus", status="idle")
+        self.relay.agent({"info": self.info, "terminals": [original], "acks": [{"id": start["id"]}]}, now=1003)
+        tune = dict(start, id="b" * 32, reopen=terminal, model="sonnet", effort="high")
+        with self.assertRaises(RemoteError):
+            self.relay.command(tune, now=1004)
+        self.info["features"].append("chat-model")
+        for status in ("busy", "confirm"):
+            self.relay.agent({"info": self.info, "terminals": [dict(original, status=status)]}, now=1005)
+            with self.assertRaises(RemoteError):
+                self.relay.command(tune, now=1006)
+        self.relay.agent({"info": self.info, "terminals": [original]}, now=1007)
+        for extra in (dict(mode="full"), dict(form=""), dict(session=session), dict(worktree=True)):
+            with self.assertRaises(RemoteError):
+                self.relay.command(dict(tune, **extra), now=1008)
+        reopened = self.relay.command(tune, now=1009)["terminal"]
+        result = next(t for t in self.relay.overview(now=1009)["terminals"] if t["id"] == reopened)
+        self.assertEqual((result["session"], result["mode"], result["model"], result["effort"]), (session, "read", "sonnet", "high"))
+
     def test_an_agy_chat_needs_a_computer_that_runs_it(self):
         # Antigravity CLI runs as a conversation by its ACP server, on a computer that says so ("chat-agy")
         self.info["tools"] = ["claude", "codex", "agy", "shell"]
@@ -131,6 +184,35 @@ class TerminalRelayTests(unittest.TestCase):
         self.assertEqual((op["tool"], op["form"], op["text"]), ("agy", "chat", "看看这个项目"))
         self.assertEqual(self.relay.overview(now=1005)["terminals"][0]["form"], "chat")
         self.assertTrue(terminal)
+
+    def test_chat_attachments_are_checked_and_forwarded(self):
+        self.info["features"] = ["chat", "attachments"]
+        self.relay.agent({"info": self.info}, now=1001)
+        start = {"action": "start", "id": "a" * 32, "tool": "claude", "dir": "demo", "history": False, "form": "chat", "text": "开始"}
+        terminal = self.relay.command(start, now=1002)["terminal"]
+        self.relay.agent({"info": self.info, "terminals": [{"id": terminal, "state": "running", "form": "chat"}]}, now=1003)
+        path = ".remote-ai/attachments/20261121-123456-a1b2c3.png"
+        request = {"action": "say", "id": "b" * 32, "terminal": terminal, "text": "看图", "attachments": [path]}
+        self.relay.command(request, now=1004)
+        operation = self.relay.pull({"instance": self.info["instance"], "wait": 0})["operations"][0]
+        self.assertEqual(operation["attachments"], [path])
+        self.relay.command(dict(request, id="e" * 32, text=""), now=1005)
+        operation = self.relay.pull({"instance": self.info["instance"], "wait": 0})["operations"][0]
+        self.assertEqual((operation["text"], operation["attachments"]), ("", [path]))
+        with self.assertRaises(RemoteError):
+            self.relay.command({"action": "say", "id": "f" * 32, "terminal": terminal, "text": ""}, now=1005)
+        for bad in (
+            {"attachments": []},
+            {"attachments": [path] * 5},
+            {"attachments": [".remote-ai/attachments/bad.png"]},
+            {"attachments": ["../" + path]},
+        ):
+            with self.assertRaises(RemoteError):
+                self.relay.command(dict(request, id="c" * 32, **bad), now=1005)
+        self.info["features"] = ["chat"]
+        self.relay.agent({"info": self.info}, now=1006)
+        with self.assertRaisesRegex(RemoteError, "请先更新电脑端"):
+            self.relay.command(dict(request, id="d" * 32), now=1007)
 
     def test_quotas_are_kept_as_shares_and_times_only(self):
         self.info["quotas"] = [
@@ -159,6 +241,18 @@ class TerminalRelayTests(unittest.TestCase):
         # a computer that lets nobody in tells nothing of its owner's limits
         self.relay.agent({"info": dict(self.info, enabled=False)}, now=1003)
         self.assertEqual(self.relay.overview(now=1004)["device"]["quotas"], [])
+
+    def test_codex_billing_keeps_only_declared_fields(self):
+        self.info["quotas"] = [
+            {"tool": "codex", "at": 1001, "billing": {"type": "api", "key": "private", "balance": "0", "unit": "USD"}},
+            {"tool": "codex", "at": 1002, "billing": {"type": "credits", "balance": "0.5", "email": "private"}},
+            {"tool": "codex", "at": 1003, "billing": {"type": "api", "balance": "NaN", "unit": "USD"}},
+            {"tool": "claude", "at": 1004, "billing": {"type": "credits", "balance": "10"}},
+        ]
+        self.relay.agent({"info": self.info}, now=1001)
+        quotas = self.relay.overview(now=1002)["device"]["quotas"]
+        self.assertEqual([q.get("billing") for q in quotas],
+                         [{"type": "api", "balance": "0", "unit": "USD"}, {"type": "credits", "balance": "0.5"}, {"type": "api"}, None])
 
     def test_fresh_start_never_becomes_anonymous_resume(self):
         payload = {"action": "start", "id": "a" * 32, "tool": "claude", "dir": "demo", "history": True}
@@ -395,7 +489,7 @@ class TerminalRelayTests(unittest.TestCase):
                 self.relay.work({"id": "7" * 32, "action": "team_start", "item": wrong}, now=1005, wait=0)
         asked, got = carried({"id": "8" * 32, "action": "team_start", "item": dict(item, mode="compare", tools=["claude", "codex", "agy"], rounds=1)}, {"team": {"state": "running"}})
         self.assertEqual((asked["item"]["mode"], asked["item"]["tools"]), ("compare", ["claude", "codex", "agy"]))
-        with self.assertRaisesRegex(RemoteError, "1 至 4000"):
+        with self.assertRaisesRegex(RemoteError, "请输入文字或添加图片"):
             self.relay.work({"id": "9" * 32, "action": "team_say", "team": "d" * 32, "text": "   "}, now=1005, wait=0)
         with self.assertRaisesRegex(RemoteError, "候选方案无效"):
             self.relay.work({"id": "9" * 32, "action": "team_pick", "team": "d" * 32, "tool": "shell"}, now=1005, wait=0)
@@ -405,6 +499,14 @@ class TerminalRelayTests(unittest.TestCase):
             self.relay.work({"id": "9" * 32, "action": "team_swap", "team": "d" * 32, "role": "writer", "tool": "agy", "note": "x" * 1001}, now=1005, wait=0)
         asked, got = carried({"id": "a" * 32, "action": "team_say", "team": "d" * 32, "text": "  改用浅色卡片  ", "target": "agy"}, {"team": {"state": "running"}})
         self.assertEqual((asked["action"], asked["team"], asked["text"], asked["target"]), ("work_team_say", "d" * 32, "改用浅色卡片", "agy"))
+        path = ".remote-ai/attachments/20261121-123456-a1b2c3.png"
+        picture = {"id": "e" * 32, "action": "team_say", "team": "d" * 32, "text": "", "target": "agy", "attachments": [path]}
+        with self.assertRaisesRegex(RemoteError, "请先更新电脑端"):
+            self.relay.work(picture, now=1005, wait=0)
+        self.info["features"].append("attachments")
+        self.relay.agent({"info": self.info}, now=1005)
+        asked, got = carried(picture, {"team": {"state": "running"}})
+        self.assertEqual((asked["action"], asked["text"], asked["target"], asked["attachments"]), ("work_team_say", "", "agy", [path]))
         asked, got = carried({"id": "d" * 32, "action": "team_swap", "team": "d" * 32, "role": "writer", "tool": "agy", "note": "  接手继续修  "}, {"team": {"state": "running"}})
         self.assertEqual((asked["action"], asked["team"], asked["role"], asked["tool"], asked["note"]), ("work_team_swap", "d" * 32, "writer", "agy", "接手继续修"))
         asked, got = carried({"id": "b" * 32, "action": "team_pick", "team": "d" * 32, "tool": "codex"}, {"team": {"state": "done", "picked": "codex"}})
@@ -416,6 +518,211 @@ class TerminalRelayTests(unittest.TestCase):
             self.assertEqual((asked["action"], asked["team"]), ("work_" + action, "d" * 32))
         asked, got = carried({"id": "6" * 32, "action": "teams"}, {"teams": []})
         self.assertEqual((asked, got), ({"id": "6" * 32, "action": "work_teams"}, {"teams": []}))
+
+    def _carried(self, payload, answer):
+        import threading
+        got = {}
+        asking = threading.Thread(target=lambda: got.update(value=self.relay.work(payload, now=1004, wait=5)))
+        asking.start()
+        asked = self.relay.pull({"instance": self.info["instance"], "wait": 3})["operations"][0]
+        self.relay.agent({"info": self.info, "acks": [{"id": payload["id"], "error": "", "result": answer}]}, now=1005)
+        asking.join(5)
+        return {k: v for k, v in asked.items() if k not in ("at", "terminal")}, got.get("value")
+
+    def test_a_team_member_model_is_checked_and_passed_on(self):
+        # a computer without `teams-models`: no list, no model with a task or a swap (an empty choice is the default)
+        self.info.update(tools=["claude", "codex", "agy"], features=["work", "chat", "chat-agy", "teams", "teams-v2"])
+        self.relay.agent({"info": self.info}, now=1001)
+        item = {"id": "d" * 32, "mode": "review", "dir": "demo", "goal": "加优惠券", "tools": ["claude", "codex"], "rounds": 3}
+        for older in ({"id": "1" * 32, "action": "team_models"},
+                      {"id": "1" * 32, "action": "team_start", "item": dict(item, models={"claude": "sonnet"})},
+                      {"id": "1" * 32, "action": "team_swap", "team": "d" * 32, "tool": "agy", "model": "gemini-3-pro"}):
+            with self.assertRaisesRegex(RemoteError, "更新电脑端"):
+                self.relay.work(older, now=1002, wait=0)
+        asked, _ = self._carried({"id": "2" * 32, "action": "team_start", "item": dict(item, models={"claude": "", "codex": " "})}, {"team": {}})
+        self.assertNotIn("models", asked["item"])
+        # with it: the list is asked of the computer, and a safe name of a tool of the task is passed on
+        self.info["features"] = self.info["features"] + ["teams-models"]
+        self.relay.agent({"info": self.info}, now=1003)
+        listed = {"models": {"codex": [{"id": "gpt-5.1-codex", "label": "GPT-5.1 Codex"}], "claude": [], "agy": []}}
+        asked, got = self._carried({"id": "3" * 32, "action": "team_models"}, listed)
+        self.assertEqual((asked, got), ({"id": "3" * 32, "action": "work_team_models"}, listed))
+        for wrong in ({"agy": "gemini-3-pro"}, {"claude": "a b"}, {"claude": "x;rm -rf"}, {"claude": 5}, ["sonnet"], {"claude": "-x"}, {"claude": "a" * 81}):
+            with self.assertRaisesRegex(RemoteError, "模型选择无效"):
+                self.relay.work({"id": "4" * 32, "action": "team_start", "item": dict(item, models=wrong)}, now=1004, wait=0)
+        asked, _ = self._carried({"id": "5" * 32, "action": "team_start", "item": dict(item, models={"claude": " sonnet[1m] ", "codex": ""})}, {"team": {}})
+        self.assertEqual(asked["item"]["models"], {"claude": "sonnet[1m]"})
+        with self.assertRaisesRegex(RemoteError, "模型名称无效"):
+            self.relay.work({"id": "6" * 32, "action": "team_swap", "team": "d" * 32, "tool": "agy", "model": "gemini 3"}, now=1004, wait=0)
+        asked, _ = self._carried({"id": "7" * 32, "action": "team_swap", "team": "d" * 32, "tool": "agy", "model": "models/gemini-3-pro"}, {"team": {}})
+        self.assertEqual((asked["tool"], asked["model"]), ("agy", "models/gemini-3-pro"))
+        asked, _ = self._carried({"id": "8" * 32, "action": "team_swap", "team": "d" * 32, "tool": "agy"}, {"team": {}})
+        self.assertNotIn("model", asked)
+
+    def test_a_lead_roster_and_its_members_are_forwarded(self):
+        features = ["work", "chat", "chat-agy", "teams", "teams-v2", "teams-models", "teams-roster"]
+        self.info.update(tools=["claude", "codex", "agy"], features=features)
+        self.relay.agent({"info": self.info}, now=1001)
+        team = "d" * 32
+        leader = {"role": "leader", "tool": "claude"}
+        worker = {"role": "member-1", "tool": "claude", "model": "sonnet"}
+        second = {"role": "member-2", "tool": "claude", "model": "opus"}
+        item = {"id": team, "mode": "lead", "dir": "demo", "goal": "查结账", "rounds": 2}
+        asked, _ = self._carried({"id": "1" * 32, "action": "team_start", "item": dict(item, roster=[leader, worker, second])}, {"team": {}})
+        self.assertEqual(asked["item"]["tools"], ["claude"] * 3)
+        self.assertEqual(asked["item"]["roster"], [dict(leader, model=""), worker, second])
+        asked, _ = self._carried({"id": "2" * 32, "action": "team_start", "item": dict(item, roster=[leader], auto_roster=True)}, {"team": {}})
+        self.assertTrue(asked["item"]["auto_roster"])
+        self.assertEqual(asked["item"]["roster"], [dict(leader, model="")])
+        for invalid in (dict(item, roster=[leader, worker, worker]), dict(item, roster=[leader], auto_roster="true"),
+                        dict(item, roster=[leader, worker], auto_roster=True), dict(item, roster=[leader, dict(worker, model="a b")])):
+            with self.assertRaises(RemoteError):
+                self.relay.work({"id": "3" * 32, "action": "team_start", "item": invalid}, now=1002, wait=0)
+        asked, _ = self._carried({"id": "4" * 32, "action": "team_say", "team": team, "target": "member-2", "text": "再检查"}, {"team": {}})
+        self.assertEqual(asked["target"], "member-2")
+        asked, _ = self._carried({"id": "5" * 32, "action": "team_swap", "team": team, "role": "member-2", "tool": "claude", "model": ""}, {"team": {}})
+        self.assertEqual((asked["role"], asked["model"]), ("member-2", ""))
+        card = dict(item, state="running", updated=1700000000, awaited=["discuss:member-1", "member-2"], roster=[leader, worker, second])
+        self.relay.agent({"info": dict(self.info, team_cards=[card])}, now=1003)
+        overview = self.relay.overview(now=1003)["device"]
+        self.assertIn("teams-roster", overview["features"])
+        self.assertEqual(overview["team_cards"][0]["awaited"], ["discuss:member-1", "member-2"])
+        self.assertEqual(overview["team_cards"][0]["roster"], [dict(leader, model=""), worker, second])
+        # older computer without `teams-effort` rejects non-empty effort cleanly, allows empty effort as default
+        for older in ({"id": "6" * 32, "action": "team_start", "item": dict(item, roster=[dict(leader, effort="high"), worker])},
+                      {"id": "6" * 32, "action": "team_start", "item": dict(item, roster=[dict(leader, effort="high")], auto_roster=True)},
+                      {"id": "6" * 32, "action": "team_swap", "team": team, "role": "leader", "tool": "codex", "effort": "high"}):
+            with self.assertRaisesRegex(RemoteError, "更新电脑端"):
+                self.relay.work(older, now=1004, wait=0)
+        asked, _ = self._carried({"id": "7" * 32, "action": "team_start", "item": dict(item, roster=[dict(leader, effort=""), worker])}, {"team": {}})
+        self.assertNotIn("effort", asked["item"]["roster"][0])
+        # with `teams-effort`: roster effort (manual & auto-roster), swap effort, and team_cards preserve valid effort
+        self.info["features"] = features + ["teams-effort"]
+        self.relay.agent({"info": self.info}, now=1005)
+        leader_with_effort = {"role": "leader", "tool": "codex", "model": "gpt-6.2-sol", "effort": "HIGH"}
+        asked, _ = self._carried({"id": "8" * 32, "action": "team_start", "item": dict(item, roster=[leader_with_effort, worker])}, {"team": {}})
+        self.assertEqual(asked["item"]["roster"][0], {"role": "leader", "tool": "codex", "model": "gpt-6.2-sol", "effort": "high"})
+        asked, _ = self._carried({"id": "9" * 32, "action": "team_start", "item": dict(item, roster=[leader_with_effort], auto_roster=True)}, {"team": {}})
+        self.assertEqual(asked["item"]["roster"], [{"role": "leader", "tool": "codex", "model": "gpt-6.2-sol", "effort": "high"}])
+        asked, _ = self._carried({"id": "a" * 32, "action": "team_swap", "team": team, "role": "leader", "tool": "codex", "model": "gpt-6.2-astra", "effort": "xhigh"}, {"team": {}})
+        self.assertEqual((asked["role"], asked["model"], asked["effort"]), ("leader", "gpt-6.2-astra", "xhigh"))
+        for bad_effort in (dict(item, roster=[dict(leader, effort="bad effort"), worker]),
+                           dict(item, roster=[dict(leader, effort=123), worker])):
+            with self.assertRaisesRegex(RemoteError, "思考深度无效"):
+                self.relay.work({"id": "b" * 32, "action": "team_start", "item": bad_effort}, now=1006, wait=0)
+        with self.assertRaisesRegex(RemoteError, "思考深度无效"):
+            self.relay.work({"id": "c" * 32, "action": "team_swap", "team": team, "role": "leader", "tool": "codex", "effort": "x;y"}, now=1006, wait=0)
+        card_effort = dict(item, state="running", updated=1700000000, awaited=["leader"], roster=[{"role": "leader", "tool": "codex", "model": "gpt-6.2-sol", "effort": "high"}, worker])
+        self.relay.agent({"info": dict(self.info, team_cards=[card_effort])}, now=1007)
+        overview = self.relay.overview(now=1007)["device"]
+        self.assertIn("teams-effort", overview["features"])
+        self.assertEqual(overview["team_cards"][0]["roster"][0]["effort"], "high")
+        # free rounds (`rounds: 0`, 分工协作 only): refused by a computer that does not say it can, then passed on
+        free = dict(item, rounds=0, roster=[leader, worker])
+        with self.assertRaisesRegex(RemoteError, "自由轮数"):
+            self.relay.work({"id": "d" * 32, "action": "team_start", "item": free}, now=1008, wait=0)
+        self.info["features"] = features + ["teams-effort", "teams-flex-rounds"]
+        self.relay.agent({"info": self.info}, now=1009)
+        self.assertIn("teams-flex-rounds", self.relay.overview(now=1009)["device"]["features"])
+        asked, _ = self._carried({"id": "e" * 32, "action": "team_start", "item": free}, {"team": {}})
+        self.assertEqual(asked["item"]["rounds"], 0)
+        for bad_rounds in ({"id": team, "mode": "review", "dir": "demo", "goal": "写", "tools": ["claude", "codex"], "rounds": 0}, dict(free, rounds=-1), dict(free, rounds=11), dict(free, rounds=True)):
+            with self.assertRaisesRegex(RemoteError, "轮数"):
+                self.relay.work({"id": "f" * 32, "action": "team_start", "item": bad_rounds}, now=1010, wait=0)
+        # promoting an existing conversation (`from_terminal` / `context`): gated by `teams-promote`
+        promoted = dict(free, from_terminal="a" * 32, context="  前期已确认方案  ")
+        with self.assertRaisesRegex(RemoteError, "对话转为协作"):
+            self.relay.work({"id": "1" * 32, "action": "team_start", "item": promoted}, now=1011, wait=0)
+        self.info["features"] = features + ["teams-effort", "teams-flex-rounds", "teams-promote"]
+        self.relay.agent({"info": self.info}, now=1012)
+        self.assertIn("teams-promote", self.relay.overview(now=1012)["device"]["features"])
+        asked, _ = self._carried({"id": "2" * 32, "action": "team_start", "item": promoted}, {"team": {}})
+        self.assertEqual((asked["item"]["from_terminal"], asked["item"]["context"]), ("a" * 32, "前期已确认方案"))
+        for bad_promote in (dict(promoted, mode="compare", tools=["claude", "codex"], rounds=1, roster=None),
+                            dict(promoted, discuss=True),
+                            dict(promoted, from_terminal="not-a-terminal"),
+                            dict(promoted, context="x" * 6001)):
+            bad_item = {k: v for k, v in bad_promote.items() if v is not None}
+            with self.assertRaises(RemoteError):
+                self.relay.work({"id": "3" * 32, "action": "team_start", "item": bad_item}, now=1013, wait=0)
+
+    def test_team_cards_and_members_are_listed_for_the_owner(self):
+        team, sid = "e" * 32, "11111111-2222-3333-4444-555555555555"
+        card = {"id": team, "dir": "demo", "goal": "g" * 300, "mode": "lead", "state": "running", "phase": "verify", "note": "", "updated": 1700000000,
+                "awaited": ["leader", "discuss:agy", "Bad Role"], "tools": ["codex", "claude", "shell"], "models": {"claude": "sonnet", "codex": "a b", "shell": "x"}, "confirm": True}
+        bad = [dict(card, id="x"), dict(card, mode="vote"), dict(card, state="lost"), dict(card, updated="1"), "x"]
+        self.info["features"] = ["work", "teams", "teams-grouped"]
+        terminal = "c" * 32
+        self.relay.agent({"info": dict(self.info, team_cards=[card] + bad), "sessions": [
+            {"id": sid, "tool": "claude", "dir": "demo", "title": "成员", "updated": 1700000000000, "team": team},
+            {"id": "66666666-7777-8888-9999-000000000000", "tool": "codex", "dir": "demo", "title": "其它", "updated": 1700000000000, "team": "not-an-id"}],
+            "terminals": [{"id": terminal, "tool": "claude", "dir": "demo", "created": 1700000000000, "state": "running", "form": "chat", "session": sid, "team": team}]}, now=1001)
+        overview = self.relay.overview(now=1001)
+        self.assertEqual(overview["device"]["team_cards"], [{"id": team, "dir": "demo", "goal": "g" * 200, "mode": "lead", "state": "running", "phase": "verify", "note": "", "updated": 1700000000,
+                                                             "awaited": ["leader", "discuss:agy"], "tools": ["codex", "claude"], "models": {"claude": "sonnet"}, "confirm": True}])
+        self.assertIn("teams-grouped", overview["device"]["features"])
+        self.assertEqual({s["id"]: s["team"] for s in overview["sessions"]}, {sid: team, "66666666-7777-8888-9999-000000000000": ""})
+        self.assertEqual([t["team"] for t in overview["terminals"]], [team])
+        # the task removed: the computer lists them by themselves again
+        self.relay.agent({"info": self.info, "terminals": [{"id": terminal, "tool": "claude", "dir": "demo", "created": 1700000000000, "state": "running", "form": "chat", "session": sid, "team": ""}]}, now=1002)
+        overview = self.relay.overview(now=1002)
+        self.assertEqual((overview["device"]["team_cards"], overview["terminals"][0]["team"]), ([], ""))
+        # nothing of it while the computer is not enabled, nor to whoever is not signed in (server.py answers 401 before the overview)
+        self.relay.agent({"info": dict(self.info, enabled=False, team_cards=[card])}, now=1003)
+        self.assertEqual(self.relay.overview(now=1003)["device"]["team_cards"], [])
+
+    def test_team_card_preserves_leader_decision_phase(self):
+        card = {"id": "e" * 32, "mode": "lead", "state": "running", "phase": "decision",
+                "updated": 1700000000, "awaited": ["leader"], "tools": ["codex", "claude"]}
+        states = [("running", "decision", "decision"), ("paused", "decision", "decision"),
+                  ("running", "verify", "verify"), ("done", "verify", "verify"),
+                  ("running", "unknown", "")]
+        for now, (state, phase, expected) in enumerate(states, 1001):
+            with self.subTest(state=state, phase=phase):
+                self.relay.agent({"info": dict(self.info, team_cards=[dict(card, state=state, phase=phase)])}, now=now)
+                stored = self.relay.overview(now=now)["device"]["team_cards"][0]
+                self.assertEqual((stored["state"], stored["phase"], stored["awaited"]), (state, expected, ["leader"]))
+
+    def test_linux_team_tool_flags_allow_pty_members_cards_pick_and_adopt(self):
+        team_id = "f" * 24
+        self.info["tools"] = ["claude", "opencode", "qoder", "cline", "pi", "shell"]
+        self.info["features"] = ["work", "chat", "teams", "teams-v2", "teams-grouped",
+                                 "claude-team", "opencode-team", "qoder-team", "cline-team", "pi-team"]
+        card = {"id": team_id, "dir": "demo", "goal": "跨工具比稿", "mode": "compare", "state": "choose",
+                "phase": "", "note": "", "updated": 1700000000, "awaited": [],
+                "tools": ["claude", "opencode", "pi", "shell"], "models": {}}
+        oc_term, cl_term = "a" * 32, "b" * 32
+        oc_sid, cl_sid = "ses_abcdef1234567890", "1730000000000_ab12cd"
+        self.relay.agent({
+            "info": dict(self.info, team_cards=[card]),
+            "terminals": [
+                {"id": oc_term, "tool": "opencode", "dir": "demo", "created": 1700000000000,
+                 "state": "running", "session": oc_sid, "team": team_id},
+                {"id": cl_term, "tool": "cline", "dir": "demo", "created": 1700000000001,
+                 "state": "running", "session": cl_sid, "team": team_id},
+            ],
+        }, now=1001)
+        overview = self.relay.overview(now=1001)
+        self.assertIn("opencode-team", overview["device"]["features"])
+        self.assertIn("pi-team", overview["device"]["features"])
+        self.assertEqual(overview["device"]["team_cards"][0]["tools"], ["claude", "opencode", "pi"])
+        adopted = {t["id"]: t for t in overview["terminals"]}
+        self.assertEqual((adopted[oc_term]["session"], adopted[oc_term]["team"]), (oc_sid, team_id))
+        self.assertEqual((adopted[cl_term]["session"], adopted[cl_term]["team"]), (cl_sid, team_id))
+
+        asked, _ = self._carried({"id": "1" * 32, "action": "team_start",
+                                  "item": {"id": team_id, "mode": "compare", "dir": "demo",
+                                           "goal": "比稿", "tools": ["opencode", "pi"], "rounds": 1}},
+                                 {"team": {"id": team_id}})
+        self.assertEqual(asked["item"]["tools"], ["opencode", "pi"])
+        asked, _ = self._carried({"id": "2" * 32, "action": "team_pick", "team": team_id, "tool": "opencode"},
+                                 {"team": {"id": team_id}})
+        self.assertEqual(asked["tool"], "opencode")
+        asked, _ = self._carried({"id": "3" * 32, "action": "team_swap", "team": team_id, "role": "writer", "tool": "qoder"},
+                                 {"team": {"id": team_id}})
+        self.assertEqual(asked["tool"], "qoder")
+        with self.assertRaises(RemoteError):
+            self.relay.work({"id": "4" * 32, "action": "team_pick", "team": team_id, "tool": "shell"}, now=1002, wait=0)
 
     def test_desktop_timeout_never_claims_not_executed(self):
         self.info["features"] = ["codex-desktop-open"]
@@ -551,16 +858,40 @@ class TerminalRelayTests(unittest.TestCase):
         with self.assertRaises(RemoteError):
             self.relay.command({"id": "e" * 32, "terminal": self.terminal, "action": "close"}, now=2000)
 
-    def test_close_error_and_cap_do_not_drop_existing_terminals(self):
-        self.start()
-        op = {"id": "c" * 32, "terminal": self.terminal, "action": "close"}
-        self.relay.command(op, now=1004)
-        self.relay.agent({"info": self.info, "acks": [{"id": op["id"]}], "terminals": [{"id": self.terminal, "state": "closed"}]}, now=1005)
-        self.assertEqual(self.relay.overview(self.terminal, now=1006)["terminal"]["state"], "closed")
-        for n in range(8):
-            self.relay.command({"id": "%032x" % n, "action": "start", "tool": "claude", "dir": "demo"}, now=1007)
-        with self.assertRaises(RemoteError):
-            self.relay.command({"id": "d" * 32, "action": "start", "tool": "claude", "dir": "demo"}, now=1008)
+    def test_terminal_cap_counts_pending_starts_and_all_terminal_forms(self):
+        session = "11111111-2222-3333-4444-555555555555"
+        info = dict(self.info, features=["chat"])
+        self.relay.agent({"info": info, "sessions": [
+            {"id": session, "tool": "claude", "dir": "demo", "title": "Saved", "updated": 1000},
+        ]}, now=1001)
+        operations = [{"id": "%032x" % n, "action": "start", "tool": "shell", "dir": "demo"} for n in range(1, 15)]
+        operations += [
+            {"id": "a" * 32, "action": "start", "tool": "codex", "dir": "demo", "form": "chat"},
+            {"id": "b" * 32, "action": "start", "tool": "claude", "dir": "demo", "session": session},
+        ]
+        reports = [{"id": self.relay.command(op, now=1002)["terminal"], "state": "running"} for op in operations]
+        next_op = {"id": "d" * 32, "action": "start", "tool": "shell", "dir": "demo"}
+        with self.assertRaisesRegex(RemoteError, "^最多同时运行 16 个终端，请先结束一个$"):
+            self.relay.command(next_op, now=1003)
+
+        def publish(at):
+            self.relay.agent({"info": info, "terminals": reports}, now=at)
+            return {t["id"] for t in self.relay.overview(now=at)["terminals"] if t["state"] == "running"}
+
+        self.assertEqual(publish(1004), {t["id"] for t in reports})
+        reports[0]["state"] = "closed"
+        self.assertEqual(len(publish(1005)), 15)
+        reports.append({"id": self.relay.command(next_op, now=1006)["terminal"], "state": "running"})
+        self.assertEqual(publish(1007), {t["id"] for t in reports[1:]})
+
+    def test_new_relay_adopts_all_sixteen_running_terminals_behind_closed_reports(self):
+        history = [{"id": "%032x" % n, "state": "closed", "tool": "shell", "dir": "demo", "created": n}
+                   for n in range(1, 29)]
+        running = [{"id": "%032x" % n, "state": "running", "tool": "shell", "dir": "demo", "created": n}
+                   for n in range(29, 45)]
+        self.relay.agent({"info": self.info, "terminals": history + running}, now=1001)
+        actual = {t["id"] for t in self.relay.overview(now=1001)["terminals"] if t["state"] == "running"}
+        self.assertEqual(actual, {t["id"] for t in running})
 
     def test_new_terminal_sorts_above_second_precision_history(self):
         old = {"action": "start", "id": "1" * 32, "tool": "shell", "dir": "demo"}
@@ -1007,6 +1338,59 @@ class TerminalRelayTests(unittest.TestCase):
         self.relay.agent({"info": info}, now=1004)
         with self.assertRaises(RemoteError):
             self.relay.conversation(dict(stop, receipt=True), now=1004, wait=0)
+
+    def test_agy_desktop_open_draft_limits(self):
+        op = dict(id="a" * 32, tool="agy", action="app_open", dir="demo")
+        info = dict(self.info, features=["agy-desktop-open", "claude-desktop-open"])
+        self.relay.agent({"info": info}, now=1001)
+        for tool, text in (("agy", "😀" * 4001), ("claude", "😀" * 501)):
+            with self.assertRaises(RemoteError):
+                self.relay.command(dict(op, tool=tool, draft=text), now=1002)
+        self.relay.command(dict(op, draft="😀" * 4000), now=1002)
+        sent = self.relay.pull({"instance": info["instance"], "wait": 0})["operations"]
+        self.assertEqual(sent[0]["draft"], "😀" * 4000)
+
+    def test_agy_desktop_read_choice_routing_and_receipts(self):
+        from concurrent.futures import ThreadPoolExecutor
+        sid = "11111111-2222-3333-4444-555555555555"
+        info = dict(self.info, features=["reach", "peek", "agy-desktop-control"])
+        ask = dict(id="abcdef12", kind="question", text="选择一个项目",
+                   options=[dict(id=f"choice:{i}", label=str(i), detail="") for i in range(7)])
+        session = dict(id=sid, tool="agy", dir="demo", title="示例", updated=1, live=True,
+                       status="confirm", reach=["answer"], transport="agy-desktop", ask=ask)
+        def report():
+            self.relay.agent({"info": info, "sessions": [session]}, now=1001)
+
+        def exchange(request, result):
+            with ThreadPoolExecutor(1) as pool:
+                answer = pool.submit(self.relay.conversation, request, now=1002, wait=4)
+                op, = self.relay.pull({"instance": info["instance"], "wait": 2})["operations"]
+                self.relay.agent({"info": info, "acks": [{"id": request["id"], "result": result}]}, now=1003)
+                self.assertEqual(answer.result(), result)
+                return op
+
+        report()
+        self.assertEqual(self.relay.overview(now=1001)["sessions"][0]["ask"], ask)
+        exchange(dict(id="a" * 32, session=sid, action="read"), {"same": True, "ask": ask})
+        request = dict(id="b" * 32, session=sid, action="answer", ask=ask["id"], allow=True, choice="choice:6")
+        for change in (dict(choice="choice:7"), dict(choice="choice:01"), dict(choice=[]), dict(allow=False),
+                       dict(scope="always"), dict(ask="bbbbbbbb"), dict(receipt="true"), dict(transport="hook")):
+            with self.assertRaises(RemoteError):
+                self.relay.conversation(dict(request, **change), now=1002, wait=0)
+        op = exchange(request, {"status": "accepted"})
+        self.assertEqual((op["transport"], op["choice"], op["receipt"]), ("agy-desktop", "choice:6", False))
+        op = exchange(dict(request, id="c" * 32, allow=False, choice="deny"), {"status": "accepted"})
+        self.assertFalse(op["allow"])
+        session.update(status="busy", ask=None, reach=["say", "stop"])
+        report()
+        self.assertTrue(exchange(dict(request, receipt=True), {"status": "accepted"})["receipt"])
+        for verb, fields in (("stop", {}), ("say", {"text": "继续"})):
+            op = exchange(dict(id="d" * 32, session=sid, action=verb, **fields), {"status": "accepted"})
+            self.assertEqual((op["transport"], op["action"]), ("agy-desktop", "session_" + verb))
+        info["features"].remove("agy-desktop-control")
+        report()
+        with self.assertRaises(RemoteError):
+            self.relay.conversation(dict(request, receipt=True), now=1002, wait=0)
 
     def test_native_stop_capability_requires_matching_application(self):
         from relay import _reached
@@ -1548,6 +1932,49 @@ class TerminalRelayTests(unittest.TestCase):
         for _ in range(2):          # said again and again, the list stays the same: the newest that fit
             self.relay.agent({"info": self.info, "terminals": many}, now=1005)
             self.assertEqual(ids(), {"%032x" % n for n in range(10, 10 + tr.MAX_HISTORY)})
+
+    def test_start_params_and_terminal_metadata(self):
+        info = dict(self.info, max_mode="edit", features=["chat", "chat-agy", "chat-params", "teams-models", "teams-effort"])
+        self.relay.agent({"info": info, "terminals": []}, now=1001)
+        overview = self.relay.overview(now=1002)
+        self.assertEqual(overview["device"]["max_mode"], "edit")
+        self.assertIn("chat-params", overview["device"]["features"])
+        with self.assertRaises(tr.RemoteError):
+            self.relay.command({"action": "start", "id": "a" * 32, "tool": "claude", "dir": "demo", "mode": "admin"}, now=1003)
+        with self.assertRaises(tr.RemoteError):
+            self.relay.command({"action": "start", "id": "b" * 32, "tool": "claude", "dir": "demo", "model": "bad model!"}, now=1004)
+        res = self.relay.command({"action": "start", "id": "c" * 32, "tool": "claude", "dir": "demo", "form": "chat",
+                                  "model": "claude-opus-5-5", "effort": "high", "mode": "read"}, now=1005)
+        tid = res["terminal"]
+        self.relay.agent({"info": info, "acks": [{"id": "c" * 32}],
+                          "terminals": [{"id": tid, "state": "running", "form": "chat", "tool": "claude", "dir": "demo",
+                                         "model": "claude-opus-5-5", "effort": "high", "mode": "read"}]}, now=1006)
+        term = self.relay.overview(tid, now=1007)["terminal"]
+        self.assertEqual((term["model"], term["effort"], term["mode"]), ("claude-opus-5-5", "high", "read"))
+
+    def test_pty_output_burst_does_not_bump_overview_list_rev(self):
+        info = dict(self.info, features=["chat"])
+        self.relay.agent({"info": info, "terminals": []}, now=1000)
+        tid = self.relay.command({"action": "start", "id": "d" * 32, "tool": "claude", "dir": "demo", "form": "chat"}, now=1001)["terminal"]
+        self.relay.agent({"info": info, "acks": [{"id": "d" * 32}],
+                          "terminals": [{"id": tid, "state": "running", "form": "chat", "tool": "claude", "dir": "demo", "status": "busy"}]}, now=1002)
+        rev_before = self.relay.overview(now=1003)["rev"]
+        # Pure PTY/chat output chunks must wake per-terminal readers without bumping overview list rev.
+        self.relay.agent({"info": info,
+                          "terminals": [{"id": tid, "state": "running", "form": "chat", "tool": "claude", "dir": "demo", "status": "busy"}],
+                          "output": [{"terminal": tid, "seq": 1, "data": '{"t":"delta","text":"hello"}\n'},
+                                     {"terminal": tid, "seq": 2, "data": '{"t":"delta","text":" world"}\n'}]}, now=1004)
+        unchanged = self.relay.overview(now=1005, rev=rev_before, wait=0)
+        self.assertTrue(unchanged.get("unchanged"))
+        self.assertEqual(unchanged["rev"], rev_before)
+        chunks = self.relay.overview(tid, after=0, now=1005)["chunks"]
+        self.assertEqual(len(chunks), 2)
+        # Status/phase transition MUST bump overview list rev immediately.
+        self.relay.agent({"info": info,
+                          "terminals": [{"id": tid, "state": "running", "form": "chat", "tool": "claude", "dir": "demo", "status": "idle"}]}, now=1006)
+        updated = self.relay.overview(now=1007, rev=rev_before, wait=0)
+        self.assertFalse(updated.get("unchanged"))
+        self.assertGreater(updated["rev"], rev_before)
 
 
 if __name__ == "__main__":

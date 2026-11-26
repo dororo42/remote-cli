@@ -51,14 +51,14 @@ import sys
 import termios
 import threading
 import time
-import quotas as quotas_store
-import peers as peers_mod
-import teams
-import worktrees
 import uuid
 from types import SimpleNamespace
 from urllib.parse import quote, urlsplit
 import claude_permissions
+import peers as peers_mod
+import quotas as quotas_store
+import teams
+import worktrees
 
 VERSION = "0.7.0"
 ID_RE = re.compile(r"\A[a-f0-9]{16,32}\Z")
@@ -190,14 +190,20 @@ UPLOAD_ACTIONS = ("file_upload_start", "file_upload_chunk", "file_upload_finish"
 FILE_ACTIONS = ("file_list", "file_read") + UPLOAD_ACTIONS
 FILE_PIECE = 737280     # bytes of a file in one answer, as the Windows agent cuts them
 FILE_ENTRIES = 3000     # entries of a folder in one answer
-FEATURES = ["terminal-exit", "files", "file-upload", "peek", "marks", "delete", "work", "chat", "chains", "brief", "schedule-days", "teams", "teams-v2"]
-TEAM_FEATURES = tuple(tool + "-team" for tool in ("claude", "codex", "opencode", "qoder", "cline", "pi", "agy"))
+TOOL_LABELS = {"claude": "Claude Code", "codex": "Codex", "opencode": "OpenCode", "qoder": "Qoder", "cline": "Cline", "pi": "Pi"}
+FEATURES = ["terminal-exit", "files", "file-upload", "attachments", "peek", "marks", "delete", "work", "chat", "chains", "brief", "schedule-days", "reopen", "teams", "teams-v2", "teams-grouped"]
+CLAUDE_READ_ONLY_TOOLS = frozenset(("Read", "Glob", "Grep", "LS", "NotebookRead"))
+ATTACHMENT_LIMIT = 20 * 1024 * 1024
+ATTACHMENT_PATH = re.compile(r"^\.remote-ai/attachments/[0-9]{8}-[0-9]{6}-[0-9a-f]{6}\.(?:png|jpg|jpeg|webp|gif)$")
 # What the phone asks about the owner's work (docs/PROTOCOL.md, `/api/work`). Passing on when a conversation stops
 # ("chains") is seen by watching the conversation's record grow and then go quiet — the tools' own hooks, which
 # tell the Windows program of it at once, are not there on Linux.
 WORK_ACTIONS = ("work_stats", "work_schedules", "work_schedule_set", "work_schedule_remove", "work_handoff", "work_brief",
-                "work_chains", "work_chain_set", "work_chain_remove")
+                "work_chains", "work_chain_set", "work_chain_remove",
+                "work_teams", "work_team_start", "work_team_stop", "work_team_resume",
+                "work_team_remove", "work_team_say", "work_team_pick", "work_team_swap")
 CHAIN_TOOLS = ("claude", "codex", "opencode", "qoder", "cline", "pi")   # the conversations the phone can pass between
+TEAM_FEATURES = tuple(tool + "-team" for tool in CHAIN_TOOLS)
 CHAIN_QUIET = 45.0     # a turn is over once the source's record has been quiet this long after growing
 MAX_CHAINS = 20
 LONGEST_TURN, LONGEST_WAIT = 3 * 3600, 600      # a turn is counted for no longer; a first answer later than this is none
@@ -211,7 +217,7 @@ SAID_NOTED = 600        # of what the tool said of its work between its steps, t
 SAID_RESULTS = 40       # of this many steps, counted from the last, the first lines of what came back are given
 # where the tools' own installers put them; a service's PATH seldom has these
 TOOL_DIRS = (".local/bin", ".npm-global/bin", "bin", ".bun/bin", ".volta/bin", ".cargo/bin", ".opencode/bin")
-MAX_TERMINALS = 8
+MAX_TERMINALS = 16
 MAX_OWN_PROJECTS = 30
 OP_TTL = 150            # seconds an operation may travel before it is refused
 CHUNK_CHARS = 12000
@@ -614,6 +620,60 @@ def publish_upload(tmp, name, fd):
         raise
 
 
+def attachment_media(path):
+    return {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".webp": "image/webp", ".gif": "image/gif"
+    }.get(os.path.splitext(path)[1].lower(), "")
+
+
+def read_attachments(root, value):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise OpError("\u9644\u56fe\u4e0d\u5b58\u5728\u6216\u5df2\u88ab\u5220\u9664")
+    if len(value) > 4:
+        raise OpError("\u9644\u56fe\u6700\u591a 4 \u5f20")
+    result = []
+    root = os.path.realpath(root)
+    for relative in value:
+        if not isinstance(relative, str) or not ATTACHMENT_PATH.fullmatch(relative):
+            raise OpError("\u9644\u56fe\u4e0d\u5b58\u5728\u6216\u5df2\u88ab\u5220\u9664")
+        absolute = os.path.normpath(os.path.join(root, relative))
+        real = os.path.realpath(absolute)
+        if absolute != os.path.join(root, relative) or not absolute.startswith(root.rstrip("/") + "/") \
+                or real != absolute or not real.startswith(root.rstrip("/") + "/"):
+            raise OpError("\u9644\u56fe\u4e0d\u5b58\u5728\u6216\u5df2\u88ab\u5220\u9664")
+        try:
+            info = os.stat(absolute, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > ATTACHMENT_LIMIT:
+                raise OpError("\u9644\u56fe\u4e0d\u5b58\u5728\u6216\u5df2\u88ab\u5220\u9664")
+            with open(absolute, "rb") as stream:
+                data = stream.read()
+        except (FileNotFoundError, PermissionError, OSError):
+            raise OpError("\u9644\u56fe\u4e0d\u5b58\u5728\u6216\u5df2\u88ab\u5220\u9664")
+        result.append({"relative": relative, "absolute": absolute, "media": attachment_media(absolute), "data": data})
+    return result
+
+
+def attachment_text(text, attachments):
+    return text if not attachments else text + "\n\n" + "\n".join("\u9644\u56fe\uff1a" + one["absolute"] for one in attachments)
+
+
+def claude_content(text, attachments):
+    return [{"type": "text", "text": text}] + [
+        {"type": "image", "source": {"type": "base64", "media_type": one["media"],
+                                     "data": base64.b64encode(one["data"]).decode("ascii")}}
+        for one in attachments
+    ]
+
+
+def codex_content(text, attachments):
+    return [{"type": "text", "text": text, "text_elements": []}] + [
+        {"type": "localImage", "path": one["absolute"]} for one in attachments
+    ]
+
+
 class Uploads:
     """Bounded uploads owned by this agent (docs/PROTOCOL.md, "Uploads"). A destination is
     published only after all bytes arrive, and an existing file or folder is never replaced.
@@ -710,6 +770,23 @@ class Uploads:
         if isinstance(size, bool) or not isinstance(size, int) or not 0 <= size <= self.LIMIT:
             raise OpError("单个文件上传上限为 300 MB")
         relative = str(op.get("path") or "")
+        if ATTACHMENT_PATH.fullmatch(relative):
+            if size > ATTACHMENT_LIMIT:
+                raise OpError("\u9644\u56fe\u4e0d\u5b58\u5728\u6216\u5df2\u88ab\u5220\u9664")
+            remote = os.path.join(os.path.normpath(root), ".remote-ai")
+            attachments = os.path.join(remote, "attachments")
+            for directory in (remote, attachments):
+                if os.path.lexists(directory) and (os.path.islink(directory) or not os.path.isdir(directory)):
+                    raise OpError("\u9644\u56fe\u4e0d\u5b58\u5728\u6216\u5df2\u88ab\u5220\u9664")
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+            ignore = os.path.join(remote, ".gitignore")
+            if not os.path.exists(ignore):
+                try:
+                    fd_ignore = os.open(ignore, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(fd_ignore, "w", encoding="utf-8", newline="") as stream:
+                        stream.write("*")
+                except FileExistsError:
+                    pass
         parts = self._parts(relative)
         root = os.path.normpath(root)
         full = os.path.normpath(os.path.join(root, *parts))
@@ -1200,6 +1277,80 @@ class Sessions:
     def known(self, session, tool, name):
         return next((s for s in self.found if s["id"] == session and s["tool"] == tool and s["dir"] == name), None)
 
+    def read_folder(self, session, tool, folder, since=""):
+        """Reads a conversation directly from its working folder (for both project dirs and
+        temporary compare worktrees). Returns (answer, stamp)."""
+        if not session_id_ok(tool, session) or not folder:
+            raise OpError("电脑上没有找到这个对话，请刷新后重试")
+        try:
+            if tool == "opencode":
+                answer = said_opencode(session)
+                stamp = "u%d" % answer["updated"]
+                return ({"same": True} if since and since == stamp else answer), stamp
+            if tool == "cline":
+                answer = said_cline(session)
+                stamp = "u%d" % answer["updated"]
+                return ({"same": True} if since and since == stamp else answer), stamp
+            if tool == "pi":
+                found = glob.glob(os.path.join(self.pi_home(), "sessions",
+                                               pi_slug(folder), "*_%s.jsonl" % session))
+                info = os.stat(found[0])
+                stamp = "%d.%d" % (info.st_size, info.st_mtime_ns)
+                return ({"same": True} if since and since == stamp else said_pi(found[0])), stamp
+            if tool == "claude":
+                found = [os.path.join(self.claude_home(), "projects", re.sub(r"[^a-zA-Z0-9]", "-", folder), session + ".jsonl")]
+                read_tool = "claude"
+            elif tool == "qoder":
+                found = glob.glob(os.path.join(self.qoder_home(), "projects",
+                                               re.sub(r"[^a-zA-Z0-9]", "-", folder), session + ".jsonl"))
+                read_tool = "claude"
+            else:
+                home = os.environ.get("CODEX_HOME") or os.path.join(self.home, ".codex")
+                found = glob.glob(os.path.join(home, "sessions", "**", "rollout-*%s.jsonl" % session), recursive=True)
+                read_tool = "codex"
+            info = os.stat(found[0])
+            stamp = "%d.%d" % (info.st_size, info.st_mtime_ns)
+            return ({"same": True} if since and since == stamp else said(found[0], read_tool)), stamp
+        except (OSError, IndexError, sqlite3.Error):
+            raise OpError("读不到这个对话的内容")
+
+    def updated_in_folder(self, session, tool, folder):
+        """Latest activity stamp (epoch ms) of a conversation in `folder`, or 0 if not yet written."""
+        if not session_id_ok(tool, session) or not folder:
+            return 0
+        try:
+            if tool == "opencode":
+                db = opencode_db()
+                if not os.path.exists(db):
+                    return 0
+                con = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+                try:
+                    con.execute("pragma busy_timeout=1000")
+                    row = con.execute("select time_updated from session_v2 where id = ?", (session,)).fetchone()
+                finally:
+                    con.close()
+                return int(row[0] or 0) if row else 0
+            if tool == "cline":
+                return int(said_cline(session).get("updated") or 0)
+            if tool == "pi":
+                found = glob.glob(os.path.join(self.pi_home(), "sessions",
+                                               pi_slug(folder), "*_%s.jsonl" % session))
+                return int(os.stat(found[0]).st_mtime * 1000) if found else 0
+            if tool == "qoder":
+                saved = os.path.join(self.qoder_home(), "projects", re.sub(r"[^a-zA-Z0-9]", "-", folder))
+                path = os.path.join(saved, session + ".jsonl")
+                if os.path.isfile(path):
+                    return int(os.stat(path).st_mtime * 1000)
+                state_path = os.path.join(saved, session, "state.json")
+                if os.path.isfile(state_path):
+                    with open(state_path, encoding="utf-8") as stream:
+                        state = json.load(stream)
+                    return iso_ms(state.get("updatedAt")) or int(os.stat(state_path).st_mtime * 1000)
+                return 0
+        except (OSError, ValueError, sqlite3.Error):
+            return 0
+        return 0
+
     def read(self, session, tool, name, dirs, since=""):
         """What was last said in a conversation of a project, for the phone to look at. A page
         that follows it says what it has (`since`): it is given the conversation anew only
@@ -1209,41 +1360,8 @@ class Sessions:
         folder = dirs.get(name) if name else saved and saved["live"] and saved["folder"]
         if saved is None or not folder:
             raise OpError("电脑上没有找到这个对话，请刷新后重试")
-        try:
-            if tool == "opencode":
-                answer = said_opencode(session)
-                stamp = "u%d" % answer["updated"]
-                return dict({"same": True} if since and since == stamp else answer, stamp=stamp,
-                            title=saved["title"], status=saved.get("status", ""))
-            if tool == "cline":
-                answer = said_cline(session)
-                stamp = "u%d" % answer["updated"]
-                return dict({"same": True} if since and since == stamp else answer, stamp=stamp,
-                            title=saved["title"], status=saved.get("status", ""))
-            if tool == "pi":
-                # one file to a conversation, under the folder it was worked in, named by pi itself
-                found = glob.glob(os.path.join(self.pi_home(), "sessions",
-                                               pi_slug(folder), "*_%s.jsonl" % session))
-                info = os.stat(found[0])
-                stamp = "%d.%d" % (info.st_size, info.st_mtime_ns)
-                answer = {"same": True} if since and since == stamp else said_pi(found[0])
-                return dict(answer, stamp=stamp, title=saved["title"], status=saved.get("status", ""))
-            if tool == "claude":
-                found = [os.path.join(self.claude_home(), "projects", re.sub(r"[^a-zA-Z0-9]", "-", folder), session + ".jsonl")]
-            elif tool == "qoder":
-                # its rows are claude's shape, so they are read the claude way
-                found = glob.glob(os.path.join(self.qoder_home(), "projects",
-                                               re.sub(r"[^a-zA-Z0-9]", "-", folder), session + ".jsonl"))
-                tool = "claude"
-            else:
-                home = os.environ.get("CODEX_HOME") or os.path.join(self.home, ".codex")
-                found = glob.glob(os.path.join(home, "sessions", "**", "rollout-*%s.jsonl" % session), recursive=True)
-            info = os.stat(found[0])
-            stamp = "%d.%d" % (info.st_size, info.st_mtime_ns)
-            answer = {"same": True} if since and since == stamp else said(found[0], tool)
-            return dict(answer, stamp=stamp, title=saved["title"], status=saved.get("status", ""))
-        except (OSError, IndexError, sqlite3.Error):
-            raise OpError("读不到这个对话的内容")
+        answer, stamp = self.read_folder(session, tool, folder, since)
+        return dict(answer, stamp=stamp, title=saved["title"], status=saved.get("status", ""))
 
     @staticmethod
     def used_by(*said):
@@ -1804,13 +1922,13 @@ class Sessions:
         for session, folder, title, started in rows:
             if not session_id_ok("cline", session):
                 continue
-            name = next((n for n, p in dirs.items() if folder and os.path.normpath(folder) == p), None)
-            if name is None:
-                continue
             pid = held.get(session, pids.get(session))
             owner = owner_of(pid, terminals) if pid else None
             if owner is not None and owner.tool == "cline" and not owner.session:
                 owner.session = session
+            name = next((n for n, p in dirs.items() if folder and os.path.normpath(folder) == p), None)
+            if name is None:
+                continue
             live = pid is not None and owner is None
             if not live and counts.get(name, 0) >= 15:
                 continue
@@ -1909,6 +2027,10 @@ class Live:
         self.tool = tool
         self.session = session          # the conversation a tool shows, once it is known
         self.status = ""                # busy or idle, where the tool says so itself
+        self.created = int(time.time() * 1000)
+        self.brackets = False           # whether the program enabled bracketed paste (\x1b[?2004h)
+        self.last_out_at = 0.0
+        self.on_close = None
         self.wake = wake
         self.lock = threading.Lock()
         self.pending = []               # read from the program, not yet numbered
@@ -1961,6 +2083,10 @@ class Live:
     def add_pending(self, text):
         """Keeps the newest text the reader has: a report that is stalled (the relay is away,
         an operation is slow) must not let a noisy program grow this buffer without bound."""
+        on, off = text.rfind("\x1b[?2004h"), text.rfind("\x1b[?2004l")
+        if on >= 0 or off >= 0:
+            self.brackets = on > off
+        self.last_out_at = time.monotonic()
         with self.lock:
             self.pending.append(text)
             self.pending_bytes += len(text)
@@ -2019,6 +2145,9 @@ class Live:
             self.exit_code = code
             self.closed = True
             self.closed_at = time.time()
+        on_close = self.on_close
+        if on_close:
+            threading.Thread(target=on_close, daemon=True).start()
         self.wake()
 
     def write(self, text):
@@ -2236,24 +2365,27 @@ class Chat(Live):
     It keeps the shape of a terminal (Live) for the report, the relay's acknowledgements and ending it."""
 
     form = "chat"
+    mcp = None
+    auto_ask = False
 
     def __init__(self, terminal_id, project, cwd, tool, launcher, wake, session, resume, mode, mcp=None):
         # (a terminal's fields, without a screen: Live.__init__ is not run, it would start a pty)
         self.id, self.project, self.dir, self.tool, self.session, self.status = terminal_id, project, cwd, tool, session, "starting"
+        self.created = int(time.time() * 1000)
         self.wake, self.lock = wake, threading.Lock()
         self.pending, self.output, self.out_bytes, self.seq = [], [], 0, 0
         self.pending_bytes, self.needs_sweep = 0, False
         self.closing_at, self.swept, self.closed, self.drained, self.exit_code, self.closed_at, self.told_closed = None, False, False, False, None, None, False
         self.stopping, self.fd, self.tty, self.cols, self.rows = False, -1, None, 80, 24
-        self.mcp = mcp
         self.said_last, self.gate = "", threading.RLock()
         self.asks, self.printed, self.gather, self.halting, self.errors = {}, {}, ["", "", ""], False, []
-        # what has been said in the turn at hand, who hears when the turn ends (a team member's
-        # use), who keeps what the tool says of its usage limits, and the MCP server the tool is
-        # given (a peer's ask_ai) — all set by whoever opened the conversation
-        self.turn_words, self.turned = "", None
+        # what has been said in the turn at hand, who hears when the turn ends (teams / peers),
+        # who keeps what the tool says of its usage limits, and the MCP server offered to the chat
+        self.turn_words, self.turn_words_id, self.turned = "", "", None
         self.quotas_note = None
-        self.mcp, self.auto_ask = None, False
+        self.on_session = None
+        self.on_close = None
+        self.mcp, self.auto_ask = mcp, False
         self.start(launcher, session, resume, mode)
 
     def run(self, argv):
@@ -2292,17 +2424,25 @@ class Chat(Live):
             pass
         code = self.proc.wait()
         with self.gate:
+            was_working = self.status in ("busy", "confirm")
             for ask in list(self.asks):
                 self.event(t="answered", id=ask, decision="gone")
             self.asks.clear()
+            exit_note = "工具已退出（代码 %d）%s" % (code, "：" + "\n".join(self.errors[-6:]) if self.errors else "")
             if code and not self.stopping and not self.closing_at:
-                self.note("工具已退出（代码 %d）%s" % (code, "：" + "\n".join(self.errors[-6:]) if self.errors else ""))
+                self.note(exit_note)
+            if was_working:
+                how = "stopped" if (self.stopping or self.closing_at) else "failed"
+                self.turn_ended(how, "" if how == "stopped" else (exit_note if code else "对话已意外退出"))
             self.state("ended")
             self.flush()
         with self.lock:
             self.exit_code = code
             self.closed = self.drained = True
             self.closed_at = time.time()
+        on_close = self.on_close
+        if on_close:
+            threading.Thread(target=on_close, daemon=True).start()
         self.wake()
 
     def _errors(self):
@@ -2351,6 +2491,8 @@ class Chat(Live):
             if had + len(text) > CHAT_OUTPUT_MOST:
                 text = text[:CHAT_OUTPUT_MOST - had] + "\n…"
             self.printed[item] = had + len(text)
+        if kind == "more" and item == self.turn_words_id:
+            self.turn_words = (self.turn_words + text)[-120000:]
         if self.gather[2] and (self.gather[0], self.gather[1]) != (kind, item):
             self.flush()
         self.gather = [kind, item, self.gather[2] + text]
@@ -2372,12 +2514,21 @@ class Chat(Live):
         if session and session != self.session:
             self.session = session
             self.event(t="session", session=session)
+            if self.on_session:
+                try:
+                    self.on_session(session)
+                except Exception:
+                    pass
 
     def item(self, item, kind, text, **more):
+        if kind == "text":
+            self.turn_words_id = item
+            self.turn_words = (text or "")[-120000:]
+        elif kind == "user":
+            self.turn_words_id, self.turn_words = "", ""
         self.event(t="item", id=item, kind=kind, text=text or "", at=int(time.time() * 1000), **more)
         if kind == "text":
             self.said_last = ""
-            self.turn_words = (self.turn_words + text)[-120000:]
             self.spoken(text)
 
     def done(self, item, ok, result):
@@ -2395,14 +2546,20 @@ class Chat(Live):
         more = {"error": error} if error else {}
         self.event(t="turn", end=how, at=int(time.time() * 1000), **more)
         self.halting = False
-        words, self.turn_words = self.turn_words, ""
+        said = self.turn_words
+        self.turn_words, self.turn_words_id = "", ""
+        if how == "failed" and error:
+            if not said.strip():
+                said = error
+            elif error.lower() not in said.lower():
+                said = said + "\n" + error
         heard = self.turned
         if heard:
-            threading.Thread(target=heard, args=(how, words), daemon=True).start()
+            threading.Thread(target=heard, args=(how, said), daemon=True).start()
 
-    def ask(self, request, kind, title, text, always, choices=None):
+    def ask(self, request, kind, title, text, always, choices=None, read_only=False):
         if self.auto_ask:
-            decision = "allow" if kind in ("read", "search") else "deny"
+            decision = "allow" if (read_only or kind in ("read", "search")) else "deny"
             asked = {"request": request, "text": (title + ("\n" + text if text else "")).strip(),
                      "always": always, "choices": list(choices or [])}
             self.reply(asked, decision)
@@ -2501,13 +2658,16 @@ class ClaudeChat(Chat):
         with self.gate:
             self.state("idle")
 
-    def say(self, text, op_id=""):
+    def say(self, text, op_id="", attachments=None):
+        attachments = attachments or []
+        shown = attachment_text(text, attachments)
         with self.gate:
-            self.turn_words = ""
-            self.said_here.append((text.strip(), op_id or ""))
+            self.turn_words, self.turn_words_id = "", ""
+            self.said_here.append((shown.strip(), op_id or ""))
             if self.status != "confirm":
                 self.state("busy")
-        self.send({"type": "user", "message": {"role": "user", "content": text}})
+        content = claude_content(shown, attachments) if attachments else shown
+        self.send({"type": "user", "message": {"role": "user", "content": content}})
 
     def stop_turn(self):
         with self.gate:
@@ -2531,11 +2691,8 @@ class ClaudeChat(Chat):
         elif kind == "user":
             self.came(m)
         elif kind == "rate_limit_event":
-            if self.quotas_note:
-                info = m.get("rate_limit_info") if isinstance(m.get("rate_limit_info"), dict) else {}
-                windows = quotas_store.from_claude_event(info)
-                if windows:
-                    self.quotas_note("claude", windows)
+            info = m.get("rate_limit_info") if isinstance(m.get("rate_limit_info"), dict) else {}
+            self.note_quota("claude", quotas_store.from_claude_event(info))
         elif kind == "control_request":
             self.permission(m)
         elif kind == "control_cancel_request":
@@ -2580,11 +2737,18 @@ class ClaudeChat(Chat):
                 self.steps[part["id"]] = item
                 given, name = part.get("input") or {}, part.get("name") or ""
                 more = {"name": name, "state": "run"}
-                if isinstance(given, dict) and given.get("command"):
-                    more["detail"] = str(given["command"])[:2000]
-                elif isinstance(given, dict) and name in ("Edit", "Write", "MultiEdit"):
-                    more["detail"] = str(given.get("file_path") or "")
-                self.item(item, "step", chat_brief(name, given), **more)
+                if name == "mcp__" + peers_mod.SERVER_NAME + "__" + peers_mod.TOOL_NAME or name.endswith("__" + peers_mod.TOOL_NAME):
+                    question = str(given.get("question") or "") if isinstance(given, dict) else ""
+                    title = peers_mod.step_title(str(given.get("tool") or "") if isinstance(given, dict) else "", question)
+                    if question:
+                        more["detail"] = question[:2000]
+                else:
+                    title = chat_brief(name, given)
+                    if isinstance(given, dict) and given.get("command"):
+                        more["detail"] = str(given["command"])[:2000]
+                    elif isinstance(given, dict) and name in ("Edit", "Write", "MultiEdit"):
+                        more["detail"] = str(given.get("file_path") or "")
+                self.item(item, "step", title, **more)
             elif part.get("type") == "text" and message.get("id") not in self.streamed and (part.get("text") or "").strip():
                 self.item("%s:t%s" % (message.get("id"), secrets.token_hex(3)), "text", part["text"])
 
@@ -2615,6 +2779,8 @@ class ClaudeChat(Chat):
         if request.get("subtype") != "can_use_tool":
             return self.respond(m.get("request_id"), None, "不支持的请求")
         name, given = request.get("tool_name") or "", request.get("input") or {}
+        if self.mcp and name == "mcp__" + self.mcp.name + "__" + peers_mod.TOOL_NAME:
+            return self.respond(m.get("request_id"), {"behavior": "allow", "updatedInput": given}, None)
         if name == "AskUserQuestion":
             questions = given.get("questions") or []
             if len(questions) == 1 and not questions[0].get("multiSelect"):
@@ -2629,7 +2795,8 @@ class ClaudeChat(Chat):
         suggestion = claude_permissions.select(request.get("permission_suggestions"), allow_session=True)
         if suggestion is not None:
             text = claude_permissions.detail(suggestion) + "\n\n" + str(text or "")
-        self.ask(m, "plan" if plan else "tool", "开始按计划执行？" if plan else request.get("display_name") or name, str(text or ""), suggestion is not None)
+        self.ask(m, "plan" if plan else "tool", "开始按计划执行？" if plan else request.get("display_name") or name,
+                 str(text or ""), suggestion is not None, read_only=(name in CLAUDE_READ_ONLY_TOOLS))
 
     def reply(self, asked, decision):
         m = asked["request"]
@@ -2684,8 +2851,8 @@ class CodexChat(Chat):
                 return self.state("ended")
             self.known(thread)
             self.state("busy" if self.status == "busy" else "idle")
-            for text, op_id in self.early:
-                self.begin_turn(text, op_id)
+            for text, op_id, attachments in self.early:
+                self.begin_turn(text, op_id, attachments)
             self.early = []
         self.call("thread/resume" if resume else "thread/start", given, opened)
 
@@ -2697,40 +2864,46 @@ class CodexChat(Chat):
         self.send({"id": number, "method": method, "params": given})
 
     @staticmethod
-    def words(text):
+    def words(text, attachments=None):
         return [{"type": "text", "text": text, "text_elements": []}]
 
-    def say(self, text, op_id=""):
+    def say(self, text, op_id="", attachments=None):
+        attachments = attachments or []
+        shown = attachment_text(text, attachments)
         with self.gate:
             if not self.session:
-                self.early.append((text, op_id))
+                self.early.append((text, op_id, attachments))
                 return self.state("busy")
             if self.turn:
                 # at work: the words join the turn, as its own window's box does
                 def steered(answer):
                     if answer.get("error") is not None:
-                        self.begin_turn(text, op_id)      # the turn had just ended: a new one
-                return self.call("turn/steer", {"threadId": self.session, "expectedTurnId": self.turn, "input": self.words(text), "clientUserMessageId": op_id or secrets.token_hex(16)}, steered)
-            self.begin_turn(text, op_id)
+                        self.begin_turn(text, op_id, attachments)      # the turn had just ended: a new one
+                return self.call("turn/steer", {"threadId": self.session, "expectedTurnId": self.turn, "input": self.words(shown), "clientUserMessageId": op_id or secrets.token_hex(16)}, steered)
+            self.begin_turn(text, op_id, attachments)
 
     def ask_rate_limits(self):
         self.call("account/rateLimits/read", {}, lambda answer: self.note_quota(
             "codex", quotas_store.from_codex((answer.get("result") or {}).get("rateLimits") or
                                              (answer.get("result") or {}))))
 
-    def begin_turn(self, text, op_id):
+    def begin_turn(self, text, op_id, attachments=None):
         with self.gate:
-            self.turn_words = ""
+            self.turn_words, self.turn_words_id = "", ""
         self.state("busy")
+        shown = attachment_text(text, attachments or [])
 
         def started(answer):
             if answer.get("error") is not None:
-                self.note("Codex 没有收下这句话：" + str(answer["error"].get("message") or ""))
+                msg = "Codex 没有收下这句话：" + str(answer["error"].get("message") or "")
+                self.note(msg)
+                if not self.turn:
+                    self.turn_ended("failed", msg)
                 return self.state("busy" if self.turn else "idle")
             begun = ((answer.get("result") or {}).get("turn") or {}).get("id") or ""
             if begun and not self.turn:
                 self.turn = begun
-        self.call("turn/start", {"threadId": self.session, "input": self.words(text), "clientUserMessageId": op_id or secrets.token_hex(16)}, started)
+        self.call("turn/start", {"threadId": self.session, "input": self.words(shown), "clientUserMessageId": op_id or secrets.token_hex(16)}, started)
 
     def stop_turn(self):
         with self.gate:
@@ -2803,7 +2976,17 @@ class CodexChat(Chat):
             names = [os.path.basename(one.get("path", "")) for one in item.get("changes") or [] if isinstance(one, dict) and one.get("path")]
             self.item(key, "step", "修改：" + ("、".join(names[:3]) + (" 等 %d 个文件" % len(names) if len(names) > 3 else "") if names else "文件"), name="edit", state="run")
         elif kind == "mcpToolCall":
-            self.item(key, "step", "%s：%s" % (item.get("server") or "", item.get("tool") or ""), name="mcp", state="run")
+            tool_name = str(item.get("tool") or "")
+            more = {"name": "mcp", "state": "run"}
+            if tool_name == peers_mod.TOOL_NAME:
+                args_obj = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+                question = str(args_obj.get("question") or "")
+                title = peers_mod.step_title(str(args_obj.get("tool") or ""), question)
+                if question:
+                    more["detail"] = question[:2000]
+            else:
+                title = "%s：%s" % (item.get("server") or "", tool_name)
+            self.item(key, "step", title, **more)
         elif kind == "webSearch":
             self.item(key, "step", "搜索：" + str(item.get("query") or ""), name="search", state="run")
         elif kind in ("dynamicToolCall", "collabAgentToolCall"):
@@ -2819,13 +3002,28 @@ class CodexChat(Chat):
         elif kind == "fileChange":
             self.done(key, item.get("status") == "completed", "\n".join("%s\n%s" % (one.get("path", ""), one.get("diff", "")) for one in item.get("changes") or [] if isinstance(one, dict)))
         elif kind == "mcpToolCall":
-            self.done(key, item.get("status") == "completed", str((item.get("error") or {}).get("message") or "") if item.get("error") else json.dumps(item.get("result") or "", ensure_ascii=False))
+            result_obj = item.get("result")
+            if item.get("error"):
+                back = str((item.get("error") or {}).get("message") or "")
+            elif isinstance(result_obj, dict) and isinstance(result_obj.get("content"), list):
+                parts = [str(one.get("text") or "") for one in result_obj["content"] if isinstance(one, dict) and one.get("text")]
+                back = "\n".join(parts) if parts else json.dumps(result_obj, ensure_ascii=False)
+            elif isinstance(result_obj, str):
+                back = result_obj
+            else:
+                back = json.dumps(result_obj or "", ensure_ascii=False)
+            ok = item.get("status") == "completed" and not item.get("error") and not (isinstance(result_obj, dict) and result_obj.get("isError") is True)
+            self.done(key, ok, back)
         elif kind in ("webSearch", "dynamicToolCall", "collabAgentToolCall"):
             self.done(key, item.get("status") != "failed", "")
         elif kind == "agentMessage":
-            self.event(t="set", id=key, text=item.get("text") or "")
+            text = item.get("text") or ""
+            if key == self.turn_words_id or text:
+                self.turn_words_id = key
+                self.turn_words = text[-120000:]
+            self.event(t="set", id=key, text=text)
             self.said_last = ""
-            self.spoken(item.get("text") or "")
+            self.spoken(text)
         elif kind == "reasoning" and key not in self.thoughts:
             summary = "\n\n".join(one if isinstance(one, str) else one.get("text", "") for one in item.get("summary") or [] if one)
             if summary.strip():
@@ -2835,9 +3033,11 @@ class CodexChat(Chat):
     def requested(self, number, method, p):
         request = {"id": number, "method": method, "params": p}
         if method in ("item/commandExecution/requestApproval", "execCommandApproval"):
-            actions = [one.get("command") for one in p.get("commandActions") or [] if isinstance(one, dict) and one.get("command")]
+            raw_actions = [one for one in p.get("commandActions") or [] if isinstance(one, dict)]
+            actions = [one.get("command") for one in raw_actions if one.get("command")]
+            read_only = bool(raw_actions) and all(one.get("type") in ("read", "listFiles", "search") for one in raw_actions)
             reason = p.get("reason") or ""
-            self.ask(request, "command", "运行命令", (reason + "\n" if reason else "") + ("\n".join(actions) if actions else str(p.get("command") or "")), True)
+            self.ask(request, "command", "运行命令", (reason + "\n" if reason else "") + ("\n".join(actions) if actions else str(p.get("command") or "")), True, read_only=read_only)
         elif method in ("item/fileChange/requestApproval", "applyPatchApproval"):
             self.ask(request, "edit", "修改文件", p.get("reason") or p.get("grantRoot") or "", True)
         elif method == "item/tool/requestUserInput":
@@ -2847,6 +3047,8 @@ class CodexChat(Chat):
                 self.ask(request, "question", questions[0].get("question") or "", "", False, labels)
             else:
                 self.send({"id": number, "error": {"code": -32601, "message": "手机上不能回答这个问题"}})
+        elif self.mcp and "mcp" in method.lower() and p.get("server") == self.mcp.name:
+            self.send({"id": number, "result": {"decision": "accept"}})
         else:
             self.send({"id": number, "error": {"code": -32601, "message": "Remote AI 不支持这个请求"}})
 
@@ -3454,12 +3656,17 @@ def handover(source, messages, note):
     """What a conversation is handed over with: what its owner asked first and last, what the tool answered last
     and did last, taken from its record. Written as its owner's own words to the conversation that takes over.
     (The same words as the Windows program's.)"""
-    cut = lambda text, most: text.strip() if len(text.strip()) <= most else text.strip()[:most] + "…"
+    def cut(text, most):
+        text = text.strip()
+        # The phone and Windows count the 8,000-character input limit in UTF-16 units.
+        encoded = text.encode("utf-16-le", errors="replace")
+        return text if len(encoded) <= most * 2 else encoded[:most * 2].decode("utf-16-le", errors="ignore") + "…"
     asked = [m["text"] for m in messages if m.get("role") == "user"]
     answered = next((m["text"] for m in reversed(messages) if m.get("role") == "assistant"), "")
-    steps = [m["text"] for m in messages if m.get("role") == "tool"]
-    label = {"claude": "Claude Code", "codex": "Codex", "opencode": "OpenCode", "qoder": "Qoder", "cline": "Cline", "pi": "Pi"}.get(source["tool"], source["tool"])
-    brief = "【对话交接】下面是我在另一段对话里的进展（%s，“%s”%s），请接着处理。\n" % (label, source["title"], "，项目 " + source["dir"] if source["dir"] else "")
+    steps = [m for m in messages if m.get("role") == "tool"]
+    label = TOOL_LABELS.get(source["tool"], source["tool"])
+    brief = "【对话交接】下面是我在另一段对话里的进展（%s，“%s”%s），请接着处理。\n" % (label, cut(source["title"], 100), "，项目 " + cut(source["dir"], 100) if source["dir"] else "")
+    brief += "原对话 ID：" + cut(source["id"], 128) + "\n"
     if asked:
         brief += "\n我最初的要求：\n" + cut(asked[0], 800) + "\n"
     if len(asked) > 1:
@@ -3467,7 +3674,14 @@ def handover(source, messages, note):
     if answered:
         brief += "\n它最后的回答：\n" + cut(answered, 2000) + "\n"
     if steps:
-        brief += "\n它最近做的操作：\n" + "\n".join("- " + cut(step, 160) for step in steps[-8:]) + "\n"
+        brief += "\n它最近做的操作：\n"
+        for step in steps[-8:]:
+            brief += "- " + cut(step["text"], 160) + "\n"
+            result = cut(step.get("result") or "", 160)
+            if result:
+                brief += "  返回摘录：" + result.replace("\n", "\n  ") + "\n"
+            else:
+                brief += "  记录中没有返回内容\n"
     if note.strip():
         brief += "\n我的补充：\n" + cut(note, 1000) + "\n"
     return brief.rstrip()
@@ -3479,7 +3693,7 @@ def chain_brief(source, messages, note):
     cut = lambda text, most: text.strip() if len(text.strip()) <= most else text.strip()[:most] + "…"
     answered = next((m["text"] for m in reversed(messages) if m.get("role") == "assistant"), "")
     brief = "【接力】%s“%s”完成了一轮，把它的进展转给你。\n" % (
-        {"claude": "Claude Code", "codex": "Codex", "opencode": "OpenCode", "qoder": "Qoder", "cline": "Cline", "pi": "Pi"}.get(source["tool"], source["tool"]),
+        TOOL_LABELS.get(source["tool"], source["tool"]),
         source["title"])
     if answered:
         brief += "\n它最后的回答：\n" + cut(answered, 2000) + "\n"
@@ -3504,23 +3718,31 @@ class Agent:
         self.quotas = quotas_store.Quotas(data)
         self.next_codex_ask = self.next_agy_ask = 0.0
         self.peers = peers_mod.Peers(peers_mod.socket_path(data), find_tool, quota_of=self.quotas.of,
-                                     config_dir=data, chat_tools=CHAIN_TOOLS,
-                                     open_read_only=self.open_peer_chat)
+                                     config_dir=data, chat_tools=CHAT_TOOLS,
+                                     open_read_only=self.open_peer_chat,
+                                     bridge_script=os.path.abspath(__file__))
         self.worktrees = worktrees.Worktrees(os.path.join(data, "worktrees"))
         self.teams = teams.Teams(os.path.join(data, "teams.json"), teams.Hands(
-            begin_in=self.begin_member_in, say=self.say_to_member, stop=self.stop_member,
+            begin_in=self.begin_member_in, say=self.say_to_member,
+            say_with_attachments=self.say_to_member_with_attachments,
+            stop=self.stop_member, close=self.close_member,
             changes=self.changes_of, available=self.chat_tools_available, limits=self.quotas.of,
             make_worktree=self.make_team_worktree, worktree_diff=self.worktrees.diff,
             worktree_stat=self.worktrees.stat, apply_worktree=self.apply_team_worktree,
-            clean_worktrees=self.clean_team_worktrees))
+            clean_worktrees=self.clean_team_worktrees),
+            chat_tools=CHAT_TOOLS,
+            error_types=(OpError, teams.OpError, worktrees.OpError, ValueError))
+        self.teams_version = 0
+        self.teams.changed = self._on_teams_changed
         self.team_seen = {}
+        self.team_seen_lock = threading.Lock()
         self.next_asking = 0.0
-        self.sessions_sent = (0, 0.0)   # the version of the list the relay was last told, and when
+        self.sessions_sent = ((0, 0), 0.0)   # ((sessions.version, teams_version), when)
         self.tools = (["shell"], 0.0)
         self.terminals = {}
         self.completed = {}
         self.reported = set()
-        self.work = threading.Lock()
+        self.work = threading.RLock()
         self.wakeup = threading.Event()
         self.stop = threading.Event()
         self.scan_want = ({}, [])       # what the conversation lookup last looked at (projects, terminals)
@@ -3542,6 +3764,10 @@ class Agent:
     # ---- wiring
     def wake(self):
         self.wakeup.set()
+
+    def _on_teams_changed(self):
+        self.teams_version += 1
+        self.wake()
 
     def stop_run(self, *_):
         self.stop.set()
@@ -3648,31 +3874,34 @@ class Agent:
                                                                     chain_brief(source, read.get("messages", []), due["text"])), now)
                     except (OpError, OSError, ValueError) as failed:
                         self.chains.done(due["id"], False, str(failed), now)
-                if enabled:
-                    try:
-                        self.teams_step(dirs, now)
-                    except Exception as failed:
-                        say("协作任务推进失败：%s" % type(failed).__name__)
-                    if now >= self.next_codex_ask:
-                        self.next_codex_ask = now + 600
-                        for one in self.terminals.values():
-                            if isinstance(one, CodexChat) and not one.closed:
-                                one.ask_rate_limits()
-                    if now >= self.next_agy_ask:
-                        self.next_agy_ask = now + 600
-                        agy = find_tool("agy")
-                        if agy:
-                            threading.Thread(target=self.quotas.ask_agy, args=(agy,), daemon=True).start()
+                codex_chats = [one for one in self.terminals.values() if isinstance(one, CodexChat) and not one.closed]
+                if codex_chats and now >= self.next_codex_ask:
+                    self.next_codex_ask = now + 600
+                    for one in codex_chats:
+                        one.ask_rate_limits()
+                if now >= self.next_agy_ask:
+                    self.next_agy_ask = now + 600
+                    agy = find_tool("agy")
+                    if agy:
+                        threading.Thread(target=self.quotas.ask_agy, args=(agy,), daemon=True).start()
+            for live in self.terminals.values():
+                if live.session:
+                    self.teams.learn(live.id, live.tool, live.session)
+            team_features = [one for one in TEAM_FEATURES if one[:-5] in self.tools[0]]
             payload = {
                 "info": {"instance": self.instance, "enabled": enabled, "tools": self.tools[0],
-                         "features": FEATURES + [one for one in TEAM_FEATURES if one[:-5] in self.tools[0]],
-                         "quotas": self.quotas.report(), "version": VERSION, "newer": "",
+                         "features": FEATURES + team_features,
+                         "quotas": self.quotas.report() if enabled else [],
+                         "team_cards": self.teams.cards(self.terminal_is_asking) if enabled else [],
+                         "version": VERSION, "newer": "",
                          "shell": os.path.basename(self.shell(cfg)),
                          "workspaces": list(dirs.keys()),
                          "projects": self.sessions.told(self.projects.entries(cfg, dirs)),
                          "candidates": self.sessions.candidates},
-                "terminals": [dict({"id": live.id, "state": "closed" if live.closed else "running",
+                "terminals": [dict({"id": live.id, "tool": live.tool, "dir": live.project, "created": live.created,
+                               "state": "closed" if live.closed else "running",
                                "cols": live.cols, "rows": live.rows, "session": live.session,
+                               "team": self.teams.team_of(live.id, live.tool, live.session),
                                "status": "" if live.closed or live.status == "ended" else live.status, "exit_code": live.exit_code,
                                "error": "程序退出（代码 %d），请检查终端画面中的原因" % live.exit_code
                                         if live.exit_code else ""},
@@ -3685,10 +3914,16 @@ class Agent:
             ended = [item["id"] for item in payload["terminals"] if item["state"] == "closed"]
             # The list of conversations is long: it goes out when it changed, and now and then
             # in case the relay restarted.
-            listed = self.sessions.version
+            listed = (self.sessions.version, self.teams_version)
             listing = listed != self.sessions_sent[0] or now - self.sessions_sent[1] > 10
             if listing:
-                payload["sessions"] = self.sessions.found
+                payload["sessions"] = [dict(s, team=self.teams.team_of_session(s["tool"], s["id"])) for s in self.sessions.found]
+            step_dirs = dict(dirs) if enabled else None
+        if step_dirs is not None:
+            try:
+                self.teams_step(step_dirs, now)
+            except Exception as failed:
+                say("协作任务推进失败：%s" % type(failed).__name__)
         try:
             status, body = self.http.post(self.server + "/api/terminal/agent", payload, self.token)
         except (OSError, http.client.HTTPException):
@@ -3800,23 +4035,26 @@ class Agent:
                 live = self.terminals.get(terminal)
                 if live is None or live.closed:
                     raise OpError("终端已结束")
-                # a terminal can always be ended; typing into it needs its folder still allowed
-                if action != "close" and live.dir not in dirs.values():
+                # a terminal can always be ended; typing into it needs its folder (or compare worktree) still allowed
+                if action != "close" and live.dir not in dirs.values() \
+                        and not (live.project in dirs and self.worktrees.contains(live.dir)):
                     raise OpError("目录不再获允许")
                 if isinstance(live, Chat):
                     # a conversation: told something, stopped, answered or ended; it has no screen to type into
                     self.last_input = time.time()
                     if action == "say":
                         text = str(op.get("text") or "").strip()
-                        if not text or len(text) > 8000:
-                            raise OpError("消息需为 1 至 8000 字")
-                        live.say(text, op_id)
+                        attachments = read_attachments(live.dir, op.get("attachments"))
+                        if (not text and not attachments) or len(text) > 8000:
+                            raise OpError("请输入文字或添加图片，文字最多 8000 字")
+                        live.say(text, op_id, attachments)
                     elif action == "stop":
                         live.stop_turn()
                     elif action == "answer":
                         live.answer(str(op.get("ask") or ""), str(op.get("decision") or ""))
                     elif action == "close":
                         live.begin_close()
+                        self.teams.closed(live.id)
                     else:
                         raise OpError("对话不接受这个操作")
                 elif action == "input":
@@ -3833,9 +4071,10 @@ class Agent:
                     live.resize(cols, rows)
                 elif action == "close":
                     live.begin_close()
+                    self.teams.closed(live.id)
                 else:
                     raise OpError("操作无效")
-        except OpError as exc:
+        except (OpError, teams.OpError, worktrees.OpError) as exc:
             error = str(exc)
         except Exception as exc:                # never leak a path or a stack to the phone
             error = "终端操作失败：" + type(exc).__name__
@@ -3926,12 +4165,24 @@ class Agent:
                 raise OpError("没有找到这个协作任务")
             return {}
         if action == "work_team_say":
-            return {"team": teams.Teams.shown(self.teams.say(str(op.get("team") or ""), str(op.get("text") or ""), str(op.get("target") or "")))}
+            team_id = str(op.get("team") or "")
+            raw_attachments = op.get("attachments")
+            attachments = []
+            if raw_attachments is not None:
+                found = self.teams.of(team_id)
+                if found is None:
+                    raise OpError("没有找到这个协作任务")
+                folder = dirs.get(found.dir)
+                if not folder:
+                    raise OpError("目录未获允许")
+                attachments = read_attachments(folder, raw_attachments)
+            return {"team": teams.Teams.shown(self.teams.say(team_id, str(op.get("text") or ""),
+                                                             str(op.get("target") or ""), attachments))}
         if action == "work_team_pick":
             return {"team": teams.Teams.shown(self.teams.pick(str(op.get("team") or ""), str(op.get("tool") or "")))}
         if action == "work_team_swap":
             return {"team": teams.Teams.shown(self.teams.swap(str(op.get("team") or ""), str(op.get("role") or ""),
-                                        str(op.get("tool") or ""), str(op.get("note") or "")))}
+                                                              str(op.get("tool") or ""), str(op.get("note") or "")))}
         if action == "work_chains":
             return {"chains": self.chains.all()}
         if action == "work_chain_set":
@@ -3960,26 +4211,69 @@ class Agent:
         brief = handover(source, read.get("messages", []), str(op.get("note") or ""))
         return {"status": "accepted", "note": self.tell(taker["tool"], taker["id"], brief), "length": len(brief)}
 
+    # ---- read-only peer consultations (peers.py `ask_ai`)
     def open_peer_chat(self, peer_tool, launcher, folder):
-        """Opens a strictly read-only peer conversation with no MCP server of its own (so a
-        consultation never recurses); its permission asks are answered on the spot — reads and
+        """Opens a strictly read-only structured peer chat with no MCP server of its own (so a
+        consultation never recurses); its permission asks are answered automatically — reads and
         searches allowed, everything else denied."""
+        if peer_tool not in CHAT_TOOLS:
+            raise OpError("这个工具不支持只读请教")
         cfg = read_config(self.data)
         dirs = self.projects.all(cfg)
-        dir_name = next((name for name, path in dirs.items() if os.path.samefile(path, folder)), os.path.basename(folder.rstrip("/")))
-        session = str(uuid.uuid4()) if peer_tool in ("claude", "opencode", "qoder", "pi") else ""
+        dir_name = next((name for name, path in dirs.items() if os.path.normpath(path) == os.path.normpath(folder)),
+                        os.path.basename(folder.rstrip("/")))
+        session = str(uuid.uuid4()) if peer_tool == "claude" else ""
         terminal = uuid.uuid4().hex
-        if peer_tool in CHAT_TOOLS:
-            chat = open_chat(terminal, dir_name, folder, peer_tool, launcher, self.wake, session, False, "read")
-            chat.auto_ask = True
-            return chat
-        live = Live(terminal, dir_name, folder, 80, 24, tool_argv(peer_tool, launcher, session, False, "read"),
-                    self.wake, peer_tool, session)
-        self.terminals[terminal] = live
-        live.auto_ask = True
-        return live
+        chat = open_chat(terminal, dir_name, folder, peer_tool, launcher, self.wake, session, False, "read")
+        chat.auto_ask = True
+        chat.quotas_note = self.quotas.note
+        return chat
 
     # ---- the members of a team: conversations this program begins and tells (teams.py Hands)
+    def terminal_is_asking(self, terminal):
+        with self.work:
+            live = self.terminals.get(terminal)
+            return live is not None and not live.closed and live.status == "confirm"
+
+    @staticmethod
+    def _pty_message(live, words):
+        text = words.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if getattr(live, "brackets", False):
+            return "\x1b[200~" + text + "\x1b[201~\r"
+        return " ".join(line.strip() for line in text.split("\n") if line.strip()) + "\r"
+
+    def _send_pty_initial(self, live, words):
+        """Waits briefly for a newly forked TUI to emit its initial prompt (and bracketed-paste
+        switch) before typing the first task, avoiding dropped or garbled early stdin."""
+        text = str(words or "").strip()
+        if not text:
+            return
+
+        def deliver():
+            deadline = time.monotonic() + 2.5
+            while not live.closed and time.monotonic() < deadline:
+                if live.last_out_at and time.monotonic() - live.last_out_at >= 0.35:
+                    break
+                time.sleep(0.05)
+            if live.closed:
+                return
+            try:
+                live.write(self._pty_message(live, text))
+            except OpError:
+                pass
+
+        threading.Thread(target=deliver, daemon=True).start()
+
+    def _pty_updated_now(self, live):
+        if not live.session:
+            return 0
+        updated = self.sessions.updated_in_folder(live.session, live.tool, live.dir)
+        if updated:
+            return updated
+        entry = next((one for one in self.sessions.found
+                      if one["tool"] == live.tool and one["id"] == live.session), None)
+        return int(entry.get("updated") or 0) if entry else 0
+
     def begin_member_in(self, tool, dir_name, words, read, folder_override=None):
         cfg = read_config(self.data)
         dirs = self.projects.all(cfg)
@@ -3990,12 +4284,18 @@ class Agent:
         launcher = find_tool(tool)
         if launcher is None:
             raise OpError("电脑没有这个工具")
+        if folder_override:
+            if not os.path.isdir(folder_override) or not self.worktrees.contains(folder_override):
+                raise OpError("独立工作区无效")
+            cwd = folder_override
+        else:
+            cwd = dirs[dir_name]
         with self.work:
             if sum(1 for one in self.terminals.values() if not one.closed) >= MAX_TERMINALS:
                 raise OpError("最多同时运行 %d 个终端，请先结束一个" % MAX_TERMINALS)
-            cwd = dirs[folder_override] if folder_override else dirs[dir_name]
+            fresh = tool in ("claude", "opencode", "qoder", "pi")
             session = ""
-            if tool in ("claude", "opencode", "qoder", "pi"):
+            if fresh:
                 # named by us, so the terminal knows its conversation at once (as start_terminal does)
                 session = "ses_" + secrets.token_hex(13) if tool == "opencode" else str(uuid.uuid4())
             terminal = uuid.uuid4().hex
@@ -4003,30 +4303,47 @@ class Agent:
             if tool in CHAT_TOOLS:
                 chat = open_chat(terminal, dir_name, cwd, tool, launcher, self.wake, session, False, mode,
                                  mcp=None if read else self.peers.offer(tool, cwd))
+                chat.quotas_note = self.quotas.note
+                chat.turned = lambda how, said, one=terminal: self.teams.turned(one, how, said)
+                chat.on_session = lambda sid, one=terminal, t=tool: self.teams.learn(one, t, sid)
+                chat.on_close = lambda one=terminal: self.teams.closed(one)
                 self.terminals[terminal] = chat
-                chat.turned = lambda how, words, one=terminal: self.teams.turned(one, how, words)
+                if session:
+                    self.teams.learn(terminal, tool, session)
                 if str(words).strip():
                     chat.say(str(words).strip())
                 return terminal
-            live = Live(terminal, dir_name, cwd, 80, 24, tool_argv(tool, launcher, session, False, mode),
-                        self.wake, tool, session)
+            argv = tool_argv(tool, launcher, session, False, mode, fresh)
+            live = Live(terminal, dir_name, cwd, 80, 24, argv, self.wake, tool, session)
+            live.on_close = lambda one=terminal: self.teams.closed(one)
             self.terminals[terminal] = live
-            if str(words).strip():
-                live.write("\x1b[200~" + words.replace("\r\n", "\n").replace("\r", "\n").strip() + "\x1b[201~\r")
+            if session:
+                self.teams.learn(terminal, tool, session)
+            with self.team_seen_lock:
+                self.team_seen[terminal] = {"updated": 0, "armed": 0}
+            self._send_pty_initial(live, words)
             return terminal
 
     def member(self, terminal):
-        live = self.terminals.get(terminal)
-        if live is None or live.closed:
-            raise OpError("这个成员的对话已经结束")
-        return live
+        with self.work:
+            live = self.terminals.get(terminal)
+            if live is None or live.closed:
+                raise OpError("这个成员的对话已经结束")
+            return live
 
     def say_to_member(self, terminal, words):
+        self.say_to_member_with_attachments(terminal, words, None)
+
+    def say_to_member_with_attachments(self, terminal, words, attachments=None):
         live = self.member(terminal)
+        attachments = list(attachments or [])
         if isinstance(live, Chat):
-            live.say(words.strip())
-        else:
-            live.write("\x1b[200~" + words.replace("\r\n", "\n").replace("\r", "\n").strip() + "\x1b[201~\r")
+            live.say(words.strip(), attachments=attachments)
+            return
+        baseline = self._pty_updated_now(live)
+        with self.team_seen_lock:
+            self.team_seen[terminal] = {"updated": baseline, "armed": 0}
+        live.write(self._pty_message(live, attachment_text(words.strip(), attachments)))
 
     def stop_member(self, terminal):
         live = self.member(terminal)
@@ -4038,10 +4355,17 @@ class Agent:
         else:
             live.write("\x03")         # the pty way of interrupting a turn
 
+    def close_member(self, terminal):
+        with self.work:
+            live = self.terminals.get(terminal)
+            if live is not None and not live.closed:
+                live.begin_close()
+        self.wake()
+
     def changes_of(self, dir_name):
         cfg = read_config(self.data)
         folder = self.projects.all(cfg).get(dir_name)
-        return teams.changes_in(folder) if folder else ""
+        return worktrees.changes_in(folder) if folder else ""
 
     def chat_tools_available(self):
         return [one for one in CHAIN_TOOLS if find_tool(one)]
@@ -4068,43 +4392,95 @@ class Agent:
     def teams_step(self, dirs, now):
         """Moves the pty members of the teams on: a structured chat reports its own turn ending;
         a terminal's member is done when its conversation record has gone quiet after growing
-        (the way chains knows a turn has ended)."""
+        (the way chains knows a turn has ended). Runs outside `self.work`."""
+        checks = []
         for team in self.teams.all():
             if team.state != "running":
                 continue
             for role in list(team.awaited):
                 terminal = team.members.get(role)
-                if not terminal or terminal not in self.terminals:
+                if not terminal:
                     continue
-                live = self.terminals[terminal]
-                if isinstance(live, Chat):
+                with self.work:
+                    live = self.terminals.get(terminal)
+                if live is None or isinstance(live, Chat):
                     continue                # its own turn_ended callback drives it
-                if live.closed:
-                    self.teams.turned(terminal, "stopped", "")
-                    continue
-                if not live.session:
-                    continue                # the scan has not named its conversation yet
+                checks.append((team, role, terminal, live))
+        for team, role, terminal, live in checks:
+            if live.closed:
+                with self.team_seen_lock:
+                    self.team_seen.pop(terminal, None)
+                self.teams.turned(terminal, "stopped", "")
+                continue
+            if not live.session:
+                continue                    # the scan has not named its conversation yet
+            self.teams.learn(terminal, live.tool, live.session)
+            updated = 0
+            if hasattr(self.sessions, "updated_in_folder") and getattr(live, "dir", ""):
+                updated = self.sessions.updated_in_folder(live.session, live.tool, live.dir)
+            if not updated:
                 entry = next((one for one in self.sessions.found
                               if one["tool"] == live.tool and one["id"] == live.session), None)
-                if entry is None:
-                    continue
-                updated = entry.get("updated") or 0
-                key = (team.id, role)
-                seen = self.team_seen.setdefault(key, {"updated": updated, "armed": 0})
+                updated = int(entry.get("updated") or 0) if entry else 0
+            if not updated:
+                continue
+            with self.team_seen_lock:
+                seen = self.team_seen.setdefault(terminal, {"updated": updated, "armed": 0})
                 if seen["updated"] != updated:
                     seen["updated"] = updated
                     seen["armed"] = updated
                     continue
-                if seen["armed"] and updated and now - updated / 1000.0 >= self.teams.quiet:
-                    self.team_seen.pop(key, None)
-                    said = ""
-                    try:
+                ready = bool(seen["armed"] and now - updated / 1000.0 >= self.teams.quiet)
+                if ready:
+                    self.team_seen.pop(terminal, None)
+            if ready:
+                said = ""
+                try:
+                    if hasattr(self.sessions, "read_folder") and getattr(live, "dir", ""):
+                        try:
+                            read, _ = self.sessions.read_folder(live.session, live.tool, live.dir)
+                        except OpError:
+                            read = self.sessions.read(live.session, live.tool, team.dir, dirs)
+                    else:
                         read = self.sessions.read(live.session, live.tool, team.dir, dirs)
-                        said = next((m["text"] for m in reversed(read.get("messages", []))
-                                     if m.get("role") == "assistant"), "")
-                    except (OpError, OSError, ValueError):
-                        pass
-                    self.teams.turned(terminal, "done", said)
+                    said = next((m["text"] for m in reversed(read.get("messages", []))
+                                 if m.get("role") == "assistant"), "")
+                except (OpError, OSError, ValueError):
+                    pass
+                self.teams.turned(terminal, "done", said)
+
+    def known_now(self, session, tool, name):
+        """A conversation of this computer's lists; one it has only just had is not listed yet: a look is asked for
+        now and waited for, rather than the phone told to refresh."""
+        if not session_id_ok(tool, session):
+            return None
+        saved = self.sessions.known(session, tool, name)
+        if saved is None:
+            self.scan_wake.set()
+            seen, deadline = self.scan_done, time.time() + 3.5
+            with self.scanned:
+                while self.scan_done == seen and time.time() < deadline:
+                    self.scanned.wait(deadline - time.time())
+            saved = self.sessions.known(session, tool, name)
+        return saved
+
+    def reopening(self, op, tool, name):
+        """The terminal a `reopen` start leaves: a Claude Code or Codex conversation that runs as a chat and is to be
+        shown on its tool's own screen, or the other way round. One at work, asking or unnamed stays."""
+        source = self.terminals.get(str(op.get("reopen") or ""))
+        if source is None or source.closed or source.closing_at is not None:
+            raise OpError("原对话已结束，请刷新后重试")
+        if source.tool != tool or source.project != name or tool not in ("claude", "codex"):
+            raise OpError("切换视图的选项无效")
+        if isinstance(source, Chat) == (op.get("form") == "chat"):
+            raise OpError("这段对话已经是这种视图")
+        if not source.session:
+            raise OpError("%s 还没有给这段对话编号，发一条消息后再切换" % TOOL_LABELS.get(tool, tool))
+        if source.status in ("busy", "confirm"):
+            raise OpError("对话正在执行或等待确认，请等这一轮结束或先停止")
+        if self.teams.team_of(source.id, source.tool, source.session):
+            raise OpError("协作任务的成员对话暂不支持切换视图")
+        return source
 
     def start_terminal(self, op, dirs, terminal, op_id=""):
         if terminal in self.terminals:
@@ -4118,7 +4494,9 @@ class Agent:
         cwd = dirs[name]
         if not os.path.isdir(cwd):
             raise OpError("电脑上没有这个文件夹")
-        if sum(1 for live in self.terminals.values() if not live.closed) >= MAX_TERMINALS:
+        # the same conversation shown the other way: the terminal it leaves is ended below, once all else is certain
+        source = self.reopening(op, tool, name) if "reopen" in op else None
+        if sum(1 for live in self.terminals.values() if not live.closed) - (1 if source else 0) >= MAX_TERMINALS:
             raise OpError("最多同时运行 %d 个终端，请先结束一个" % MAX_TERMINALS)
         cfg = read_config(self.data)
         session = ""
@@ -4132,18 +4510,15 @@ class Agent:
             launcher = find_tool(tool)
             if launcher is None:
                 raise OpError("电脑没有这个工具")
-            session, history = str(op.get("session") or ""), op.get("history") is True
-            if session:
-                saved = self.sessions.known(session, tool, name) if session_id_ok(tool, session) else None
-                if saved is None and session_id_ok(tool, session):
-                    # a conversation this computer has only just had is not listed yet: ask for
-                    # a look now and wait for it, rather than tell the phone to refresh
-                    self.scan_wake.set()
-                    seen, deadline = self.scan_done, time.time() + 3.5
-                    with self.scanned:
-                        while self.scan_done == seen and time.time() < deadline:
-                            self.scanned.wait(deadline - time.time())
-                    saved = self.sessions.known(session, tool, name)
+            session, history = (source.session, False) if source else (str(op.get("session") or ""), op.get("history") is True)
+            if source:
+                if self.known_now(session, tool, name) is None:
+                    raise OpError("%s 还没有保存这段对话，发一条消息后再切换" % TOOL_LABELS.get(tool, tool))
+                source.kill()               # (waits for it: a conversation has one writer at a time)
+                if not source.closed:
+                    raise OpError("原对话还没有结束，请稍后重试")
+            elif session:
+                saved = self.known_now(session, tool, name)
                 if saved is None:
                     raise OpError("电脑上没有找到这个对话，请刷新后重试")
                 if saved["live"] or any(t.session == session and not t.closed for t in self.terminals.values()):
@@ -4157,10 +4532,11 @@ class Agent:
                 # a conversation run through its tool's structured mode; the first thing to say is said at once
                 if tool not in CHAT_TOOLS or history:
                     raise OpError("对话选项无效")
-                resume = bool(op.get("session"))       # (a new one of Claude Code's is named above, as for a terminal)
+                resume = bool(op.get("session")) or source is not None     # (a new one of Claude Code's is named above, as for a terminal)
                 chat = open_chat(terminal, name, cwd, tool, launcher, self.wake, session, resume,
                                  str(cfg.get("RemoteMaxMode") or ""),
                                  mcp=self.peers.offer(tool, cwd))
+                chat.quotas_note = self.quotas.note
                 self.terminals[terminal] = chat
                 if resume:
                     earlier = self.sessions.read(session, tool, name, dirs)
@@ -4252,6 +4628,7 @@ class Agent:
                 live.kill()
             live.dispose()
         self.uploads.dispose()
+        self.peers.dispose_all()
         self.http.close()
         self.pull_http.close()
         return 0

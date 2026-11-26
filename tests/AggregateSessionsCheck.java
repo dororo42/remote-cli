@@ -169,22 +169,22 @@ public final class AggregateSessionsCheck {
         require("a".equals(ids.apply(board.needs)), "only confirmation requests enter needs");
         require("past-2".equals(ids.apply(board.pinned)), "saved pinned records remain in pinned: " + ids.apply(board.pinned));
         require("c out".equals(ids.apply(board.active)), "pinned running tasks remain in the running group");
-        require("b desk 看日志".equals(ids.apply(board.opened)), "desktop conversations precede idle phone terminals");
+        require("b".equals(ids.apply(board.replies)) && "desk 看日志".equals(ids.apply(board.opened)), "waiting for a reply is separate from idle terminals");
         held.now = false;
         held.used = 1000;
-        require("desk b 看日志".equals(ids.apply(AggregateSessions.board(things, "", "", "").opened)), "idle desktop conversations sort by recent use");
+        require("desk 看日志".equals(ids.apply(AggregateSessions.board(things, "", "", "").opened)), "idle desktop conversations precede phone terminals");
         shell.pinned = true;
-        require("看日志 desk b".equals(ids.apply(AggregateSessions.board(things, "", "", "").opened)), "explicit pin remains first");
+        require("看日志 desk".equals(ids.apply(AggregateSessions.board(things, "", "", "").opened)), "explicit pin remains first");
         shell.pinned = false; held.used = 0; held.now = true;
         // an ended terminal whose conversation is listed is not listed twice; hidden history is left out
         require("past-1 只有画面的终端".equals(ids.apply(board.recent)) && !board.searched && board.found.isEmpty(), "what was used lately: " + ids.apply(board.recent));
         require("[claude, codex, shell]".equals(board.tools.toString()) && "[term, app]".equals(board.sources.toString()), board.tools + " " + board.sources);
         // narrowed by tool and by where a thing runs
         AggregateSessions.Board claudeOnly = AggregateSessions.board(things, "", "claude", "");
-        require("a".equals(ids.apply(claudeOnly.needs)) && "past-2".equals(ids.apply(claudeOnly.pinned)) && claudeOnly.active.isEmpty() && "b".equals(ids.apply(claudeOnly.opened)) && "past-1".equals(ids.apply(claudeOnly.recent)), "one tool");
+        require("a".equals(ids.apply(claudeOnly.needs)) && "past-2".equals(ids.apply(claudeOnly.pinned)) && claudeOnly.active.isEmpty() && "b".equals(ids.apply(claudeOnly.replies)) && "past-1".equals(ids.apply(claudeOnly.recent)), "one tool");
         // in a terminal (one of the phone's, a command line on the computer), or in an app
         AggregateSessions.Board termOnly = AggregateSessions.board(things, "", "", "term"), appOnly = AggregateSessions.board(things, "", "", "app");
-        require(termOnly.active.isEmpty() && "b 看日志".equals(ids.apply(termOnly.opened)) && termOnly.tools.size() == 3, "terminal waiting sessions are opened");
+        require(termOnly.active.isEmpty() && "b".equals(ids.apply(termOnly.replies)) && "看日志".equals(ids.apply(termOnly.opened)) && termOnly.tools.size() == 3, "explicit replies and idle terminals both respect source filtering");
         require("c out".equals(ids.apply(appOnly.active)) && "desk".equals(ids.apply(appOnly.opened)) && !ids.apply(appOnly.recent).contains("past"), "app filtering keeps both running and opened groups");
         // one that no program has open is told by what started it, where the computer says so
         AggregateSessions.Entry drawn = new AggregateSessions.Entry(false, "drawn", "web-shop", "桌面版里画的", "codex", "", "", "", false, "", "", ""), typed = new AggregateSessions.Entry(false, "typed", "web-shop", "终端里写的", "codex", "", "", "", false, "", "", "");
@@ -224,6 +224,12 @@ public final class AggregateSessionsCheck {
         require("past-3".equals(ids.apply(AggregateSessions.board(things, "旧的 codex", "", "").found)) && "b".equals(ids.apply(AggregateSessions.board(things, "台式机", "", "").found)), "the hidden one is found; and by the computer");
         require("out".equals(ids.apply(AggregateSessions.board(things, "未加入项目", "", "").found)) && AggregateSessions.board(things, "没有这样的", "", "").found.isEmpty(), "by what a card says; and nothing");
         require(AggregateSessions.board(things, "旧的", "claude", "").found.isEmpty(), "a search stays within what the filters leave");
+        past1.organizedTitle = "摘要整理"; past1.originalTitle = "摘要翻译";
+        past1.organizeTags = Collections.singletonList("断线重连"); past1.followUp = true;
+        past2.organizeSummary = "验证断线重连"; past2.followUp = true;
+        require("past-2 past-1".equals(ids.apply(AggregateSessions.board(things, "断线重连", "", "", true).found)), "topic and summary search can span projects");
+        require("past-1".equals(ids.apply(AggregateSessions.board(things, "摘要翻译", "", "").found)), "search retains the original title");
+        require(AggregateSessions.board(Collections.singletonList(on.apply(finished)), "", "", "").unseen.size() == 1, "finished and unread work has its own group");
         require("out".equals(outside.conversation()) && "past-1".equals(gone.conversation()) && shell.conversation().isEmpty(), "the conversation a mark is kept of");
         // A single identity moves between groups; pinning must not change its state category.
         for (String status : Arrays.asList("confirm", "busy", "waiting", "idle", "closed")) {
@@ -232,7 +238,8 @@ public final class AggregateSessionsCheck {
             AggregateSessions.Board moved = AggregateSessions.board(Collections.singletonList(on.apply(moving)), "", "", "");
             require(moved.needs.size() == ("confirm".equals(status) ? 1 : 0), "confirmation membership: " + status);
             require(moved.active.size() == ("busy".equals(status) ? 1 : 0), "execution membership: " + status);
-            require(moved.opened.size() == ("waiting".equals(status) || "idle".equals(status) ? 1 : 0), "opened membership: " + status);
+            require(moved.opened.size() == ("idle".equals(status) ? 1 : 0), "opened membership: " + status);
+            require(moved.replies.size() == ("waiting".equals(status) ? 1 : 0), "reply membership: " + status);
             require(moved.pinned.size() == ("closed".equals(status) ? 1 : 0), "saved pin membership: " + status);
         }
         require(AggregateSessions.counts(one, looked)[1] == 1, "completed but still open terminal is counted as opened");
@@ -245,6 +252,65 @@ public final class AggregateSessionsCheck {
         AggregateSessions.Entry agyFallback = new AggregateSessions.Entry(true, TERMINAL, "thesis", "Antigravity CLI · thesis", "shell", "running", "idle", "", false, "", "", "");
         require("agy".equals(agyFallback.displayTool()) && "Antigravity CLI".equals(agyFallback.toolName()), "Legacy-relay agy fallback terminal displays as agy");
         require(AggregateSessions.board(Collections.singletonList(new AggregateSessions.Thing("pc", "Computer", agyFallback, "idle")), "", "agy", "").opened.size() == 1, "Legacy-relay agy fallback matches agy filter");
-        System.out.println("Aggregate checks passed: computer isolation, active/history separation, recent ordering, locks, deduplication, stable refresh and exact terminal route.");
+
+        // Collaboration task parent cards: one entry per task (active & historical), member terminals/sessions collapsed,
+        // Unix-second updated timestamps converted, verify phase labelled "领队验收", legacy/standalone items unaffected.
+        String teamRunId = "11111111111111111111111111111111", teamDoneId = "22222222222222222222222222222222", teamConfirmId = "33333333333333333333333333333333";
+        long nowSec = now / 1000L;
+        java.util.Map<String, String> teamModels = new java.util.LinkedHashMap<>();
+        teamModels.put("codex", "gpt-5.4");
+        teamModels.put("claude", "claude-sonnet-4-6");
+        AggregateSessions.Entry teamVerify = AggregateSessions.Entry.teamCard(
+            teamRunId, "web-shop", "重构结算页并验收", "lead", "running", "verify", "正在核对改动",
+            nowSec - 120, false, Arrays.asList("codex", "claude", "agy"), teamModels, Collections.singletonList("leader"));
+        AggregateSessions.Entry teamDone = AggregateSessions.Entry.teamCard(
+            teamDoneId, "web-shop", "补充优惠券测试", "review", "done", "", "已通过",
+            nowSec - 3600, false, Arrays.asList("claude", "agy"), Collections.<String, String>emptyMap(), Collections.<String>emptyList());
+        AggregateSessions.Entry teamAsk = AggregateSessions.Entry.teamCard(
+            teamConfirmId, "web-shop", "等待成员确认的任务", "review", "running", "", "",
+            nowSec - 60, false, Arrays.asList("claude", "codex"), Collections.<String, String>emptyMap(), Collections.singletonList("writer"));
+        AggregateSessions.Entry childTerm = new AggregateSessions.Entry(true, "f" + TERMINAL.substring(1), "web-shop", "成员终端", "claude", "running", "busy", "busy", false, "", "", "child-sess");
+        childTerm.teamId = teamRunId;
+        AggregateSessions.Entry childAskTerm = new AggregateSessions.Entry(true, "e" + TERMINAL.substring(1), "web-shop", "等待确认成员", "claude", "running", "confirm", "confirm", false, "", "", "");
+        childAskTerm.teamId = teamConfirmId;
+        AggregateSessions.Entry childHist = saved("web-shop", "child-hist", "", false, "");
+        childHist.teamId = teamDoneId;
+        AggregateSessions.Entry orphanChild = saved("web-shop", "orphan-sess", "", false, "");
+        orphanChild.teamId = "99999999999999999999999999999999";
+        AggregateSessions.Entry solo = new AggregateSessions.Entry(
+            false, "solo-sess", "web-shop", "独立对话", "codex", "", "", "idle", true, "cli", "", "");
+        solo.used = now - 30_000L;
+        List<AggregateSessions.Project> teamProjects = AggregateSessions.projects(Collections.singletonList("web-shop"),
+            Arrays.asList(teamVerify, teamDone, teamAsk, childTerm, childAskTerm, childHist, orphanChild, solo));
+        AggregateSessions.Project shop = teamProjects.get(0);
+        require(shop.active.size() == 3, "Two active team cards + one standalone session, child member terminals collapsed: " + shop.active.size());
+        require(shop.history.size() == 2, "One done team card + one orphan fallback session, done child collapsed: " + shop.history.size());
+        require("team-verify".equals(teamVerify.kind(null)) && "领队验收".equals(teamVerify.label()), "Verify phase displays 领队验收: " + teamVerify.label());
+        AggregateSessions.Entry teamDecision = AggregateSessions.Entry.teamCard(
+            teamRunId, "web-shop", "处理成员阻塞", "lead", "running", "decision", "",
+            nowSec, false, Arrays.asList("codex", "claude"), teamModels, Collections.singletonList("leader"));
+        String decisionKind = teamDecision.kind(null);
+        require("领队处理中".equals(teamDecision.label()) && AggregateSessions.working(decisionKind)
+            && AggregateSessions.rank(decisionKind) == AggregateSessions.rank(teamVerify.kind(null)), "Decision card stays among active teams");
+        require("已暂停".equals(AggregateSessions.label(AggregateSessions.teamKind("paused", "decision", false)))
+            && "已完成".equals(AggregateSessions.label(AggregateSessions.teamKind("done", "decision", false)))
+            && "已停止".equals(AggregateSessions.label(AggregateSessions.teamKind("stopped", "decision", false)))
+            && "等你确认".equals(AggregateSessions.label(AggregateSessions.teamKind("running", "decision", true))), "State and confirmation take precedence over decision");
+        require("confirm".equals(teamAsk.kind(null)) && teamAsk.teamConfirm, "Live child confirmation propagates to parent team card");
+        require(teamVerify.used == (nowSec - 120) * 1000L && "2 分钟前".equals(AggregateSessions.ago(teamVerify.used, now)), "Unix seconds converted to ms: " + teamVerify.used);
+        require(Arrays.equals(AggregateSessions.counts(teamProjects, null), new int[]{1, 1, 1, 3}), "Team confirm, standalone open, team verify active");
+        List<AggregateSessions.Thing> teamThings = new java.util.ArrayList<>();
+        for (AggregateSessions.Entry e : shop.active) teamThings.add(new AggregateSessions.Thing(pc, "笔记本", e, e.kind(null)));
+        for (AggregateSessions.Entry e : shop.history) teamThings.add(new AggregateSessions.Thing(pc, "笔记本", e, e.team ? e.kind(null) : "history"));
+        AggregateSessions.Board teamBoard = AggregateSessions.board(teamThings, "", "", "");
+        require(teamBoard.needs.size() == 1 && teamConfirmId.equals(teamBoard.needs.get(0).entry.id), "Confirm team card goes to needs");
+        require(teamBoard.active.size() == 1 && teamRunId.equals(teamBoard.active.get(0).entry.id), "Verify team card goes to active");
+        require(teamBoard.recent.size() == 2 && teamDoneId.equals(teamBoard.recent.get(0).entry.id), "Done team card goes to recent");
+        require(AggregateSessions.board(teamThings, "", "agy", "").active.size() == 1, "Tool filter matches secondary team member tool");
+        require(AggregateSessions.board(teamThings, "领队验收 gpt-5.4", "", "").found.size() == 1, "Search matches verify phase and selected model");
+        String sigBefore = AggregateSessions.signature(teamProjects, null);
+        teamVerify.teamPhase = "";
+        require(!sigBefore.equals(AggregateSessions.signature(teamProjects, null)), "Team phase changes update render signature");
+        System.out.println("Aggregate checks passed: computer isolation, active/history separation, recent ordering, locks, deduplication, stable refresh, collaboration parent cards and exact terminal route.");
     }
 }

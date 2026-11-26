@@ -36,17 +36,19 @@ Android 复用 WebView，但每次打开或重试页面都建立新的 `Connecti
 
 | 目录 | 内容 |
 | --- | --- |
-| `agent-windows/` | 电脑端：`RemoteCliApp.cs`（窗口、托盘、连接方式）、`RemoteCliAgent.cs`（终端与对话扫描）、`Tools.cs`（各 AI 工具的统一适配：启动参数、记录文件、占用与接管、删除、结构化对话驱动、闲置唤醒；每个工具一个类，加工具时在这里加一个类）、`SessionLocks.cs`（Windows 锁文件探测、Restart Manager 进程归属核验与双检接管，供 Codex 和 Antigravity 共用）、`Transcripts.cs`（Claude Code、Codex、Antigravity 已保存记录的解析、标题提取与完成轮次识别）、`Chats.cs` / `AcpChat.cs`（`Chat`、`JsonRpcChat` 及各工具结构化对话驱动）、`Relays.cs`（公共中转清单和保存的中转）、`Remote.cs`（手机可以向电脑端程序本身提出的要求：读取和更改几项设置、切换连接线路）、`Controls.cs`（外观和控件）、`QrCode.cs`、`Setup.cs`（安装程序）。C#，用 Windows 自带的编译器构建 |
+| `agent-windows/` | 电脑端：`RemoteCliApp.cs`（窗口、托盘、连接方式）、`RemoteCliAgent.cs`（终端与对话扫描）、`ProcessText.cs`（代理对与 UTF-8 字节安全截断、头尾折叠、ANSI/进度条归一化、混排编码逐行解码、只读 Git 加固与进程树清理）、`WorkspaceSnapshot.cs`（带耗时熔断的 `<=1.5 KB` 只读工作区快照，供协作与只读请教首轮注入）、`Tools.cs`（各 AI 工具的统一适配：启动参数、记录文件、占用与接管、删除、结构化对话驱动、闲置唤醒；每个工具一个类，加工具时在这里加一个类）、`SessionLocks.cs`（Windows 锁文件探测、Restart Manager 进程归属核验与双检接管，供 Codex 和 Antigravity 共用）、`Transcripts.cs`（Claude Code、Codex、Antigravity 已保存记录的解析、标题提取与完成轮次识别）、`Chats.cs` / `AcpChat.cs`（`Chat`、`JsonRpcChat` 及各工具结构化对话驱动）、`Relays.cs`（公共中转清单和保存的中转）、`Remote.cs`（手机可以向电脑端程序本身提出的要求：读取和更改几项设置、切换连接线路）、`Controls.cs`（外观和控件）、`QrCode.cs`、`Setup.cs`（安装程序）。C#，用 Windows 自带的编译器构建 |
 | `agent-linux/` | Linux 电脑端：`agent.py`（终端、对话扫描、查看文件），一个文件，只用 Python 标准库；`install.sh` 一条命令装好中转和电脑端；`remote-cli-agent.service` 是 systemd 用户服务 |
 | `relay/` | 中转：`server.py`（登录、HTTP，以及公共中转里每台电脑各自的空间）、`relay.py`（终端状态与输出的转发：一台电脑一个 `Relay` 对象）。只用 Python 标准库；`install.sh` 把它装成服务器上的系统服务 |
 | `android/` | 安卓 App：`MainActivity`（各界面之间的跳转、扫码回调、语音识别）、`Tabs`（底部四个栏目，与电脑页面的底栏同样的图标和尺寸）、`Workbench`（“任务”和“项目”两页）、`AppPages`（“协作”和“我的”两页）、`Kit`（配色和界面部件）、`AggregateSessions`（任务分组与排序，不依赖 Android，可单独检查） |
-| `web/` | App 里一台电脑的列表页和终端页（xterm.js），同时随 App 和电脑端打包。App 使用 APK 内的页面，浏览器使用中转提供的页面。列表页由 `app.js` 提供公共部分，各部分是登记到它上面的模块：`begin.js`（新建对话：应用或终端）、`together.js`（协作）、`me.js`（我的） |
+| `web/` | App 里一台电脑的列表页和终端页（xterm.js），同时随 App 和电脑端打包。App 使用 APK 内的页面，浏览器使用中转提供的页面。列表页由 `app.js` 提供公共部分，各部分是登记到它上面的模块：`begin.js`（新建对话）、`together.js`（协作）、`me.js`（我的） |
 | `tools/` | `package_windows.py`（安装程序）、`window_pictures.py`（文档里的电脑端截图）、`readme_pictures.py`（README 里的手机页面截图和带说明的图：用真实页面和编造的示例对话截图，再把 `docs/images/src/` 里的各页画成图）、`relay_list.py`（生成公共中转清单里不以明文出现的条目） |
 | `docs/PROTOCOL.md` | 三方之间的接口，想写别的客户端或别的系统的电脑端看这里 |
 
 电脑和手机都只向中转发起请求，电脑不需要公网地址或端口映射。
 
 ## 自己构建
+
+应用图标由 `tools/build_icons.py` 生成。装有 Pillow 的开发环境可运行 `python tools/build_icons.py --preview .build/icon-preview` 更新 Android、Windows 和内嵌页面资源，并查看手机启动器裁切和 Windows 小尺寸预览。协作、图标和连接方式的[回归检查入口](../.agents/skills/remote-ai-checks/SKILL.md)按改动范围列出。
 
 ```powershell
 # 电脑端（两个 exe），只需要 Windows 自带的 .NET Framework 4.x
@@ -61,6 +63,10 @@ powershell -ExecutionPolicy Bypass -File android\build.ps1 -Jdk <JDK 目录> -Sd
 
 安卓构建默认要求已有签名密钥；用 `-SecretDir <密钥目录>` 指定包含 `signing.p12` 和 `signing-password.txt` 的目录。只有首次创建独立应用签名时才传 `-CreateSigningKey`，默认目录为仓库之外的 `~/.remote-cli-signing`。正式发版必须与上一版 APK 比对证书，不能用新密钥替代已有发布密钥。
 
+### 正式版与预发布
+
+新版本默认直接发布为 GitHub 正式版。核对远端标签指向已验收的提交后，用 `gh release create` 上传 Windows 安装包、Android APK 与 iOS IPA（`.github/workflows/ios-build.yml` 在 `macos-15` 上构建），并指定 `--verify-tag --latest`。发布后核对附件及其摘要。仅在明确需要预发布验证时使用 `--prerelease --latest=false`，验收通过后可用 `gh release edit vX.Y.Z --prerelease=false --latest` 晋升为正式版。
+
 CI 的 `Windows session behavior` 作业在 Windows 上编译并运行会话归属、活动状态、操作能力和历史去重测试；Android 的界面源文件检查不依赖 Windows 实现中的具体调用文本。
 
 ```powershell
@@ -71,7 +77,7 @@ python tests\e2e_windows.py
 node tests\bridge_check.js                                # 传输选择、连接状态、延迟测量、连续输入和断线重试
 node tests\terminal_scroll_check.js                       # 拖动、惯性、起滑不跳动、画面跟随手指（两侧都有内容、网络停顿时的跟随、滑到列表尽头不漂移）、固定行的识别、只在终端重画时复制画面、滑动图层中途丢失时退回按行滚动、Codex 普通/全屏模式、Claude Code 的滚轮配速、鼠标编码、回到最新和程序自己的回到末尾提示的识别、提示所在行由上面的内容补上
 python tests\fullscreen_check.py <chrome.exe>             # 占满屏幕的程序：触摸拖动逐行滚动；滑动时屏幕截图与静止时的终端画面逐像素比对（每一行都在应在的位置，没有遮挡），移动图层时不重画；手机给不出滑动图层、图层中途丢失或复制画面过慢时退回按行滚动；手指点“回到最新”回到末尾，程序自己在画面上给出回到末尾的提示时（Claude Code 的 Jump to bottom）上面的内容下移一行盖住它，不留空行，没有滑动图层时才只盖住这一行，按钮按程序的方式回去；长时间运行后重新打开只读最近的输出且画面完整。真实的中转和电脑端，Codex 用替身程序；屏幕密度按手机取 2.625（`RCLI_TEST_DENSITY` 可改）；读截图需要 Pillow
-python tests\phone_line_check.py [chrome.exe [输出文件夹]]  # 手机上切换线路和更改设置：新线路在原线路旁准备好，交接后手机到达才保留，没到则回到原线路；隧道、局域网、中转互相切换；带浏览器时在页面上实际点按，并从列表给终端发一条指令。先运行 tools\package_windows.py
+python tests\phone_line_check.py [chrome.exe [输出文件夹]]  # 手机切换隧道、局域网和中转；验证到达确认、超时回退及旧进程退出。局域网使用系统分配的回环端口，隧道由测试程序模拟。带浏览器时还验证页面点按。先运行 tools\package_windows.py
 node tests\session_state_check.js                         # 运行中的会话与保留的写入锁分开显示
 python tests\android_aggregate_check.py --jdk <JDK 目录>  # 工作台的分组、排序、状态和刷新判定；按“等你确认、正在运行、已打开、置顶记录、最近”分段、搜索、按工具和运行位置筛选、未加入项目的对话
 python tests\workbench_ui_check.py                         # 工作台默认折叠、最近两条和标题可读性
@@ -88,7 +94,8 @@ python tests\own_mode_check.py                            # “我的中转”�
 python tests\public_mode_check.py                         # “公共中转”页签：不用配置就列出，选中后自动申请自己的空间，不显示地址和密码；空间被清理后重新申请；电脑端在空间里开终端，别的空间看不到
 python tests\work_check.py                                # 工作统计、定时提问和接力：用编造的 Claude Code 与 Codex 记录逐项核对提问数、工作时长、首次响应和 token，按工具、项目、时段的汇总；定时提问的三种重复方式、到期只问一次、重启后仍在；接力按次数触发
 python tests\tabs_ui_check.py <chrome.exe> <输出文件夹>     # 手机页面底部的四个栏目：各显示自己的内容，320、390、430 三种宽度下没有内容被底栏挡住；在“协作”里添加、修改、删除接力和定时提问，交接对话，同时提问；“我的”里的统计切换时间范围和指标；较早版本的电脑端给出说明。真实页面和真实中转，电脑由 tools\readme_pictures.py 里的替身扮演
-python tests\begin_ui_check.py <chrome.exe> <输出文件夹>    # 新建对话：项目页和“任务”的表单都提供“应用”和“终端”，上次选的种类和工具保留；终端一点即开；应用交出第一句话，电脑上发出后自动进入那段对话；没有桌面应用的电脑只有终端；只在终端里用过的项目先显示终端；添加项目后直接进入；App 里底栏的四个栏目都交给 App，App 打开的表单和对话窗口离开后回到 App 的列表，较早版本的 App 只接管“协作”和“我的”。真实页面和真实中转，电脑由 tools\readme_pictures.py 里的替身扮演
+python tests\console_ui_check.py <chrome.exe> <输出文件夹> [RemoteCliAgent.exe 所在文件夹]    # 电脑总控台：真实中转和刚构建的 Windows 电脑端，编造的工具记录和替身工具；对话按项目只列一次，右键菜单写明不可用的原因，历史对话发消息后以对话继续，对话与终端界面往返后仍是同一会话，交接、新建对话的项目选择和分支菜单不被遮挡，文件改动在中间显示，窄窗口布局
+python tests\begin_ui_check.py <chrome.exe> <输出文件夹>    # 新建对话：项目页和“任务”的表单是一个列表，能以对话方式运行的 AI 一点即开对话，命令行一点即开终端，上次选的保留；不支持对话的电脑列出桌面版（交出第一句话，电脑上发出后自动进入那段对话）和各工具的终端，没有桌面应用时只有终端；添加项目后直接进入；App 里底栏的四个栏目都交给 App，App 打开的表单和对话窗口离开后回到 App 的列表，较早版本的 App 只接管“协作”和“我的”。真实页面和真实中转，电脑由 tools\readme_pictures.py 里的替身扮演
 python tests\notice_check.py                              # 钩子把工具留给手机时电脑屏幕右下角的说明：Codex 的确认请求、等手机消息的停止；没有留住时不显示
 python tests\reach_check.py                               # 电脑上开着的对话：工具的钩子报告的事件由谁回答、何时交给手机，手机的消息怎样送达，以及写入工具配置的条目（用虚构的事件和临时文件夹；先构建电脑端）
 python tests\reach_e2e_check.py [chrome.exe [输出文件夹]]  # 同一件事经真实的中转、电脑端和钩子程序走一遍：列表、确认、发消息，以及列表页上的卡片（虚构的 Codex 目录和事件）；对话的置顶和隐藏由电脑端记住；未加入项目的对话被列出、查看、发消息，文件夹加为项目后归入该项目
@@ -102,7 +109,7 @@ python tests\tunnel_download_check.py --bash <bash路径>    # 四种 Linux 架�
 python tests\tunnel_check.py <cloudflared.exe> --protocol http2  # 公网回显延迟
 python tests\tunnel_keep_check.py <cloudflared.exe>       # 程序结束后再启动，公网地址不变
 python tests\smooth_check.py                           # 历史很长时按键回显和连续输出的间隔
-python tests\files_check.py [chrome.exe <输出文件夹>]    # 查看文件：列目录、读文件、不出项目文件夹；带浏览器时给每种查看器截图
+python tests\files_check.py [chrome.exe <输出文件夹>]    # 查看文件：列目录、读文件、不出项目文件夹；带浏览器时给每种查看器截图，并检查右上角面板（排列、隐藏文件开关、返回键关闭；截图 folder-menu.png、file-menu.png）和保存后的面板
 python tests\restart_check.py                          # 电脑端和中转重启后，终端在原编号下接回
 python tests\move_check.py                             # 电脑端换到另一个中转再换回：终端、名字、画面和已结束的终端都跟着，不留下假的运行中终端
 python tests\history_check.py                          # 电脑端保留已交给中转的输出，中转缺少时从缺的地方再给一遍
@@ -114,6 +121,6 @@ python tests\pages_check.py <chrome.exe> <输出文件夹>     # 用本机的中
 java -cp .cache\zxing-core-3.5.3.jar tests\QrDecodeCheck.java <二维码.png> <内容>   # 手机端的二维码识别
 ```
 
-本轮相关模块：Android `Tabs.java` 画底部四个栏目，`Workbench.java` 提供“任务”和“项目”，`AppPages.java` 提供全局协作和统计；内嵌页面的 `begin.js` 负责新建对话；Windows `LanNetwork.cs` 选择局域网地址并诊断监听状态，`ToolInstaller.cs` 处理用户接受后的可选安装。
+本轮相关模块：Android `Tabs.java` 画底部四个栏目，`Workbench.java` 提供“任务”和“项目”，`AppPages.java` 提供全局协作和统计，`RouteSelector.java` / `RouteStore.java` / `RouteCoordinator.java` 负责多路由并发选路与本地凭据加密存储；内嵌页面的 `begin.js` 负责新建对话；`web-app/` 为基于 Vite + Preact + TypeScript 的电脑总控台源码（`npm --prefix web-app run build` 输出至 `web/console/`，随 Windows 安装包和 Android APK 一并离线打包）：`runtime/threads.ts` 把电脑报告的终端和对话记录合成“一段对话一项”（对话方式、终端界面、电脑其它窗口、未运行），`runtime/actions.ts` 集中发送、停止、确认、结束、切换显示方式和交接等操作，组件只负责界面；Windows `DesktopConsole.cs` 封装系统 Edge WebView2 原生桌面总控台（`agent-windows/build.ps1` 自动下载并校验固定版本 `Microsoft.Web.WebView2` NuGet 的三个轻量库文件），`GitReview.cs` 与 `Worktrees.cs` 提供两阶段按需 Diff、隐藏 ref 检查点与安全 Worktree 隔离，`RelayLink.cs` / `RouteDiscovery.cs` / `TunnelSupervisor.cs` 提供多路由并发上报与隧道自愈，`LanNetwork.cs` 选择局域网地址并诊断监听状态，`ToolInstaller.cs` 处理用户接受后的可选安装。
 
-新增检查：`python tests/lan_tools_check.py` 验证校园网地址、代理虚拟地址、端口诊断和跳过安装，运行时不安装工具。`tests/in_use_check.py` 同时核对闲置未归项目的对话仍出现在电脑活动列表，且不误算为执行中。
+新增检查：`python -m unittest relay/test_git_and_rev.py` 验证 `rev` 增量长轮询与 `/api/git` 协议；`python tests/git_review_check.py` 验证 Worktree 隔离、安全清理、隐藏 ref 检查点与两阶段 Diff；`python tests/backend_optimizations_check.py` 验证 `ProcessText` 截断/头尾折叠/ANSI 归一化/混排编码解码、`WorkspaceSnapshot` 只读快照、`GitReview` porcelain v2、`Peers` 对 `agy` 的 168 秒预算与 8.6 KB 防溢盘和 `Content-Length` 帧，以及 `Reach` 未关 stdin EOF 的即时响应；`python tests/multi_route_check.py` 验证多路由并发与隧道自愈；`python tests/console_smoke_check.py` 验证 `web/console/` 打包产物、同源 `SAMEORIGIN` 嵌入头与实时中转响应；`python tests/android_aggregate_check.py --jdk <JDK目录>` 包含 `RouteSelectorCheck` 多路由选路单测；`python tests/lan_tools_check.py` 验证校园网地址、代理虚拟地址、端口诊断和跳过安装，运行时不安装工具。`tests/in_use_check.py` 同时核对闲置未归项目的对话仍出现在电脑活动列表，且不误算为执行中。

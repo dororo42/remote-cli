@@ -25,9 +25,34 @@
     else if (message) ui().inputError(message, state === 'retrying' ? '' : op.data || '', op);
   }
   const home = () => { location.replace('../'); };      // the list is one step back, not one more page
-  // Opened from the app's workbench, the back arrow leads there again rather than to this computer's list.
-  const fromBench = new URLSearchParams(location.search).get('from') === 'bench';
-  const leave = () => { if (fromBench && native && native.home) native.home(); else home(); };
+  // Opened from a collaboration task's member chip, back leads to that team; from the app's workbench, back there.
+  const searchParams = new URLSearchParams(location.search);
+  const fromBench = searchParams.get('from') === 'bench';
+  const returnList = /^[a-f0-9]{32}$/.test(searchParams.get('returnList') || '') ? searchParams.get('returnList') : '';
+  const fromTeam = /^[a-f0-9]{16,32}$/.test(searchParams.get('team') || '') ? searchParams.get('team') : '';
+  const returnTab = ['tasks', 'projects', 'together', 'me'].includes(searchParams.get('returnTab') || '') ? searchParams.get('returnTab') : '';
+  const rawReturnProject = (searchParams.get('returnProject') || '').trim();
+  const returnProject = rawReturnProject && rawReturnProject.length <= 120 ? rawReturnProject : '';
+  const teamQuery = () => {
+    let tail = fromBench ? '&from=bench' : '';
+    if (fromTeam) tail += '&team=' + encodeURIComponent(fromTeam);
+    if (returnProject) tail += '&returnProject=' + encodeURIComponent(returnProject);
+    else if (returnTab) tail += '&returnTab=' + encodeURIComponent(returnTab);
+    if (returnList) tail += '&returnList=' + returnList;
+    return tail;
+  };
+  const leave = () => {
+    if (fromTeam) {
+      let target = '../?' + (returnProject ? 'project=' + encodeURIComponent(returnProject) : 'tab=' + (returnTab || 'together'))
+        + '&do=team&item=' + encodeURIComponent(fromTeam);
+      if (fromBench) target += '&from=bench';
+      location.replace(target);
+      return;
+    }
+    if (fromBench && native && native.home) native.home();
+    else if (returnList) location.replace('../?backList=' + returnList);
+    else home();
+  };
   // Quick tunnels buffer SSE; a held JSON response is delivered without that delay.
   let after = 0, terminal = null, loaded = false, streamed = !location.hostname.endsWith('.trycloudflare.com'), failures = 0, reader = null, run = 0, fetching = false, gone = false;
   let socketMode = typeof WebSocket === 'function', everSocket = false, socket = null, socketTimer = null;
@@ -288,7 +313,8 @@
   const say = text => { const t = ui(); if (t && t.notice) t.notice(text); else if (t) t.error(text); };
   const worker = () => work || (work = window.RemoteWork.forPage('../', say));
   async function again() {
-    if (!terminal || terminal.state !== 'closed' || ['shell', 'agy'].includes(terminal.tool)) return;
+    // (an Antigravity CLI conversation is gone on with as a conversation; its screen in a terminal is not)
+    if (!terminal || terminal.state !== 'closed' || terminal.tool === 'shell' || (terminal.tool === 'agy' && terminal.form !== 'chat')) return;
     const start = { action: 'start', id: newId(), tool: terminal.tool, dir: terminal.dir };
     if (terminal.session) start.session = terminal.session;
     start.history = false;
@@ -296,7 +322,7 @@
     try {
       const { status, body } = await post(start);
       if (status !== 200) throw new Error(body.error || '没有打开');
-      location.replace('?id=' + body.terminal);
+      location.replace('?id=' + body.terminal + teamQuery());
     } catch (error) { ui().error(error.message); }
   }
   // The files of the project this terminal works in. The terminal goes on running on the computer; the back arrow
@@ -331,6 +357,17 @@
         { id: 'menu-copy', icon: 'copy', tint: 'copy', label: '复制画面', say, act: async () => { const text = ui().screenText(); p.sheet.close(null); if (!await window.RemoteSheet.copy(text)) ui().error('没能复制，请长按选择文字'); } }]));
       const rows = [kit.row({ icon: 'pen', tint: 'muted', label: '重命名', value: terminal.title || '', go: () => p.sheet.push(renamePage()) })];
       if (closed && talks()) rows.push(kit.row({ icon: 'play', tint: 'good', label: terminal.session ? '继续这个对话' : '重新新建对话', act: () => { p.sheet.close(null, true); again(); } }));
+      // the same conversation as a chat again: the computer ends this screen and goes on with it in one step (`reopen`)
+      if (!closed && (shown === 'claude' || shown === 'codex') && worker().has('reopen')) rows.push(kit.row({ icon: 'chat', tint: shown, label: '以对话方式继续',
+        detail: terminal.session ? '' : '对话开始后才能切换', act: async () => {
+          if (!terminal.session) return;
+          p.sheet.close(null, true);
+          try {
+            const { status, body } = await post({ action: 'start', id: newId(), tool: terminal.tool, dir: terminal.dir, form: 'chat', reopen: id });
+            if (status !== 200) throw new Error(body.error || '没有切换');
+            location.replace('../chat/?id=' + body.terminal + teamQuery());
+          } catch (error) { ui().error(error.message); }
+        } }));
       p.body.append(kit.section('终端', kit.group(...rows)));
       const skins = window.RemoteCliSkins, follows = !!(native && native.pref && native.setPref) && !native.pref('termskin');
       const storedSkin = store.get('skin', 'paper');
@@ -369,7 +406,7 @@
     return { title: '终端外观', build(p) {
       const skins = window.RemoteCliSkins, canFollow = !!(native && native.pref && native.setPref), follows = canFollow && !native.pref('termskin');
       const currentKey = store.get('skin', 'paper');
-      const list = Object.keys(skins).map(key => ({ key, name: skins[key].name, bg: skins[key].t.background, ink: skins[key].t.foreground, muted: skins[key].muted, accent: skins[key].accent, current: !follows && key === currentKey }));
+      const list = Object.keys(skins).map(key => { const k = skins[key]; return { key, name: k.name, bg: k.t.background, bubble: (k.chat && k.chat.userBg) || k.accentSoft, termBg: k.t.background, ink: k.t.foreground, muted: k.muted, accent: k.accent, current: !follows && key === currentKey }; });
       list.unshift({ key: 'auto', name: '跟随系统', follow: true, current: !follows && currentKey === 'auto' });
       if (canFollow) list.unshift({ key: 'app', name: '跟随 App', follow: true, current: follows });
       p.body.append(kit.swatches(list, key => {
@@ -381,8 +418,9 @@
   function menu() {
     if (!terminal) return;
     if (!window.RemoteSheet) return;
-    if (talks()) worker().ensure();
-    window.RemoteSheet.open(menuPage(), '终端选项');
+    // what the computer offers decides some rows (`reopen`): its list is read first, once in a while
+    const open = () => window.RemoteSheet.open(menuPage(), '终端选项');
+    if (talks()) worker().ensure().then(open, open); else open();
   }
 
   // ---- speech: the app's system recognizer, else the browser's where it has one
@@ -423,6 +461,7 @@
     menu,
     files,
     again,
+    teamQuery,
     fontSize: () => Number(store.get('font', '13')),
     saveFontSize(size) { if (size >= 9 && size <= 20) store.set('font', String(size)); }
   };

@@ -13,7 +13,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "1.10.1"
+VERSION = "1.32.0"
 PYTHON = ("3.12.10", "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3")   # version, SHA-256 of the embeddable zip
 # Parts of the embeddable Python the relay never loads.
 UNUSED = ("_msi.pyd", "_sqlite3.pyd", "sqlite3.dll", "_elementtree.pyd", "pyexpat.pyd", "_wmi.pyd", "_zoneinfo.pyd", "winsound.pyd",
@@ -57,8 +57,12 @@ def main():
             if path.is_file() and "__pycache__" not in path.parts:
                 archive.write(path, path.relative_to(stage).as_posix())
     compiler = Path(os.environ["WINDIR"]) / "Microsoft.NET" / "Framework64" / "v4.0.30319" / "csc.exe"
+    icon = ROOT / "agent-windows" / "remote-ai.ico"
+    if not icon.is_file():
+        raise SystemExit("application icon not found: " + str(icon))
     setup = dist / ("RemoteCli-Setup-%s.exe" % VERSION)
-    subprocess.run([str(compiler), "/nologo", "/target:winexe", "/platform:x64", "/optimize+", "/codepage:65001", "/out:" + str(setup),
+    subprocess.run([str(compiler), "/nologo", "/target:winexe", "/platform:x64", "/optimize+", "/codepage:65001", "/win32icon:" + str(icon),
+                    "/resource:%s,remote-ai.ico" % icon, "/out:" + str(setup),
                     "/resource:%s,payload.zip" % payload, "/reference:System.Windows.Forms.dll", "/reference:System.Drawing.dll", "/reference:System.IO.Compression.dll",
                     "/reference:System.IO.Compression.FileSystem.dll", str(ROOT / "agent-windows" / "Setup.cs"), str(ROOT / "agent-windows" / "Controls.cs")], check=True)
     print("%s  %d bytes  sha256 %s" % (setup.name, setup.stat().st_size, hashlib.sha256(setup.read_bytes()).hexdigest()))

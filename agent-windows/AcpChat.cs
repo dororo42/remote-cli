@@ -13,13 +13,24 @@ namespace RemoteCli {
 ///   notifications tell what is written (agent_message_chunk, agent_thought_chunk) and each step (tool_call,
 ///   tool_call_update);
 /// - `session/cancel` (a notification) ends the turn that runs: the prompt is answered `cancelled`;
-/// - `session/request_permission` asks this program whether a step may run, with the tool's own options.
+/// - `session/request_permission` asks this program whether a step may run, with the tool's own options;
+/// - the models a session offers come with `session/new` (`configOptions` of category `model`, or the earlier
+///   `models.availableModels`); one asked for is chosen before the first prompt (`session/set_config_option`, or
+///   `session/set_model`), and a session that cannot take it runs nothing (Remote AI does not fall back to another);
+/// - the thinking levels come the same way (`configOptions` of category `thought_level`, agy 1.5.13: low, medium, high,
+///   xhigh; the same for each of its models): one asked for is chosen after the model, before the first prompt. A
+///   level the session does not offer is refused like a model; a tool that has no levels at all runs at its own.
 /// The conversation's id is the tool's own: it is listed with the tool's other conversations and can be gone on with
 /// in a terminal. ACP has no way to add words to a turn that runs: what is said meanwhile waits for its end.
 public class AcpChat : JsonRpcChat {
     readonly string args;
-    readonly Queue<KeyValuePair<string, string>> queued = new Queue<KeyValuePair<string, string>>();     // said while a turn runs, or before the conversation was there
+    sealed class Queued {
+        public string Text, Id;
+        public IList<Attachment> Attachments;
+    }
+    readonly Queue<Queued> queued = new Queue<Queued>();     // said while a turn runs, or before the conversation was there
     bool working, loading;
+    bool nativeImages;
     // the text and the thought being written now: a new one begins where anything else came between
     string writing = "", thinking = "";
     readonly HashSet<string> steps = new HashSet<string>();
@@ -41,41 +52,131 @@ public class AcpChat : JsonRpcChat {
             { "protocolVersion", 1 },
             { "clientCapabilities", new Dictionary<string, object> { { "fs", new Dictionary<string, object> { { "readTextFile", false }, { "writeTextFile", false } } }, { "terminal", false } } },
             { "clientInfo", new Dictionary<string, object> { { "name", "remote-ai" }, { "title", "Remote AI" }, { "version", "1" } } } }, initAnswer => {
-            if (At(initAnswer, "error") != null) { Note(Label + " 初始化失败：" + Text(At(initAnswer, "error"), "message")); State("ended"); return; }
+            if (At(initAnswer, "error") != null) { Unopened(Label + " 初始化失败：" + Text(At(initAnswer, "error"), "message"), queued.Count > 0); queued.Clear(); return; }
+            nativeImages = true.Equals(At(At(At(At(initAnswer, "result"), "agentCapabilities"), "promptCapabilities"), "image"));
             if (session.Length > 0) loading = true;
             Call(session.Length > 0 ? "session/load" : "session/new", given, answer => {
                 loading = false;
                 string id = session.Length > 0 && At(answer, "error") == null ? session : Text(At(answer, "result"), "sessionId");
-                if (id.Length == 0) { Note(Label + " 没有打开这段对话：" + Text(At(answer, "error"), "message")); State("ended"); return; }
+                if (id.Length == 0) { Unopened(Label + " 没有打开这段对话：" + Text(At(answer, "error"), "message"), queued.Count > 0); queued.Clear(); return; }
+                if (listing) { Offer(Offered(At(answer, "result"))); return; }
                 Known(id);
-                if (queued.Count > 0) Prompt(); else State("idle");
+                if (model.Length == 0 && effort.Length == 0) { Ready(); return; }
+                Configure(At(answer, "result"), refused => {
+                    if (refused == null) { Ready(); return; }
+                    // not begun with another model than the one asked for: what waits for it fails, and so does what follows
+                    this.refused = refused;
+                    Note(refused);
+                    if (queued.Count > 0) { queued.Clear(); TurnEnded("failed", refused); }
+                    State("idle");
+                });
             });
         });
     }
+    void Ready() { if (queued.Count > 0) Prompt(); else State("idle"); }
     string Label { get { return RemoteCli.Tool.LabelOf(Tool); } }
+    string refused;     // why the model asked for could not be chosen
 
-    public override void Say(string text, string id) {
-        lock (gate) {
-            queued.Enqueue(new KeyValuePair<string, string>(text, id ?? ""));
-            if (Session.Length == 0) { State("busy"); return; }
-            if (!working) Prompt();
-            else Note("消息将在这一轮结束后发出");
+    /// The models a session offers: ACP's `configOptions` entry of category `model` (its options' values, also in
+    /// groups), else the earlier `models.availableModels` (modelId, name); each with the thinking levels of the session.
+    static List<Models.Choice> Offered(object result) {
+        var config = ModelOption(result);
+        var levels = Option(result, "thought_level");
+        string[] efforts = levels == null ? new string[0] : Values(levels).Select(one => one.Id).ToArray();
+        string current = levels == null ? "" : Text(levels, "currentValue");
+        var offered = config != null ? Values(config).ToList()
+            : Many(At(result, "models"), "availableModels").Select(one => new Models.Choice { Id = Text(one, "modelId"), Label = Text(one, "name") }).ToList();
+        foreach (var one in offered) { one.Efforts = efforts; one.DefaultEffort = current; }
+        return offered;
+    }
+    static object Option(object result, string category) { return Many(result, "configOptions").FirstOrDefault(one => Text(one, "category") == category); }
+    static object ModelOption(object result) { return Option(result, "model"); }
+    /// The model asked for, then the thinking level; `then` is given null once both are chosen, or why one was not.
+    void Configure(object opened, Action<string> then) {
+        if (model.Length == 0) { Think(opened, then); return; }
+        Choose(opened, (refused, latest) => { if (refused != null) then(refused); else Think(At(latest, "configOptions") != null ? latest : opened, then); });
+    }
+    void Think(object result, Action<string> then) {
+        if (effort.Length == 0) { then(null); return; }
+        var levels = Option(result, "thought_level");
+        if (levels == null) { Note(Label + " 不能设置思考深度，按它自己的设置运行"); then(null); return; }
+        if (!Values(levels).Any(one => one.Id == effort)) { then(Label + " 没有提供思考深度 " + effort); return; }
+        Call("session/set_config_option", new Dictionary<string, object> { { "sessionId", Session }, { "configId", Text(levels, "id") }, { "value", effort } }, answer => {
+            var error = At(answer, "error");
+            then(error == null ? null : Label + " 不能使用思考深度 " + effort + "：" + Text(error, "message"));
+        });
+    }
+    static IEnumerable<Models.Choice> Values(object option) {
+        foreach (var one in Many(option, "options")) {
+            if (At(one, "options") != null) { foreach (var inner in Values(one)) yield return inner; }
+            else yield return new Models.Choice { Id = Text(one, "value"), Label = Text(one, "name") };
         }
     }
-    // The next thing said goes as a turn of its own; what waits goes after it, one by one.
+    /// Chooses the model asked for, the way the session says it can be chosen (`session/set_config_option`, else
+    /// `session/set_model`); `then` is given null once it is chosen, or why it was not, and the answer's result (the
+    /// session's options as they are now, where it says them).
+    void Choose(object result, Action<string, object> then) {
+        var config = ModelOption(result);
+        var offered = Offered(result);
+        if (offered.Count > 0 && !offered.Any(one => one.Id == model)) { then(Label + " 没有提供模型 " + model, null); return; }
+        Action<Dictionary<string, object>> answered = answer => {
+            var error = At(answer, "error");
+            then(error == null ? null : Label + " 不能使用模型 " + model + "：" + Text(error, "message"), At(answer, "result"));
+        };
+        if (config != null) Call("session/set_config_option", new Dictionary<string, object> { { "sessionId", Session }, { "configId", Text(config, "id") }, { "value", model } }, answered);
+        else Call("session/set_model", new Dictionary<string, object> { { "sessionId", Session }, { "modelId", model } }, answered);
+    }
+
+    public override void Say(string text, string id, IList<Attachment> attachments = null) {
+        lock (gate) {
+            if (Closed || Status == "ended") throw new InvalidOperationException("对话已结束");
+            if (refused != null) throw new InvalidOperationException(refused);
+            queued.Enqueue(new Queued { Text = text, Id = id ?? "", Attachments = attachments });
+            if (Session.Length == 0) { State("busy"); return; }
+            if (!working) Prompt();
+            else if (!stopping) Note("\u6d88\u606f\u5c06\u5728\u8fd9\u4e00\u8f6e\u7ed3\u675f\u540e\u5408\u5e76\u53d1\u51fa");
+        }
+    }
+    // All messages waiting in the queue go together in one turn so stacked follow-ups never wait turn by turn.
     void Prompt() {
-        var said = queued.Dequeue();
+        var batch = new List<Queued>();
+        while (queued.Count > 0) batch.Add(queued.Dequeue());
+        if (batch.Count == 0) return;
         working = true; writing = thinking = "";
-        Item("u" + Guid.NewGuid().ToString("N").Substring(0, 12), "user", said.Key, said.Value.Length > 0 ? new Dictionary<string, object> { { "op", said.Value } } : null);
+        var texts = new List<string>();
+        var allAttachments = new List<Attachment>();
+        var ops = new List<string>();
+        foreach (var one in batch) {
+            string piece = Attachments.WithText(one.Text, one.Attachments);
+            if (piece.Length > 0) texts.Add(piece);
+            if (one.Attachments != null) allAttachments.AddRange(one.Attachments);
+            if (one.Id.Length > 0) ops.Add(one.Id);
+        }
+        string shown = String.Join("\n\n", texts.ToArray());
+        Dictionary<string, object> extra = null;
+        if (ops.Count > 0) {
+            extra = new Dictionary<string, object> { { "op", ops[0] } };
+            if (ops.Count > 1) extra["ops"] = ops.ToArray();
+        }
+        Item("u" + Guid.NewGuid().ToString("N").Substring(0, 12), "user", shown, extra);
         State("busy");
-        Call("session/prompt", new Dictionary<string, object> { { "sessionId", Session }, { "prompt", new object[] { new Dictionary<string, object> { { "type", "text" }, { "text", said.Key } } } } }, answer => {
+        object prompt = nativeImages && allAttachments.Count > 0
+            ? (object)Attachments.AcpContent(shown, allAttachments)
+            : new object[] { new Dictionary<string, object> { { "type", "text" }, { "text", shown } } };
+        Call("session/prompt", new Dictionary<string, object> { { "sessionId", Session }, { "prompt", prompt } }, answer => {
             working = false; writing = thinking = "";
             var error = At(answer, "error");
             string reason = Text(At(answer, "result"), "stopReason");
-            TurnEnded(error != null ? "failed" : reason == "cancelled" ? "stopped" : reason == "end_turn" ? "done" : reason == "refusal" ? "failed" : "done",
-                error != null ? Text(error, "message") : reason == "max_tokens" || reason == "max_turn_requests" ? "这一轮达到了长度上限" : reason == "refusal" ? "工具拒绝了这个请求" : "");
+            string how = error != null ? "failed" : reason == "cancelled" ? "stopped" : reason == "end_turn" ? "done" : reason == "refusal" ? "failed" : "done";
+            string errText = error != null ? Text(error, "message") : reason == "max_tokens" || reason == "max_turn_requests" ? "这一轮达到了长度上限" : reason == "refusal" ? "工具拒绝了这个请求" : "";
+            if (how == "stopped" && queued.Count > 0) {
+                TurnEndedQuiet("stopped", "");
+                Prompt();
+                return;
+            }
+            TurnEnded(how, errText);
             if (asks.Count > 0) State("confirm");
-            else if (queued.Count > 0 && !stopping) Prompt();
+            else if (queued.Count > 0) Prompt();
             else State("idle");
         });
     }
@@ -83,8 +184,10 @@ public class AcpChat : JsonRpcChat {
         lock (gate) {
             if (!working) throw new InvalidOperationException("它现在没有在执行");
             stopping = true;
+            queued.Clear();
             Notify("session/cancel", new Dictionary<string, object> { { "sessionId", Session } });
         }
+        CancelConfirmations();
     }
 
     protected override void Notified(string method, object p) {
@@ -119,9 +222,10 @@ public class AcpChat : JsonRpcChat {
             string kind = Text(u, "kind"), title = Text(u, "title"), rawName = Text(u, "name");
             var input = At(u, "rawInput") ?? At(u, "args");
             bool isPeer = IsPeerAsk(rawName, title, input);
-            string name = isPeer ? "mcp" : kind == "execute" ? "shell" : kind == "edit" || kind == "delete" || kind == "move" ? "edit" : kind == "search" || kind == "fetch" ? "search" : kind == "read" ? "read" : "tool";
-            string detail = isPeer ? Text(input, "question") : Command(u);
-            string shown = isPeer ? Peers.StepTitle(Text(input, "tool"), detail) : Titled(kind, title, rawName, detail);
+            bool isCollab = !isPeer && IsCollabStart(rawName, title, input);
+            string name = (isPeer || isCollab) ? "mcp" : kind == "execute" ? "shell" : kind == "edit" || kind == "delete" || kind == "move" ? "edit" : kind == "search" || kind == "fetch" ? "search" : kind == "read" ? "read" : "tool";
+            string detail = isPeer ? Text(input, "question") : isCollab ? Text(input, "goal") : Command(u);
+            string shown = isPeer ? Peers.StepTitle(Text(input, "tool"), detail) : isCollab ? Peers.CollabStepTitle(Text(input, "mode"), detail) : Titled(kind, title, rawName, detail);
             Item(id, "step", Cut(shown, 200), new Dictionary<string, object> { { "name", name }, { "detail", Cut(detail, 2000) }, { "state", "run" } });
         }
         string back = Given(u);
@@ -172,11 +276,17 @@ public class AcpChat : JsonRpcChat {
         if (title == Peers.ToolName || title.IndexOf(Peers.ToolName, StringComparison.Ordinal) >= 0) return true;
         return Text(input, "question").Length > 0 && RemoteCli.Tool.Of(Text(input, "tool")) != null;
     }
+    static bool IsCollabStart(string name, string title, object input) {
+        if (name == Peers.CollabToolName || name.EndsWith("__" + Peers.CollabToolName, StringComparison.Ordinal) || name.EndsWith("_" + Peers.CollabToolName, StringComparison.Ordinal)) return true;
+        if (title == Peers.CollabToolName || title.IndexOf(Peers.CollabToolName, StringComparison.Ordinal) >= 0) return true;
+        return Text(input, "goal").Length > 0 && (Text(input, "mode") == "lead" || Text(input, "mode") == "review");
+    }
     protected override void Requested(object id, string method, object p) {
         if (method == "session/request_permission") {
             var request = new Dictionary<string, object> { { "id", id }, { "params", p } };
             var call = At(p, "toolCall"); string kind = Text(call, "kind"), command = Command(call), title = Text(call, "title"), rawName = Text(call, "name");
-            if (mcp != null && IsPeerAsk(rawName, title, At(call, "rawInput") ?? At(call, "args"))) {
+            var callInput = At(call, "rawInput") ?? At(call, "args");
+            if (mcp != null && (IsPeerAsk(rawName, title, callInput) || IsCollabStart(rawName, title, callInput))) {
                 var options = Many(p, "options").ToList();
                 var allow = options.FirstOrDefault(one => Text(one, "kind") == "allow_once") ?? options.FirstOrDefault(one => Text(one, "kind").StartsWith("allow", StringComparison.Ordinal));
                 if (allow != null) {

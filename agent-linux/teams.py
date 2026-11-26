@@ -14,13 +14,15 @@ The state of every team is kept in one JSON file (0600) next to the other stores
 import json
 import os
 import re
-import subprocess
 import threading
 import time
+
+from worktrees import changes_in  # noqa: F401 (re-exported for callers/tests)
 
 MOST = 10               # teams kept at all (ended ones are dropped oldest first)
 MOST_ROUNDS = 10        # the most rounds a new team may ask for
 MAX_TOTAL_ROUNDS = 20   # the most rounds a team can reach by being continued
+MAX_PAST_SESSIONS = 60
 CHAIN_QUIET_DEFAULT = 45.0
 
 MODES = ("review", "lead", "compare")
@@ -35,11 +37,12 @@ STRENGTHS = {
     "cline": "擅长逐步执行与编辑器联动，适合小步验证的改动",
     "pi": "轻量快速，适合小步修改、速查与交叉检查"}
 
-QUOTA_ERROR = re.compile(r"(hit your limit|rate[\s_-]*limit|usage[\s_-]*limit|quota|out of credits|credit balance"
-                         r"|too many requests|\b429\b|overloaded|额度|限额|已达上限|额度用尽|额度已用完|额度用完)", re.IGNORECASE)
-ASSIGN = re.compile(r"^[\s>*\-_`]*ASSIGN[*_`]*\s+[*_`]*([a-z][a-z0-9_-]*)[*_`]*\s*[:：]\s*(.+?)\s*$",
-                    re.MULTILINE | re.IGNORECASE)
+QUOTA_ERROR = re.compile(r"(hit your limit|rate[\s_-]*limit|usage[\s_-]*limit|quota(?: reached)?|out of credits"
+                         r"|credit balance|upgrade your plan|too many requests|\b429\b|overloaded"
+                         r"|额度|限额|已达上限|额度用尽|额度已用完|额度用完)", re.IGNORECASE)
+ASSIGN_HEAD = re.compile(r"^[\s>*\-_`]*ASSIGN[*_`]*\s+[*_`]*([a-z][a-z0-9_-]*)[*_`]*\s*[:：]\s*(.*)$", re.IGNORECASE)
 DONE = re.compile(r"^[\s>*\-_`]*DONE[*_`]*\s*[:：]\s*(.*)$", re.MULTILINE | re.IGNORECASE)
+DIRECTIVE_LINE = re.compile(r"^[\s>*\-_`]*(?:ASSIGN|DONE|VERIFIED)[*_`]*(?:\s+[:：]|\s+[a-z]|[:：])", re.IGNORECASE)
 ID_OK = re.compile(r"\A[a-f0-9]{16,32}\Z")
 
 REMIND = ("【协作任务】没有在你的回答里找到分派或结束。请在回答的最后按格式写：\n"
@@ -49,6 +52,11 @@ REMIND = ("【协作任务】没有在你的回答里找到分派或结束。请
 def cut(text, most):
     text = text or ""
     return text if len(text) <= most else text[:most] + "\n…（后面省略）"
+
+
+def short_text(text, most):
+    text = " ".join((text or "").split())
+    return text if len(text) <= most else text[:most - 1] + "…"
 
 
 def now_ms():
@@ -75,24 +83,6 @@ def label(tool):
     return TOOL_LABELS.get(tool, tool)
 
 
-def changes_in(folder):
-    """What changed in a project's folder, as git says it: the files, and the changes themselves
-    (a folder that is no repository says nothing)."""
-    if not folder or not os.path.isdir(folder):
-        return ""
-    try:
-        files = subprocess.run(["git", "-C", folder, "status", "--porcelain", "--untracked-files=all"],
-                               capture_output=True, timeout=15)
-        if files.returncode != 0 or not files.stdout.strip():
-            return ""
-        diff = subprocess.run(["git", "-C", folder, "-c", "core.quotepath=false", "diff", "HEAD", "--no-color"],
-                              capture_output=True, timeout=15)
-        return "文件：\n" + files.stdout.decode("utf-8", "replace").rstrip() + "\n\n" + \
-            (diff.stdout.decode("utf-8", "replace").rstrip() if diff.returncode == 0 else "")
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-
-
 def failure_reason(said):
     if is_quota_error(said):
         return "额度已用尽"
@@ -100,16 +90,48 @@ def failure_reason(said):
     return cut(one_line, 140) if one_line else "执行出错"
 
 
+def _quota_only_reply(said):
+    """Whether a short 'done' reply is solely the tool reporting a spent quota rather than real output."""
+    text = (said or "").strip()
+    if not text or len(text) > 600:
+        return False
+    if not is_quota_error(text):
+        return False
+    if DONE.search(text) or verdict(text) is not None:
+        return False
+    for line in text.splitlines():
+        if ASSIGN_HEAD.match(line):
+            return False
+    return True
+
+
+def _bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() == "true"
+
+
+def _int(value, fallback):
+    if isinstance(value, bool):
+        return fallback
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
 class Hands:
     """What this computer does for a team: begin a member's conversation (optionally in a
-    worktree folder), tell it something, stop a turn, read project changes, read quota
-    windows, list the chat-capable tools, and manage Git worktrees for `compare`. Every
-    member may be None where this computer cannot do that thing (the ported ways check)."""
+    worktree folder), tell it something, stop a turn, close a terminal on removal, read
+    project changes, read quota windows, list available tools, and manage Git worktrees."""
 
-    def __init__(self, begin=None, begin_in=None, say=None, stop=None, changes=None, limits=None,
-                 available=None, make_worktree=None, worktree_diff=None, worktree_stat=None,
+    def __init__(self, begin=None, begin_in=None, say=None, say_with_attachments=None,
+                 stop=None, close=None, changes=None, limits=None, available=None,
+                 make_worktree=None, worktree_diff=None, worktree_stat=None,
                  apply_worktree=None, clean_worktrees=None):
-        self.begin, self.begin_in, self.say, self.stop = begin, begin_in, say, stop
+        self.begin, self.begin_in = begin, begin_in
+        self.say, self.say_with_attachments = say, say_with_attachments
+        self.stop, self.close = stop, close
         self.changes, self.limits, self.available = changes, limits, available
         self.make_worktree, self.worktree_diff, self.worktree_stat = make_worktree, worktree_diff, worktree_stat
         self.apply_worktree, self.clean_worktrees = apply_worktree, clean_worktrees
@@ -125,20 +147,28 @@ class Team:
         self.tools = []
         self.rounds, self.round = 3, 1
         self.created = 0
+        self.updated = 0            # Unix seconds of the last change/step (for team_cards)
         self.log = []               # [{"at": ms, "who": str, "text": str}]
         self.members = {}           # role -> terminal id
+        self.opened = []            # all terminal ids started by this task
+        self.sessions = {}          # role -> {"id": str, "tool": str}
+        self.past = []              # [{"id": str, "tool": str}] (conversations belonging to this task)
         self.awaited = []           # roles whose turn is awaited
         self.answers = {}           # role -> what it said this round
         self.worktrees = {}         # tool -> path (compare)
         self.base_commits = {}      # tool -> base commit sha
-        self.summaries = self.stats = self.diffs = {}
+        self.summaries, self.stats, self.diffs = {}, {}, {}
         self.failed = {}            # tool -> brief reason
         self.pending = {}           # role -> the prompt last dispatched
 
     def copy(self):
         other = Team()
         for key, value in vars(self).items():
-            if isinstance(value, list):
+            if key == "sessions":
+                other.sessions = {k: dict(v) for k, v in value.items()}
+            elif key in ("log", "past"):
+                setattr(other, key, [dict(one) for one in value])
+            elif isinstance(value, list):
                 setattr(other, key, list(value))
             elif isinstance(value, dict):
                 setattr(other, key, dict(value))
@@ -146,13 +176,19 @@ class Team:
                 setattr(other, key, value)
         return other
 
+    def touch(self):
+        self.updated = int(time.time())
+
     def to_json(self):
         return {"id": self.id, "dir": self.dir, "mode": self.mode, "goal": self.goal, "rules": self.rules,
                 "state": self.state, "note": self.note, "phase": self.phase, "picked": self.picked,
                 "discuss": self.discuss, "reminded": self.reminded,
                 "tools": self.tools, "rounds": self.rounds, "round": self.round,
-                "created": self.created, "members": self.members, "awaited": self.awaited,
-                "answers": self.answers, "worktrees": self.worktrees, "base_commits": self.base_commits,
+                "created": self.created, "updated": self.updated,
+                "members": self.members, "opened": self.opened,
+                "sessions": self.sessions, "past": self.past,
+                "awaited": self.awaited, "answers": self.answers,
+                "worktrees": self.worktrees, "base_commits": self.base_commits,
                 "summaries": self.summaries, "stats": self.stats, "diffs": self.diffs,
                 "failed": self.failed, "pending": self.pending,
                 "log": [{"at": s["at"], "who": s["who"], "text": s["text"]} for s in self.log]}
@@ -166,10 +202,24 @@ class Team:
         team.id, team.dir, team.mode = word("id"), word("dir"), word("mode")
         team.goal, team.rules, team.state = word("goal"), word("rules"), word("state") or "running"
         team.note, team.phase, team.picked = word("note"), word("phase"), word("picked")
-        team.discuss = word("discuss").lower() == "true"
-        team.reminded = word("reminded").lower() == "true"
+        team.discuss = _bool(kept.get("discuss"))
+        team.reminded = _bool(kept.get("reminded"))
         team.tools = [str(one) for one in kept.get("tools") or [] if isinstance(one, str)]
-        team.members = {str(k): str(v) for k, v in (kept.get("members") or {}).items()}
+        team.members = {str(k): str(v) for k, v in (kept.get("members") or {}).items() if v}
+        opened = [str(one) for one in kept.get("opened") or [] if isinstance(one, str) and one]
+        for term in team.members.values():
+            if term not in opened:
+                opened.append(term)
+        team.opened = opened
+        for role, seat in (kept.get("sessions") or {}).items():
+            if isinstance(seat, dict) and seat.get("id") and seat.get("tool"):
+                team.sessions[str(role)] = {"id": str(seat["id"]), "tool": str(seat["tool"])}
+        for seat in kept.get("past") or []:
+            if isinstance(seat, dict) and seat.get("id") and seat.get("tool"):
+                entry = {"id": str(seat["id"]), "tool": str(seat["tool"])}
+                if entry not in team.past:
+                    team.past.append(entry)
+        team.past = team.past[-MAX_PAST_SESSIONS:]
         team.awaited = [str(one) for one in kept.get("awaited") or []]
         team.answers = {str(k): str(v) for k, v in (kept.get("answers") or {}).items()}
         team.worktrees = {str(k): str(v) for k, v in (kept.get("worktrees") or {}).items()}
@@ -186,14 +236,9 @@ class Team:
             if isinstance(step, dict):
                 team.log.append({"at": _int(step.get("at"), 0), "who": str(step.get("who") or ""),
                                  "text": str(step.get("text") or "")})
+        last_at = team.log[-1]["at"] // 1000 if team.log and team.log[-1]["at"] > 0 else team.created // 1000
+        team.updated = _int(kept.get("updated"), last_at)
         return team if ID_OK.match(team.id) and team.mode in MODES else None
-
-
-def _int(value, fallback):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return fallback
 
 
 class OpError(Exception):
@@ -203,9 +248,12 @@ class OpError(Exception):
 class Teams:
     """The teams of this machine: the port of Teams.cs. `hands` carries this computer's ways;
     `chat_tools` names the tools whose conversations report their own turn endings (the rest
-    are polled by the caller through `polled`, below)."""
+    are polled by the caller through `teams_step`).
 
-    def __init__(self, file, hands, chat_tools=(), quiet=None, labels=None):
+    Lock ordering invariant: `hands.*`, `asking`, and `changed` are NEVER invoked while holding
+    `self.gate`, preventing lock-order inversions with the agent's terminal lock."""
+
+    def __init__(self, file, hands, chat_tools=(), quiet=None, labels=None, error_types=None):
         self.file = file
         self.hands = hands
         self.chat_tools = tuple(chat_tools)
@@ -213,6 +261,7 @@ class Teams:
         self.labels = dict(TOOL_LABELS)
         if labels:
             self.labels.update(labels)
+        self.error_types = tuple(error_types) if error_types else (OpError, ValueError)
         self.gate = threading.Condition(threading.RLock())
         self.opening = 0
         self.items = []
@@ -234,6 +283,7 @@ class Teams:
                 if team.state == "running":
                     team.state = "paused"
                     team.note = "电脑端重新启动，成员这一轮被打断：点“继续”接着做"
+                    team.touch()
                 self.items.append(team)
         except (OSError, ValueError, TypeError):
             pass
@@ -242,13 +292,13 @@ class Teams:
         if not self.file:
             return
         try:
-            os.makedirs(os.path.dirname(self.file), exist_ok=True)
+            parent = os.path.dirname(os.path.abspath(self.file))
+            os.makedirs(parent, mode=0o700, exist_ok=True)
             fresh = self.file + ".new"
-            with open(fresh, "w", encoding="utf-8") as stream:
+            fd = os.open(fresh, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 json.dump([team.to_json() for team in self.items], stream, ensure_ascii=False)
-            os.chmod(fresh, 0o600)
             os.replace(fresh, self.file)
-            os.chmod(self.file, 0o600)
         except OSError:
             pass
 
@@ -268,8 +318,9 @@ class Teams:
         shown = {"id": team.id, "dir": team.dir, "mode": team.mode, "goal": team.goal, "rules": team.rules,
                  "state": team.state, "note": team.note, "phase": team.phase, "discuss": team.discuss,
                  "picked": team.picked, "tools": list(team.tools), "rounds": team.rounds, "round": team.round,
-                 "created": team.created, "members": dict(team.members), "awaited": list(team.awaited),
-                 "failed": dict(team.failed),
+                 "created": team.created, "members": dict(team.members),
+                 "member_sessions": {role: dict(seat) for role, seat in team.sessions.items()},
+                 "awaited": list(team.awaited), "failed": dict(team.failed),
                  "log": [{"at": s["at"], "who": s["who"], "text": s["text"]} for s in team.log[-80:]]}
         if team.mode == "compare":
             shown["candidates"] = [{"tool": tool,
@@ -279,11 +330,72 @@ class Teams:
                                     "ready": tool in team.worktrees} for tool in team.tools]
         return shown
 
+    def cards(self, asking=None):
+        """Short summary cards (`device.team_cards`), newest first, with `confirm` when any
+        awaited member terminal currently asks for user confirmation."""
+        snapshot = []
+        with self.gate:
+            for team in sorted(self.items, key=lambda one: one.updated, reverse=True)[:MOST]:
+                card = {"id": team.id, "dir": team.dir, "goal": short_text(team.goal, 200),
+                        "mode": team.mode, "state": team.state, "phase": team.phase,
+                        "note": short_text(team.note, 200), "updated": max(0, int(team.updated)),
+                        "awaited": list(team.awaited), "tools": list(team.tools), "models": {}}
+                awaited_terms = [team.members[role] for role in team.awaited if team.members.get(role)] \
+                    if team.state == "running" else []
+                snapshot.append((card, awaited_terms))
+        if asking is not None:
+            for card, awaited_terms in snapshot:
+                if any(asking(term) for term in awaited_terms):
+                    card["confirm"] = True
+        return [card for card, _ in snapshot]
+
+    def team_of(self, terminal, tool="", session=""):
+        """The task id a terminal (or its conversation) belongs to; "" for none."""
+        with self.gate:
+            if terminal:
+                for team in self.items:
+                    if terminal in team.members.values() or terminal in team.opened:
+                        return team.id
+            if tool and session:
+                low = session.lower()
+                for team in self.items:
+                    if any(s["tool"] == tool and s["id"].lower() == low for s in team.past):
+                        return team.id
+        return ""
+
+    def team_of_session(self, tool, session):
+        """The task id a saved conversation belongs to; "" for none."""
+        return self.team_of("", tool, session)
+
+    def learn(self, terminal, tool, session):
+        """Records which tool conversation a member terminal runs so history stays linked."""
+        if not terminal or not tool or not session:
+            return
+        with self.gate:
+            changed = False
+            for team in self.items:
+                role = next((r for r, tid in team.members.items() if tid == terminal), None)
+                if role is None:
+                    continue
+                seat = {"id": session, "tool": tool}
+                if team.sessions.get(role) != seat:
+                    team.sessions[role] = seat
+                    changed = True
+                low = session.lower()
+                if not any(s["tool"] == tool and s["id"].lower() == low for s in team.past):
+                    team.past.append(seat)
+                    if len(team.past) > MAX_PAST_SESSIONS:
+                        del team.past[:len(team.past) - MAX_PAST_SESSIONS]
+                    changed = True
+            if changed:
+                self.save()
+
     def log(self, team, who, text):
         with self.gate:
             team.log.append({"at": now_ms(), "who": who, "text": cut(text, 4000)})
             if len(team.log) > 200:
                 del team.log[:len(team.log) - 200]
+            team.touch()
             self.save()
         self.tell_changed()
 
@@ -296,21 +408,19 @@ class Teams:
     def start(self, given):
         word = lambda name: str(given.get(name) or "")
         tools = [str(one) for one in given.get("tools") or [] if isinstance(one, str)]
-        try:
-            rounds = int(word("rounds"))
-        except ValueError:
-            rounds = 0
+        rounds = _int(given.get("rounds"), 0)
         rules = word("rules").strip()
         if len(rules) > 1000:
             raise OpError("分工偏好不能超过 1000 字")
         mode = word("mode")
-        discuss = mode in ("review", "lead") and word("discuss").lower() == "true"
+        discuss = mode in ("review", "lead") and _bool(given.get("discuss"))
         team = Team()
         team.id, team.dir, team.mode = word("id"), word("dir"), mode
         team.goal, team.rules = word("goal").strip(), rules
         team.discuss, team.tools = discuss, tools
         team.rounds = max(1, min(MOST_ROUNDS, rounds if rounds else (1 if mode == "compare" else 3)))
         team.created = now_ms()
+        team.touch()
         if not ID_OK.match(team.id) or team.mode not in MODES:
             raise OpError("协作任务无效")
         if not team.goal or len(team.goal) > 4000:
@@ -345,6 +455,7 @@ class Teams:
                         team.worktrees[tool] = created["path"]
                         team.base_commits[tool] = created["base_commit"]
                         team.awaited.append(tool)
+                        team.touch()
                         self.save()
             except Exception:
                 if self.hands.clean_worktrees:
@@ -370,6 +481,7 @@ class Teams:
                 for tool in discussants:
                     if "discuss:" + tool not in team.awaited:
                         team.awaited.append("discuss:" + tool)
+                team.touch()
                 self.save()
             for tool in discussants:
                 self.open(team, "discuss:" + tool, tool, self.discuss_first(team, tool), True, None)
@@ -389,9 +501,10 @@ class Teams:
             team.state = "stopped"
             team.note = "已停止"
             team.awaited.clear()
+            team.touch()
             self.save()
         for terminal in busy:
-            if terminal:
+            if terminal and self.hands.stop:
                 try:
                     self.hands.stop(terminal)
                 except Exception:
@@ -407,17 +520,41 @@ class Teams:
                 raise OpError("这个协作任务没有暂停")
             team.state = "running"
             team.note = ""
-            again = [(role, team.members[role]) for role in team.awaited if role in team.members]
+            # Clear stale failure marks on resume so paused or quota-recovered members can run again.
+            team.failed.clear()
+            again = [(role, team.members.get(role, "")) for role in team.awaited]
+            team.touch()
             self.save()
         for role, terminal in again:
             self.deliver_or_reopen(team, role, terminal, "继续完成上面的任务。")
         self.tell_changed()
 
-    def say(self, id, text, target=""):
+    def closed(self, terminal):
+        """A member terminal closed while awaited: pause cleanly instead of hanging forever."""
+        if not terminal:
+            return
+        paused = False
+        with self.gate:
+            team = next((one for one in self.items if one.state == "running" and terminal in one.members.values()), None)
+            if team is None:
+                return
+            role = next(key for key, value in team.members.items() if value == terminal)
+            if role not in team.awaited:
+                return
+            team.state = "paused"
+            team.note = self.label(self.tool_of(team, role)) + " 的对话已中断：点“继续”重新打开接着做，或点“换 AI 接手”"
+            team.touch()
+            self.save()
+            paused = True
+        if paused:
+            self.tell_changed()
+
+    def say(self, id, text, target="", attachments=None):
         text = (text or "").strip()
         target = (target or "").strip()
-        if not text or len(text) > 4000:
-            raise OpError("消息需为 1 至 4000 字")
+        attachments = list(attachments or [])
+        if (not text and not attachments) or len(text) > 4000:
+            raise OpError("请输入文字或添加图片，文字最多 4000 字")
         with self.gate:
             team = next((one for one in self.items if one.id == id), None)
             if team is None:
@@ -426,7 +563,7 @@ class Teams:
                 raise OpError("这个协作任务没有启动成功，请重新新建")
             if team.mode == "compare" and (team.state == "done" or not team.worktrees):
                 raise OpError("比稿方案已结束并清理工作区，请新建协作任务")
-            state, phase, mode = team.state, team.phase, team.mode
+            state, mode = team.state, team.mode
             targets = []
             if state in ("running", "paused"):
                 if target:
@@ -451,6 +588,8 @@ class Teams:
                 if state == "paused":
                     team.state = "running"
                     team.note = ""
+                    team.failed.clear()
+                team.touch()
                 self.save()
             elif mode == "compare" and state in ("choose", "stopped"):
                 if target:
@@ -466,6 +605,7 @@ class Teams:
                 team.note = ""
                 team.awaited.clear()
                 team.awaited.extend(targets)
+                team.touch()
                 self.save()
             else:
                 team.round += 1
@@ -475,33 +615,36 @@ class Teams:
                 team.note = ""
                 team.phase = ""
                 team.reminded = False
+                team.failed.clear()
                 team.awaited.clear()
                 team.answers.clear()
+                team.touch()
                 self.save()
 
+        shown_text = text or ("发送了 %d 张附图" % len(attachments))
         self.log(team, "user", ("@" + self.label(self.tool_of(team, self.resolve_role(team, target) or target)) + " "
-                                if target else "") + text)
+                                if target else "") + shown_text)
 
         if state in ("running", "paused"):
             prefix = "【用户插话】\n" if state == "running" else "【用户补充】\n"
             for role in targets:
                 terminal = team.members.get(role)
-                self.deliver_or_reopen(team, role, terminal, prefix + text)
+                self.deliver_or_reopen(team, role, terminal, prefix + text if text else prefix.rstrip(), attachments)
         elif mode == "compare":
             prompt = "【用户补充要求 · 第 " + str(team.round) + " 轮】\n" + text + \
                 "\n\n请在你当前独立工作区中继续完善方案，完成后简要说明改了什么。"
             for tool in targets:
-                self.ask(team, tool, tool, prompt, False, team.worktrees.get(tool))
+                self.ask(team, tool, tool, prompt, False, team.worktrees.get(tool), attachments)
         elif mode == "review":
             self.ask(team, "writer", team.tools[0],
                      "【用户新一轮要求 · 第 " + str(team.round) + " 轮】\n" + text +
                      "\n\n请按新要求继续修改，完成后简明说明改了什么。之后 " + self.label(team.tools[1]) +
-                     " 会再次只读审查。", False)
+                     " 会再次只读审查。", False, None, attachments)
         else:
             rooms = self.rooms(team)
             self.ask(team, "leader", team.tools[0],
                      "【用户新一轮要求 · 第 " + str(team.round) + " 轮】\n" + text + self.rooms_block(team, rooms) +
-                     "\n\n请检查新要求并继续分派（ASSIGN 成员名: 任务）或确认完成（DONE: 总结）。", False)
+                     "\n\n请检查新要求并继续分派（ASSIGN 成员名: 任务）或确认完成（DONE: 总结）。", False, None, attachments)
         return self.of(id)
 
     def pick(self, id, tool):
@@ -545,6 +688,7 @@ class Teams:
             team.state = "done"
             team.note = note
             team.awaited.clear()
+            team.touch()
             self.save()
         self.log(team, "结果", note)
         return self.of(id)
@@ -637,8 +781,9 @@ class Teams:
                 team.note = ""
                 resolved = next_role
                 launch_now = True
+            team.touch()
             self.save()
-        if old_terminal:
+        if old_terminal and self.hands.stop:
             try:
                 self.hands.stop(old_terminal)
             except Exception:
@@ -686,8 +831,15 @@ class Teams:
                 raise OpError("这个协作任务还在进行，请先停止")
             has_worktrees = bool(team.worktrees)
             dir_name = team.dir
+            opened = list(team.opened)
             self.items.remove(team)
             self.save()
+        if self.hands.close:
+            for terminal in opened:
+                try:
+                    self.hands.close(terminal)
+                except Exception:
+                    pass
         if has_worktrees and self.hands.clean_worktrees:
             try:
                 self.hands.clean_worktrees(dir_name, id)
@@ -725,15 +877,25 @@ class Teams:
             return team.tools[1] if len(team.tools) > 1 else team.tools[0]
         return role
 
-    def deliver_or_reopen(self, team, role, terminal, words):
+    def _tell_member(self, terminal, words, attachments=None):
+        if attachments and self.hands.say_with_attachments:
+            self.hands.say_with_attachments(terminal, words, attachments)
+            return
+        if attachments:
+            suffix = "\n".join("附图：" + one["absolute"] for one in attachments)
+            words = (words + "\n\n" + suffix).strip() if words else suffix
+        self.hands.say(terminal, words)
+
+    def deliver_or_reopen(self, team, role, terminal, words, attachments=None):
         if terminal:
             try:
-                self.hands.say(terminal, words)
+                self._tell_member(terminal, words, attachments)
                 return
             except Exception:
                 pass
         tool = self.tool_of(team, role)
-        wt = team.worktrees.get(tool) if team.mode == "compare" else None
+        with self.gate:
+            wt = team.worktrees.get(tool) if team.mode == "compare" else None
         read = role == "reviewer" or role.startswith("discuss:")
         if role.startswith("discuss:"):
             prompt = self.discuss_first(team, tool) + "\n\n" + words
@@ -748,6 +910,9 @@ class Teams:
             prompt = self.leader_first(team, self.rooms(team)) + ("" if words == "继续完成上面的任务。" else "\n\n" + words)
         else:
             prompt = "【协作任务】继续完成这项工作：" + team.goal + "\n\n" + words
+        if attachments:
+            suffix = "\n".join("附图：" + one["absolute"] for one in attachments)
+            prompt = prompt + "\n\n" + suffix
         self.open(team, role, tool, prompt, read, wt)
 
     # ---- the members' turns
@@ -761,40 +926,49 @@ class Teams:
                         else begin_in(tool, team.dir, words, read))
             with self.gate:
                 team.members[role] = terminal
+                if terminal and terminal not in team.opened:
+                    team.opened.append(terminal)
                 if role not in team.awaited:
                     team.awaited.append(role)
                 self.opening -= 1
+                team.touch()
                 self.save()
                 self.gate.notify_all()
             self.log(team, role, "开始：" + cut(words, 240))
         except Exception as problem:
             with self.gate:
                 team.state = "failed" if not team.members and len(team.log) <= 1 else "paused"
-                team.note = self.label(tool) + " 没有开始：" + (str(problem) if isinstance(problem, (OpError, ValueError)) else "电脑端出错")
+                detail = str(problem) if isinstance(problem, self.error_types) else "电脑端出错"
+                team.note = self.label(tool) + " 没有开始：" + detail
                 if team.state == "failed":
                     if role in team.awaited:
                         team.awaited.remove(role)
                 elif role not in team.awaited:
                     team.awaited.append(role)
                 self.opening -= 1
+                team.touch()
                 self.save()
                 self.gate.notify_all()
             self.tell_changed()
 
-    def ask(self, team, role, tool, words, read, folder_override=None):
+    def ask(self, team, role, tool, words, read, folder_override=None, attachments=None):
         with self.gate:
             terminal = team.members.get(role)
             team.pending[role] = cut(words, 6000)
             if role not in team.awaited:
                 team.awaited.append(role)
+            team.touch()
             self.save()
         if terminal:
             try:
-                self.hands.say(terminal, words)
+                self._tell_member(terminal, words, attachments)
                 self.log(team, role, "收到：" + cut(words, 240))
                 return
             except Exception:
                 pass            # its conversation was closed: begun anew
+        if attachments:
+            suffix = "\n".join("附图：" + one["absolute"] for one in attachments)
+            words = words + "\n\n" + suffix
         self.open(team, role, tool, words, read, folder_override)
 
     def end(self, team, state, note):
@@ -802,11 +976,12 @@ class Teams:
             team.state = state
             team.note = note
             team.awaited.clear()
+            team.touch()
             self.save()
         self.log(team, "结果", note)
 
     def turned(self, terminal, how, said):
-        """A member's turn ended (its chat said so, or the quiet poll below). `how` is one of
+        """A member's turn ended (its chat said so, or the quiet poll in agent.py). `how` is one of
         done / stopped / failed; `said` is what the member said in its turn."""
         with self.gate:
             team = next((one for one in self.items if one.state == "running" and terminal in one.members.values()), None)
@@ -819,7 +994,10 @@ class Teams:
             if role not in team.awaited:
                 return          # (a turn of its own owner's, from the phone)
             team.awaited.remove(role)
+            team.touch()
             self.save()
+        if how == "done" and _quota_only_reply(said):
+            how = "failed"
         self.log(team, role, cut(said, 4000))
         if team.mode == "compare":
             self.compared(team, role, how, said)
@@ -834,6 +1012,7 @@ class Teams:
                 team.note = self.label(self.tool_of(team, role)) + " 这一轮被停止：点“继续”接着做，或点“换 AI 接手”"
                 if role not in team.awaited:
                     team.awaited.append(role)
+                team.touch()
                 self.save()
             self.tell_changed()
             return
@@ -854,6 +1033,7 @@ class Teams:
         with self.gate:
             team.failed[failed_tool] = reason
             pending = team.pending.get(role, "")
+            team.touch()
             self.save()
 
         if team.phase == "discuss":
@@ -891,6 +1071,7 @@ class Teams:
                             team.note = self.label(failed_tool) + " 失败（" + reason + "），且没有其他可用成员：可点“换 AI 接手”或稍后继续"
                             team.awaited.clear()
                             team.awaited.append("leader")
+                    team.touch()
                     self.save()
             self.log(team, "切换", self.label(failed_tool) + " 失败（" + reason + "），已自动加入 " + self.label(added_backup) +
                      " 并回报领队改派" if added_backup else self.label(failed_tool) + " 失败（" + reason + "），已回报领队改派给其他可用成员")
@@ -903,6 +1084,7 @@ class Teams:
                     return
                 with self.gate:
                     team.round += 1
+                    team.touch()
                     self.save()
             changes = self.safe_changes(team)
             body = self.results(team, answers, changes, self.rooms(team))
@@ -919,6 +1101,7 @@ class Teams:
                     team.members.pop("leader", None)
                     team.awaited.clear()
                     team.awaited.append("leader")
+                    team.touch()
                     self.save()
                 self.log(team, "切换", self.label(failed_tool) + "（领队）失败（" + reason + "），已自动由 " +
                          self.label(backup) + " 接任领队继续")
@@ -930,6 +1113,7 @@ class Teams:
                 team.note = self.label(failed_tool) + "（领队）失败（" + reason + "），没有可用备用 AI：可点“换 AI 接手”或稍后继续"
                 if "leader" not in team.awaited:
                     team.awaited.append("leader")
+                team.touch()
                 self.save()
             self.tell_changed()
             return
@@ -943,6 +1127,7 @@ class Teams:
                 team.members.pop(role, None)
                 team.awaited.clear()
                 team.awaited.append(role)
+                team.touch()
                 self.save()
             self.log(team, "切换", self.label(failed_tool) + "（" + ("写手" if role == "writer" else "审查") +
                      "）失败（" + reason + "），已自动切换为 " + self.label(replacement) + " 继续")
@@ -954,6 +1139,7 @@ class Teams:
             team.note = self.label(failed_tool) + " 失败（" + reason + "），没有其他可用备用 AI：可点“换 AI 接手”指定接替，或稍后继续"
             if role not in team.awaited:
                 team.awaited.append(role)
+            team.touch()
             self.save()
         self.tell_changed()
 
@@ -967,6 +1153,7 @@ class Teams:
             collected = dict(team.answers)
             team.answers.clear()
             team.phase = ""
+            team.touch()
             self.save()
         discussion = "\n\n".join("### " + self.label(self.tool_of(team, key)) + "\n" + cut(value, 5000)
                                  for key, value in collected.items())
@@ -975,7 +1162,9 @@ class Teams:
             if team.failed.get(writer_tool):
                 backup = self.fallback_tool(team, writer_tool, team.tools[1])
                 if backup:
-                    team.tools[0] = backup
+                    with self.gate:
+                        team.tools[0] = backup
+                        self.save()
                     self.log(team, "切换", self.label(writer_tool) + " 讨论阶段不可用，写手已自动切换为 " + self.label(backup))
                     writer_tool = backup
             self.open(team, "writer", writer_tool, self.writer_first(team, discussion), False, None)
@@ -984,14 +1173,17 @@ class Teams:
             if team.failed.get(leader_tool):
                 backup = self.fallback_tool(team, leader_tool)
                 if backup:
-                    self.promote_leader(team, backup)
+                    with self.gate:
+                        self.promote_leader(team, backup)
+                        self.save()
                     self.log(team, "切换", self.label(leader_tool) + " 不可用，领队已自动切换为 " + self.label(backup))
                     leader_tool = backup
             self.open(team, "leader", leader_tool, self.leader_first(team, self.rooms(team), discussion), False, None)
 
     def compared(self, team, tool, how, said):
-        wt = team.worktrees.get(tool)
-        base_commit = team.base_commits.get(tool)
+        with self.gate:
+            wt = team.worktrees.get(tool)
+            base_commit = team.base_commits.get(tool)
         diff = stat = ""
         if wt:
             if self.hands.worktree_diff:
@@ -1015,6 +1207,7 @@ class Teams:
             if all_done:
                 team.state = "choose" if any_ok else "paused"
                 team.note = "各候选方案已完成，对比改动后选一个合并到主目录" if any_ok else "候选 AI 均未完成，请检查后重试或删除"
+            team.touch()
             self.save()
         if all_done:
             self.log(team, "结果", "候选方案已就绪，等待对比选择" if any_ok else "候选方案未完成")
@@ -1035,6 +1228,7 @@ class Teams:
             return
         with self.gate:
             team.round += 1
+            team.touch()
             self.save()
         self.ask(team, "writer", team.tools[0], self.writer_again(team, said), False)
 
@@ -1049,6 +1243,7 @@ class Teams:
                 with self.gate:
                     reminded = team.reminded
                     team.reminded = True
+                    team.touch()
                     self.save()
                 if reminded:
                     with self.gate:
@@ -1056,6 +1251,7 @@ class Teams:
                         team.note = "领队没有分派任务，也没有结束：点“继续”再问它一次"
                         team.awaited.clear()
                         team.awaited.append("leader")
+                        team.touch()
                         self.save()
                     self.tell_changed()
                     return
@@ -1068,6 +1264,7 @@ class Teams:
                 for member in tasks:
                     if member not in team.awaited:
                         team.awaited.append(member)
+                team.touch()
                 self.save()
             for member, task in tasks.items():
                 self.ask(team, member, member, self.member_task(team, task), False)
@@ -1080,12 +1277,14 @@ class Teams:
                 return
             answers = dict(team.answers)
             team.answers.clear()
+            team.touch()
             self.save()
         if team.round >= team.rounds:
             self.end(team, "done", "已到 " + str(team.rounds) + " 轮，成员最后的结果没有交给领队检查")
             return
         with self.gate:
             team.round += 1
+            team.touch()
             self.save()
         self.ask(team, "leader", team.tools[0],
                  self.results(team, answers, self.safe_changes(team), self.rooms(team)), False)
@@ -1243,7 +1442,8 @@ class Teams:
             return self.reviewer_ask(team, "原审查 AI（" + self.label(from_tool) + "）未能完成本轮审查，请你接手只读审查。" +
                                      ("" if not user_note else "\n用户补充：" + user_note), changes)
         if team.mode == "lead" and role == "leader":
-            recent = "\n\n".join("[" + step["who"] + "] " + cut(step["text"], 800) for step in team.log[-10:])
+            with self.gate:
+                recent = "\n\n".join("[" + step["who"] + "] " + cut(step["text"], 800) for step in team.log[-10:])
             return self.leader_first(team, self.rooms(team)) + \
                 ("\n\n## 此前协作进展\n" + cut(recent, 8000) if recent else "") + \
                 ("\n\n## 当前工作区改动\n" + cut(changes, 16000) if changes else "") + extra
@@ -1259,15 +1459,34 @@ class Teams:
 
     @staticmethod
     def assigned(said, members):
+        """Parses ASSIGN <member>: <task> blocks, including continuation lines up to the next
+        ASSIGN / DONE / VERIFIED directive (capped at 8,000 characters per member)."""
         tasks = {}
         known = set(members)
-        for match in ASSIGN.finditer(said or ""):
-            tool = match.group(1).lower()
-            task = match.group(2).strip()
-            if tool not in known or not task:
+        current = None
+        lines = (said or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        for line in lines:
+            match = ASSIGN_HEAD.match(line)
+            if match:
+                tool = match.group(1).lower()
+                first = match.group(2).strip()
+                if tool in known:
+                    current = tool
+                    if first:
+                        tasks[tool] = (tasks.get(tool, "") + ("\n" if tool in tasks else "") + first)[:8000]
+                else:
+                    current = None
                 continue
-            tasks[tool] = tasks.get(tool, "") + ("\n" if tool in tasks else "") + task
-        return tasks
+            if DONE.match(line) or DIRECTIVE_LINE.match(line):
+                current = None
+                continue
+            if current is not None:
+                stripped = line.rstrip()
+                if stripped or current in tasks:
+                    prev = tasks.get(current, "")
+                    joined = (prev + ("\n" if prev else "") + stripped) if stripped else (prev + "\n")
+                    tasks[current] = joined[:8000]
+        return {tool: body.strip() for tool, body in tasks.items() if body.strip()}
 
 
 def _when(seconds):

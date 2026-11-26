@@ -338,6 +338,74 @@ def main():
                          "unknown": "!!document.querySelector('.unknown')"}
                 shot(base + "/?project=cohort-study", "project.png", "!document.getElementById('project').hidden")
                 shot(base + "/files/?dir=cohort-study", "folder.png", "document.querySelectorAll('#entries li').length > 5")
+                # No boxed action toolbar: upload lives in header.top, root hides #crumbs, and #entries uses .group.
+                folder_chrome = ask("Runtime.evaluate", expression="""(() => {
+                  const upload = document.getElementById('upload'), crumbs = document.getElementById('crumbs'), entries = document.getElementById('entries');
+                  return {
+                    hasActionsBar: !!document.getElementById('file-actions'),
+                    uploadInHeader: !!(upload && upload.closest('header.top')),
+                    uploadHidden: upload ? upload.hidden : null,
+                    uploadIcon: !!(upload && upload.classList.contains('icon')),
+                    crumbsHidden: crumbs ? crumbs.hidden : null,
+                    groupedEntries: !!(entries && entries.classList.contains('group'))
+                  };
+                })()""", returnByValue=True)["result"]["value"]
+                assert folder_chrome == {"hasActionsBar": False, "uploadInHeader": True, "uploadHidden": False, "uploadIcon": True, "crumbsHidden": True, "groupedEntries": True}, folder_chrome
+                # Subfolder shows #crumbs aligned with the main content column.
+                shot(base + "/files/?dir=cohort-study&path=data", "subfolder.png", "document.querySelectorAll('#entries li').length >= 1")
+                sub_crumbs = ask("Runtime.evaluate", expression="""(() => {
+                  const crumbs = document.getElementById('crumbs'), entries = document.getElementById('entries');
+                  const first = crumbs.querySelector('button');
+                  return {
+                    hidden: crumbs.hidden,
+                    labels: [...crumbs.querySelectorAll('button')].map(b => b.textContent),
+                    padLeft: getComputedStyle(crumbs).paddingLeft,
+                    deltaLeft: Math.round(first.getBoundingClientRect().left - entries.getBoundingClientRect().left)
+                  };
+                })()""", returnByValue=True)["result"]["value"]
+                assert sub_crumbs["hidden"] is False and sub_crumbs["labels"] == ["cohort-study", "data"] and sub_crumbs["padLeft"] == "16px" and abs(sub_crumbs["deltaLeft"]) <= 1, sub_crumbs
+                shot(base + "/files/?dir=cohort-study", "folder.png", "document.querySelectorAll('#entries li').length > 5")
+                # The menu at the top right is a page of the sheet the other pages use (web/ui/sheet.js): how the folder
+                # is ordered is one of three, hidden files a switch, and pressing them changes the list behind it.
+                def menu(name, expected, sections=None):
+                    ask("Runtime.evaluate", expression="document.getElementById('more').click()")
+                    until = time.time() + 5
+                    while time.time() < until and not ask("Runtime.evaluate", expression="!!document.querySelector('dialog.rs[open] .rs-row')", returnByValue=True)["result"].get("value"):
+                        time.sleep(.2)
+                    time.sleep(.4)
+                    if name:
+                        (out / name).write_bytes(base64.b64decode(ask("Page.captureScreenshot", format="png")["data"]))
+                    info = ask("Runtime.evaluate", expression="""(() => {
+                      const dlg = document.querySelector('dialog.rs[open]');
+                      const rows = [...dlg.querySelectorAll('.rs-row')];
+                      const lefts = rows.map(r => Math.round(r.querySelector('b').getBoundingClientRect().left));
+                      const multiInset = [...dlg.querySelectorAll('.rs-group')].filter(g => g.children.length > 1).every(g => g.classList.contains('inset'));
+                      return {
+                        shown: [...dlg.querySelectorAll('.rs-row b, .rs-seg button')].map(n => n.textContent),
+                        sections: [...dlg.querySelectorAll('.rs-label')].map(n => n.textContent),
+                        allIcons: rows.every(r => !!r.querySelector('.rs-glyph')),
+                        alignSpan: lefts.length ? Math.max(...lefts) - Math.min(...lefts) : 0,
+                        multiInset
+                      };
+                    })()""", returnByValue=True)["result"]["value"]
+                    assert info["shown"] == expected, info
+                    if sections is not None:
+                        assert info["sections"] == sections, info
+                    assert info["allIcons"] and info["alignSpan"] <= 1 and info["multiInset"], info
+                    assert not ask("Runtime.evaluate", expression="!!document.querySelector('#sheet, .choice')", returnByValue=True)["result"]["value"]
+                ask("Emulation.setDeviceMetricsOverride", width=390, height=844, deviceScaleFactor=1, mobile=True)
+                menu("folder-menu.png", ["名称", "修改时间", "大小", "显示隐藏的文件", "刷新", "回到项目"], ["排列", "列表", "返回"])
+                ask("Emulation.setDeviceMetricsOverride", width=500, height=960, deviceScaleFactor=1, mobile=True)
+                ask("Runtime.evaluate", expression="document.querySelector('dialog.rs[open] .rs-seg button[data-value=size]').click()")
+                time.sleep(.5)
+                assert ask("Runtime.evaluate", expression="localStorage.getItem('rcli-files-sort')", returnByValue=True)["result"]["value"] == "size"
+                ask("Runtime.evaluate", expression="document.querySelector('dialog.rs[open] .rs-switch').click()")
+                time.sleep(.3)
+                assert ask("Runtime.evaluate", expression="document.querySelector('dialog.rs[open] .rs-switch').getAttribute('aria-checked')", returnByValue=True)["result"]["value"] == "true"
+                ask("Runtime.evaluate", expression="document.querySelector('dialog.rs[open] .rs-switch').click(); history.back()")
+                time.sleep(.8)
+                assert ask("Runtime.evaluate", expression="!document.querySelector('dialog.rs[open]') && document.querySelectorAll('#entries li').length > 5", returnByValue=True)["result"]["value"], "the menu closes by the back key and the folder stays"
+                ask("Runtime.evaluate", expression="localStorage.removeItem('rcli-files-sort')")
                 # A real browser File input, including multiple files and a zero-byte document.
                 local = Path(temp.name) / "本地文件.bin"
                 local.write_bytes(contents)
@@ -355,6 +423,7 @@ def main():
                         break
                     time.sleep(.2)
                 assert "已上传 2/2" in status, status
+                assert not ask("Runtime.evaluate", expression="document.getElementById('transfer').classList.contains('error')", returnByValue=True)["result"]["value"]
                 assert (project / local.name).read_bytes() == contents
                 assert (project / empty.name).read_bytes() == b""
                 geometry = []
@@ -368,7 +437,7 @@ def main():
                 report["upload_viewports"] = geometry
                 report["uploaded_bytes"] = len(contents)
                 assert not said, said
-                # A duplicate selected through the UI must show a persistent error and keep the existing bytes.
+                # A duplicate selected through the UI must show a dismissible error banner and keep the existing bytes.
                 ask("Runtime.evaluate", expression="document.getElementById('upload').click()")
                 ask("DOM.setFileInputFiles", nodeId=node["nodeId"], files=[str(local)])
                 deadline = time.time() + 30
@@ -378,23 +447,54 @@ def main():
                         break
                     time.sleep(.2)
                 assert "同名" in status and (project / local.name).read_bytes() == contents, status
+                err_banner = ask("Runtime.evaluate", expression="({err: document.getElementById('transfer').classList.contains('error'), closeVisible: !document.getElementById('transfer-close').hidden, padTop: getComputedStyle(document.getElementById('transfer')).paddingTop, padBottom: getComputedStyle(document.getElementById('transfer')).paddingBottom})", returnByValue=True)["result"]["value"]
+                assert err_banner["err"] is True and err_banner["closeVisible"] is True and err_banner["padTop"] == err_banner["padBottom"], err_banner
                 (out / "upload-conflict.png").write_bytes(base64.b64decode(ask("Page.captureScreenshot", format="png")["data"]))
+                ask("Runtime.evaluate", expression="document.getElementById('transfer-close').click()")
+                assert ask("Runtime.evaluate", expression="document.getElementById('transfer').hidden", returnByValue=True)["result"]["value"] is True
                 ask("Emulation.setDeviceMetricsOverride", width=390, height=844, deviceScaleFactor=1, mobile=True)
                 for kind, path in sorted(made.items()):
                     shot(view(path), kind + ".png", drawn[kind], seconds=60 if kind in ("word", "slides") else 20)
+                # The bar of views (预览 / 源码) stays above the file and takes presses: the dock of the app's own pages
+                # (#tabs in app.css) is not it.
+                shot(view(made["markdown"]), "markdown.png", drawn["markdown"])
+                bar = ask("Runtime.evaluate", expression="(s => [s.position, s.pointerEvents])(getComputedStyle(document.getElementById('views')))", returnByValue=True)["result"]["value"]
+                assert bar[0] != "fixed" and bar[1] != "none", bar
+                ask("Runtime.evaluate", expression="[...document.querySelectorAll('#views button')].find(b => b.textContent === '源码').click()")
+                time.sleep(.6)
+                assert ask("Runtime.evaluate", expression="!!document.querySelector('#view .code') && !document.querySelector('#view .doc h1')", returnByValue=True)["result"]["value"], "源码 shows the source"
+                shot(view(made["code"]), "code.png", drawn["code"])
+                assert ask("Runtime.evaluate", expression="document.getElementById('upload').hidden && !document.getElementById('download')", returnByValue=True)["result"]["value"]
+                menu("file-menu.png", ["下载文件", "复制路径", "长行自动换行", "回到项目"], ["文件操作", "阅读", "返回"])
+                ask("Runtime.evaluate", expression="history.back()")
+                time.sleep(.8)
                 # Saving inside the app: the page hands the file to the phone piece by piece. A stand-in for the app
                 # collects the pieces; together they must be the file.
                 stand_in = ask("Page.addScriptToEvaluateOnNewDocument", source="window.RemoteCliNative = { got: [], saveStart(n) { this.name = n; this.got = []; return ''; }, "
                                "savePiece(d) { this.got.push(d); return ''; }, saveEnd() { this.done = true; return '下载 / RemoteAI'; }, saveCancel() { this.cancelled = true; }, openSaved() {}, chrome() {}, pref() { return ''; }, setPref() {} };")
+                # Previewable file saves through the sheet menu ("保存到手机").
+                shot(view(made["code"]), "code-native.png", drawn["code"])
+                menu(None, ["保存到手机", "复制路径", "长行自动换行", "回到项目"], ["文件操作", "阅读", "返回"])
+                ask("Runtime.evaluate", expression="document.getElementById('menu-download').click()")
+                deadline = time.time() + 20
+                while time.time() < deadline and ask("Runtime.evaluate", expression="window.RemoteCliNative.done === true", returnByValue=True).get("result", {}).get("value") is not True:
+                    time.sleep(0.2)
+                assert ask("Runtime.evaluate", expression="window.RemoteCliNative.name === 'analysis.py' && window.RemoteCliNative.done === true", returnByValue=True)["result"]["value"]
+                (out / "code-native.png").unlink()
+                # Unpreviewable file keeps only its center save button, with no duplicate download entry in the menu.
                 shot(view("bundle.zip"), "save.png", "!!document.querySelector('.unknown button')")
-                ask("Runtime.evaluate", expression="document.getElementById('download').click()")
+                menu(None, ["复制路径", "回到项目"], ["文件操作", "返回"])
+                ask("Runtime.evaluate", expression="history.back()")
+                time.sleep(.6)
+                ask("Runtime.evaluate", expression="document.querySelector('.unknown button').click()")
                 deadline = time.time() + 30
                 while time.time() < deadline and ask("Runtime.evaluate", expression="window.RemoteCliNative.done === true", returnByValue=True).get("result", {}).get("value") is not True:
                     time.sleep(0.3)
                 digest = ask("Runtime.evaluate", awaitPromise=True, returnByValue=True, expression="(async () => { const n = window.RemoteCliNative, raw = n.got.map(p => atob(p)).join(''), bytes = Uint8Array.from(raw, c => c.charCodeAt(0)); "
                              "const hash = await crypto.subtle.digest('SHA-256', bytes); return n.name + ' ' + n.got.length + ' ' + Array.from(new Uint8Array(hash), b => b.toString(16).padStart(2, '0')).join(''); })()")["result"]["value"]
                 assert digest == "bundle.zip 3 " + hashlib.sha256((project / "bundle.zip").read_bytes()).hexdigest(), digest
-                time.sleep(0.5)
+                time.sleep(0.8)
+                assert ask("Runtime.evaluate", expression="(d => !!d && d.innerText.includes('已保存到手机') && d.innerText.includes('下载 / RemoteAI'))(document.querySelector('dialog.rs[open]'))", returnByValue=True)["result"]["value"]
                 (out / "save.png").write_bytes(base64.b64decode(ask("Page.captureScreenshot", format="png")["data"]))
                 for mode in ("cancel", "changed"):
                     shot(view("bundle.zip"), "download-" + mode + ".png", "!!document.querySelector('.unknown button')")
@@ -408,15 +508,16 @@ def main():
                               }
                               return response;
                             };""")
-                    ask("Runtime.evaluate", expression="document.getElementById('download').click();" + ("document.getElementById('transfer-cancel').click();" if mode == "cancel" else ""))
+                    ask("Runtime.evaluate", expression="document.querySelector('.unknown button').click();" + ("document.getElementById('transfer-cancel').click();" if mode == "cancel" else ""))
                     deadline = time.time() + 30
                     while time.time() < deadline:
-                        state = ask("Runtime.evaluate", expression="({cancelled: RemoteCliNative.cancelled, done: RemoteCliNative.done, text: document.getElementById('transfer-text').textContent})", returnByValue=True)["result"]["value"]
+                        state = ask("Runtime.evaluate", expression="({cancelled: RemoteCliNative.cancelled, done: RemoteCliNative.done, text: document.getElementById('transfer-text').textContent, err: document.getElementById('transfer').classList.contains('error'), closeVisible: !document.getElementById('transfer-close').hidden})", returnByValue=True)["result"]["value"]
                         if state.get("cancelled"):
                             break
                         time.sleep(.2)
                     assert state.get("cancelled") and not state.get("done"), (mode, state)
                     assert ("已取消" if mode == "cancel" else "已变化") in state["text"], state
+                    assert state.get("err") is (mode == "changed") and state.get("closeVisible") is True, (mode, state)
                     (out / ("download-" + mode + ".png")).write_bytes(base64.b64decode(ask("Page.captureScreenshot", format="png")["data"]))
                 ask("Page.removeScriptToEvaluateOnNewDocument", identifier=stand_in["identifier"])
                 report["saved_in_pieces"] = 3

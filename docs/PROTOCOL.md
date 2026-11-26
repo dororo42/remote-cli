@@ -1,5 +1,25 @@
 # Protocol
 
+## Multi-route discovery and automatic selection (Stage 1)
+
+Each computer persists a stable 32-hex `environment_id` (`environment-id.txt`) across restarts and line changes.
+The relay exposes an unauthenticated identity probe at `GET /.well-known/remote-ai` (and `/c/<space>/.well-known/remote-ai`
+on public relays), returning `{"service":"remote-ai","version":"x.y.z","environment_id":"<32-hex>","online":bool,"capabilities":["routes","ws"]}`
+with `Cache-Control: no-store`.
+
+Computers running the multi-route agent advertise the `"routes"` feature, `device.environment_id`, and an ordered
+`device.routes` array (`[{"kind":"lan"|"tailscale"|"tunnel"|"own","url":"https?://...","priority":int,"local_auth":bool}]`).
+Public relay origins are never advertised in `device.routes`. Tailscale detection requires an adapter named `tailscale`,
+an adapter carrying Tailscale's unique IPv6 ULA prefix (`fd7a:115c:a1e0::/48`), or `tailscale status --json` with
+`BackendState: "Running"`, avoiding CGNAT collisions (such as Cloudflare WARP on `100.64.0.0/10`).
+
+Authenticated viewers may call `POST /api/computer` with `{"id":"<op>","action":"routes_read"}` to retrieve
+`{"environment_id","routes","local_password"}` so learned LAN/Tailscale routes can authenticate directly while
+keeping credentials encrypted in Android Keystore AES-GCM (`RouteStore`). Clients verify `environment_id` on
+`/.well-known/remote-ai` before sending credentials, reject loopback URLs in remote route tables, probe higher-priority
+routes in parallel with a shared 500 ms head start, back off silent routes exponentially (`60s * 2^n`, capped at 30 min),
+and apply a 5-minute cooldown to failed route switches.
+
 ## Pond appearance (1.7.4)
 
 The existing Android appearance bridge accepts `pond` in `look-skin` and `look-termskin`. Native screens use the matching palette; the computer's embedded pages lazily load the local ASCII pond assets. Older computer pages fall back to their default palette for this unknown name. No relay message or terminal input contract changes. Animation pause is local to the page origin (`rcli-pond-paused`), and does not affect terminal execution. The vendored `Pond`, `PondRenderer` and `koi` API and pinned source are documented in `web/themes/README.md`.
@@ -96,14 +116,24 @@ The code shown on the computer is `remotecli://connect?u=<address>&p=<password>&
 used, as the tools tell it (`Quotas.cs`): `[{"tool": "claude", "at": <ms>, "why": "", "windows": [{"name": "five_hour",
 "used": 38.0, "resets": <seconds>}, ...]}]`. `used` is a share in percent, `resets` when the window starts anew; an
 optional `group` names a secondary model pool (empty or omitted for the primary pool shown by default, so the phone can
-keep secondary pools behind an expand toggle); `why` says in words why a tool's are not known (Codex signed in otherwise
-than with ChatGPT, or Antigravity CLI signed in with a `GEMINI_API_KEY`). Claude Code tells them with each turn of a
-chat (`rate_limit_event`) and to its status line, which the computer sets in Claude Code's settings together with its
-hooks (a status line of the owner's is run after it and put back when it is taken out); Codex is asked by
-`account/rateLimits/read` of its app-server at most every ten minutes; Antigravity CLI is asked by
+keep secondary pools behind an expand toggle). `why` explains why a reading is unavailable. For Claude Code, the computer reads the
+subscription's `/usage` windows at most every five minutes with `claude --print --output-format json /usage`.
+If unavailable, it can use the chat's `rate_limit_event` or its status line. The owner's status line runs after
+the computer's status line and is restored when the computer removes its hook. Every ten minutes at most, the computer
+asks the Codex app-server for `account/read` and `account/rateLimits/read`. Where the selected provider does not use
+OpenAI login, it inspects `config/read` locally to distinguish an external API from a local runtime. A Codex reading
+may include `billing`. `{"type":"api","balance":"12.5","unit":"USD"}` reports the balance and unit from a compatible
+provider. Windows makes a read-only HTTPS `GET` to `<base_url>/usage` with the selected provider's configured bearer
+credential and parses `balance` (or `remaining`) and `unit`. The query discards redirects. `{"type":"api"}` alone
+identifies API billing when a numeric balance is unavailable. `{"type":"credits","balance":"12.5"}` or
+`{"type":"credits","unlimited":true}` describes extra Codex credits reported with the ChatGPT rate limits.
+A running Codex conversation also sends `account/rateLimits/updated`; with an API-key provider every turn carries
+`primary`, `secondary` and `credits` as null. Such an update is ignored so it does not replace the balance read above.
+The `/usage` convention is also used by [Cockpit Tools 1.4.2](https://github.com/jlcodes99/cockpit-tools/blob/v1.4.2/src-tauri/src/commands/codex_model_provider_commands.rs).
+Antigravity CLI is asked by
 `agy -p /usage --output-format json` (with `AGY_CLI_DISABLE_AUTO_UPDATE=true`) at most every ten minutes, reporting the
-Gemini/Neon group as the primary pool (`five_hour`, `seven_day`) and other model groups with `group`. Nothing of the
-account is passed on; the relay keeps at most four entries of eight windows and leaves out any that is not a share.
+Gemini/Neon group as the primary pool (`five_hour`, `seven_day`) and other model groups with `group`. The relay keeps
+at most four entries of eight windows and accepts only the listed Codex billing fields. Account identities and credentials stay on the computer.
 
 `workspaces` are the project names a terminal may be started in. `candidates` are folders that are no projects and
 have conversations of Claude Code or Codex, for a project to be made of (`project_add` with the `path`): at most 40,
@@ -166,9 +196,11 @@ and `why` (see "The ways into a conversation, and stopping one"): by which way e
 computer's words for what cannot be done. `activity` is `active` for a conversation in a
 command-line window of its own or one with `reach`, `locked` for another that a program holds, `history` otherwise.
 
-Agents may advertise `info.features`: `codex-fork`, `codex-takeover`, `terminal-exit`, `files`, `update`, `peek`, `settings`, `work`, `chains`, `brief`, `schedule-days`, `chat`, `chat-agy`, `teams` and `teams-v2`
-(the work capabilities: "The owner's work", below). These are forwarded
+Agents may advertise `info.features`: `codex-fork`, `codex-takeover`, `terminal-exit`, `files`, `file-upload`, `attachments`, `update`, `peek`, `organize`, `settings`, `work`, `chains`, `brief`, `schedule-days`, `chat`, `chat-agy`, `chat-params`, `teams`, `teams-v2`, `teams-models`, `teams-grouped`, `teams-roster`, `teams-effort`, `teams-flex-rounds`, `teams-promote`, `reopen`, `<tool>-team` (one per tool that can join a collaboration task on this computer, such as `opencode-team`, `qoder-team`, `cline-team`, `pi-team`), and `<tool>-desktop-open` for desktop hand-off. Agents with `chat-params` also report `info.max_mode` (`full`, `edit`, or `read`) and each terminal's effective `model`, `effort`, and `mode`.
+(the work capabilities are described in "The owner's work", below; `organize` is described in "Conversation organization"). These are forwarded
 under `device.features`. Sessions may include `can_takeover`, `ownership_known`, and `takeover_reason`.
+Every session and every terminal carries `team`: the id of the collaboration task it is or was a member of, `""` for
+none (see "Multi-AI collaboration tasks"); `device.team_cards` lists those tasks in short.
 An agent verifies Codex's actual writer lock and process ownership before advertising takeover, then checks
 again before terminating the selected independent CLI. Shared app servers and phone descendants are protected.
 Process identifiers and command lines are never sent to the viewer. A closed terminal may include `exit_code`;
@@ -254,9 +286,9 @@ to held requests. Switching to the background cancels the active reader; returni
 
 | `action` | Fields |
 | --- | --- |
-| `start` | `tool` (`claude`, `codex`, `agy`, `opencode`, `qoder`, `cline`, `pi`, `shell`), `dir` (a workspace name); optional `session` (continue that conversation), `takeover` (end the owning computer CLI first), `fork` (Codex only: new conversation with the source history), `history` (let the tool show its own list), `form: "chat"` (a conversation run through its tool's structured mode, see "Chats"; `claude` and `codex` need `chat`, `agy` needs `chat` and `chat-agy`, not with `history` or `fork`) with optional `text` (the first thing to say, at most 8,000 characters) |
+| `start` | `tool` (`claude`, `codex`, `agy`, `opencode`, `qoder`, `cline`, `pi`, `shell`), `dir` (a workspace name); optional `session` (continue that conversation), `takeover` (end the owning computer CLI first), `fork` (Codex only: new conversation with the source history), `history` (let the tool show its own list), `form: "chat"` (a conversation run through its tool's structured mode, see "Chats"; `claude` and `codex` need `chat`, `agy` needs `chat` and `chat-agy`, not with `history` or `fork`) with optional `text` (the first thing to say, at most 8,000 characters), `model`, `effort` (what the tool runs with, as `team_models` lists them; applies to both structured chats and CLI terminals), and `mode` (`full`, `edit`, or `read`, clamped to the computer's `RemoteMaxMode`). A chat that goes on with `session` and names no `model` keeps the model, effort and read-only mode its last chat of that conversation had on the computer; a conversation that was a collaboration member becomes that member again (see "The owner's work"). With `reopen` (the id of a running `claude` or `codex` terminal; the agent advertises `reopen`) the same conversation is shown the other way: `form: "chat"` reopens a terminal that runs the tool's own screen as a chat, no `form` reopens a chat on the tool's own screen. Only `tool`, `dir` (both the terminal's) and `form` may come with it; the session, model, effort, mode and worktree are the terminal's. The computer refuses a terminal whose tool has not named or saved the conversation yet, one that is at work or asking, and a collaboration member; otherwise it ends that terminal's whole process tree, waits until no program of its own holds the conversation, and starts the new terminal. The relay then lists the conversation once, as the new terminal; a viewer that had the old one open finds the new one by `tool` and `session` |
 | `input` | `terminal`, `data` (at most 16,000 characters) |
-| `say` | `terminal`, `text` (at most 8,000 characters, no control characters but line breaks and tabs). A message for a running terminal from where the terminal is not on the screen (a list, the app's workbench): what the box of the terminal's page sends, the text and then Enter. The relay knows from the program's output whether it takes pasted text in brackets (`ESC [ ? 2004 h`): it then gives the computer `input` with the text between `ESC [ 200 ~` and `ESC [ 201 ~` and `\r`, and otherwise the text on one line and `\r`. Refused while the terminal's phase is `confirm`: Enter would answer its question |
+| `say` | `terminal`, `text` (at most 8,000 characters, no control characters but line breaks and tabs), optional `attachments` (1-4 reserved screenshot paths, when the computer advertises `attachments`). A chat may send attachments with empty `text`. The computer appends one blank line and `附图：<absolute path>` for each image. Claude Code, Codex app-server and ACP use native image input only where that channel has been verified to accept it. A message for a running terminal from where the terminal is not on the screen (a list, the app's workbench): what the box of the terminal's page sends, the text and then Enter. The relay knows from the program's output whether it takes pasted text in brackets (`ESC [ ? 2004 h`): it then gives the computer `input` with the text between `ESC [ 200 ~` and `ESC [ 201 ~` and `\r`, and otherwise the text on one line and `\r`. Refused while the terminal's phase is `confirm`: Enter would answer its question |
 | `resize` | `terminal`, `cols` (20–240), `rows` (6–100). Not for a chat |
 | `stop` | `terminal` of a chat: stop what it is at now (see "Chats"). Refused while its phase is not `busy` or `confirm` |
 | `answer` | `terminal` of a chat, `ask` (the id of what it asks), `decision`: `allow`, `always`, `deny`, or `choice:<n>` for a question with choices |
@@ -266,6 +298,10 @@ to held requests. Switching to the background cancels the active reader; returni
 | `project_rename` | `name`, `to` |
 | `project_remove` | `name`. The folder and what is in it stay. A project that stands in the computer's own settings (`fixed`) is renamed or removed from the phone only where the computer says it does that (the `projects` capability: the Windows program, for the projects added in its window); else the relay refuses |
 | `update` | none. The program on the computer looks for a newer release of itself and installs it; needs the `update` capability |
+
+Each computer can run up to 16 Remote AI terminals and structured chats at a time. New starts, saved-session
+resumes and Windows collaboration members share the limit. The relay counts pending starts as well as running
+terminals. Closing one frees a slot when the computer reports it closed.
 
 Windows agents offer `agy` (Antigravity CLI) when installed, launching fresh terminals with no mode override so the user's own CLI default applies, and resuming or taking over conversations with `--conversation <id>`. Active `agy` conversations are discovered from `~/.gemini/antigravity-cli` (`conversation_summaries.db`, `presence/<id>.lock`, `annotations/<id>.pbtxt`, `brain/<id>/.system_generated/logs/transcript.jsonl`), reporting host origin (such as Positron, VS Code, or command line), transcript reads, and verified process takeover/end just like Claude Code and Codex. Unbound independent `agy` processes with no active conversation yet are still reported via the optional agent `info.agy_external` field (`device.agy_external`, up to 16 Unix epoch millisecond start times, newest first, refreshed every 30 seconds for the current Windows session, excluding managed terminals and processes already matched to live `agy` sessions). A missing list is empty. Clients show `agy_external` only while the computer is online and enabled.
 
@@ -295,6 +331,11 @@ filename, and a client-generated 32-character lowercase hex `upload` ID. Only th
   equal the bytes already written; the reply's `offset` is the new byte count. Chunks cannot exceed the declared size.
 - `file_upload_finish` publishes the complete file, returning `{"offset": <size>}`. It refuses incomplete files.
 - `file_upload_cancel` removes this upload's temporary file. Cancelling an unknown ID is harmless.
+
+An agent advertising `attachments` accepts screenshot uploads at `.remote-ai/attachments/<name>`, where `<name>` is
+`YYYYMMDD-HHMMSS-<six lowercase hexadecimal digits>.(png|jpg|jpeg|webp|gif)`, up to 20 MiB. The computer creates
+`.remote-ai/attachments/` when needed and writes `.remote-ai/.gitignore` with `*` if that file is absent. Other upload
+paths keep the ordinary upload limits and checks.
 
 The Windows agent owns at most four uploads per instance. Each holds its destination directory and ancestors
 against rename, rejects reparse-point subdirectories, absolute/traversal paths, alternate streams and reserved
@@ -431,6 +472,111 @@ Nothing is kept for a conversation that runs in one of the program's own termina
 many steps down, by the program, or tells of the conversation a terminal runs): the phone is at that terminal, where
 the tool shows its own question and takes what is typed.
 
+### Conversation organization
+
+The computer advertises the optional `organize` capability in `info.features`. A signed-in viewer calls
+`POST /api/organize`; the relay validates the request, holds it on the same asynchronous operation path as
+`/api/conversation`, and sends `session_organize` to the computer. The computer owns the conversation catalog, queue,
+source and model selection, daily usage counts and generated metadata. A request keeps its `id` when retried, and the
+relay returns the computer's result or its error.
+
+Organization starts disabled (`source: "off"`) and makes no model calls until the owner chooses either a local tool
+(`source: "tool"`, with `source_tool` in `codex`, `claude` or `agy`) or an OpenAI-compatible HTTP endpoint
+(`source: "api"`, with `api_url`, `model` and optional `api_key`). API keys are stored protected on the computer and
+are never returned; `status` and `settings` report only `api_key_set`.
+
+The identity of one conversation is always the pair `tool` and `session`. Windows organization currently accepts
+`claude`, `codex` and `agy` UUID sessions. `start` and `retry` can target that pair or use `scope: "all"`; `count`
+uses `scope: "all"` to preview how many conversations would be queued or skipped before starting a batch. A `list`
+request is independently paged with `offset` and `limit`, up to 120 rows per response. This paging is not the
+overview's historical-session limit, so a computer with more than 120 saved conversations is read page by page.
+
+The request verbs and representative responses are:
+
+```json
+POST /api/organize
+{"id":"a1b2c3d4e5f60718293a4b5c6d7e8f90","verb":"status"}
+
+{"source":"tool","source_tool":"codex","api_url":"","api_key_set":false,"auto":false,"auto_follow_up":false,
+ "tools":[{"id":"codex","label":"Codex"},{"id":"claude","label":"Claude Code"}],
+ "model":"gpt-6-luna","default_model":"gpt-6-luna",
+ "models":[{"id":"gpt-6-luna","label":"GPT-6 Luna","is_default":true}],
+ "model_available":true,"calls_today":2,"tokens_today":3724,
+ "queued":0,"running":0,"done":12,"failed":1}
+```
+
+```json
+{"id":"...","verb":"settings","source":"tool","source_tool":"codex","model":"gpt-6-luna","auto":true,"auto_follow_up":false}
+{"id":"...","verb":"settings","source":"api","api_url":"https://api.example.com/v1","model":"small-chat","api_key":"sk-..."}
+{"id":"...","verb":"settings","source":"off"}
+
+{"source":"tool","source_tool":"codex","api_url":"","api_key_set":false,"auto":true,
+ "tools":[{"id":"codex","label":"Codex"}],
+ "model":"gpt-6-luna","default_model":"gpt-6-luna",
+ "models":[{"id":"gpt-6-luna","label":"GPT-6 Luna","is_default":true}],
+ "model_available":true,"calls_today":2,"queued":0,"running":1,"done":12,"failed":1}
+```
+
+```json
+{"id":"...","verb":"count","scope":"all"}
+{"needed":5,"skipped":168,"total":173}
+```
+
+```json
+{"id":"...","verb":"list","offset":120,"limit":50}
+
+{"items":[
+  {"id":"11111111-2222-3333-4444-555555555555","tool":"codex","dir":"demo","folder":"",
+   "title":"修复登录","original_title":"Untitled","manual_title":"",
+   "summary":"修复登录流程并补充测试","tags":["登录","测试"],"follow_up":true,
+   "updated":1700000000000,"state":"done","error":"","model":"gpt-6-luna"}
+ ],"total":173,"more":true}
+```
+
+```json
+{"id":"...","verb":"start","tool":"codex","session":"11111111-2222-3333-4444-555555555555"}
+{"queued":1,"skipped":0}
+
+{"id":"...","verb":"retry","scope":"all"}
+{"queued":3,"skipped":170}
+```
+
+```json
+{"id":"...","verb":"edit","tool":"codex",
+ "session":"11111111-2222-3333-4444-555555555555","title":"登录流程"}
+
+{"item":{"id":"11111111-2222-3333-4444-555555555555","tool":"codex","dir":"demo","folder":"",
+ "title":"登录流程","original_title":"Untitled","manual_title":"登录流程",
+ "summary":"修复登录流程并补充测试","tags":["登录","测试"],"follow_up":true,
+ "updated":1700000000000,"state":"done","error":"","model":"gpt-6-luna"}}
+```
+
+`edit` requires `tool`, `session` and at least one of `title` or `follow_up`, or `scope: "all"` with `follow_up: false` to clear all follow-up marks (returning `{"cleared": <count>}`). Omitted fields retain their values.
+Send the JSON boolean `true` to add a conversation to follow-up and `false` to remove it. Both choices are saved
+on the computer and take precedence over model results, including when a run is in progress. The effective
+`follow_up` value is returned in `item`, `list` and `session.organize` after a restart or a relay change. Model-generated
+follow-up is off by default (`auto_follow_up: false`), so existing records without a manual choice report `follow_up: false`
+until `auto_follow_up` is enabled in `settings`.
+
+```json
+{"id":"...","verb":"edit","tool":"codex",
+ "session":"11111111-2222-3333-4444-555555555555","follow_up":false}
+{"id":"...","verb":"edit","scope":"all","follow_up":false}
+```
+
+An organization item has the stable identity fields `id`, `tool`, `dir` and `folder`, display fields
+`title`, `original_title` and `manual_title`, generated fields `summary` and `tags`, the effective `follow_up`, and queue fields
+`updated`, `state`, `error` and `model`. The overview keeps the existing session title and list behavior. When the
+computer includes organization metadata in a session report, the relay forwards it under `session.organize`, so old
+clients continue to use `session.title` and terminal `rename` unchanged.
+
+The computer can report `state` as `pending`, `queued`, `running`, `done` or `failed`. A failed item keeps its
+`error` text and can be sent again with `retry`. While a batch is running, `status` reports `running: 1`; the counts
+in `queued`, `done` and `failed` are queue progress, and `list` can be polled for each item's state and error.
+Missing `organize` capability, an unknown identity, an invalid page, model or title, an offline computer, and a
+malformed verb are relay errors with the usual `400` response. A space in a public relay has its own `Relay`, sign-in
+token and operation queue, so organization requests and results from two computers cannot cross.
+
 ### The program itself
 
 `POST /api/computer` `{"id": "<16 to 32 hex digits>", "action": "..."}` is held like `/api/files` and needs the
@@ -441,7 +587,7 @@ line. The program answers and decides everything; the relay checks the shape of 
 | `action` | Fields | Answer |
 | --- | --- | --- |
 | `settings_read` | none | what the program tells about itself, below |
-| `settings_change` | `name`, `value` | the same, after the change. `rights`: `full`, `edit` or `read` (the mode Claude Code and Codex are started in from the phone); `tunnel`: `auto` or `http2` (used by the next tunnel); `autostart`, `update`, `reach`, `ask`: `true` or `false` (`reach`: the program's hooks are in the settings of Claude Code and Codex, see "A conversation that is open on the computer"; `ask`: a request for permission of Codex's is kept for the phone while nobody is at the computer, `true` unless switched off); `wait`: `"0"`, `"60"`, `"300"`, `"900"` or `"1800"`, the seconds a tool that stops is kept waiting for the phone's message while nobody is at the computer, as a word (`"0"`, not at all, unless chosen) |
+| `settings_change` | `name`, `value` | the same, after the change. `rights`: `full`, `edit` or `read` (the mode Claude Code and Codex are started in from the phone); `tunnel`: `auto` or `http2` (used by the next tunnel); `channel`: `release` or `pre` (which GitHub releases the computer's program looks for and installs: the latest full release, or also pre-releases; `release` unless chosen); `autostart`, `update`, `reach`, `ask`: `true` or `false` (`reach`: the program's hooks are in the settings of Claude Code and Codex, see "A conversation that is open on the computer"; `ask`: a request for permission of Codex's is kept for the phone while nobody is at the computer, `true` unless switched off); `wait`: `"0"`, `"60"`, `"300"`, `"900"` or `"1800"`, the seconds a tool that stops is kept waiting for the phone's message while nobody is at the computer, as a word (`"0"`, not at all, unless chosen) |
 | `line_switch` | `to`: the `id` of a line | the same; `change.state` is now `preparing` |
 | `line_take` | none | `{"address", "ticket", "key", "seconds"}`, when `change.state` is `ready` |
 | `line_keep` | `key` | the same as `settings_read`; sent through the new line |
@@ -451,7 +597,7 @@ line. The program answers and decides everything; the relay checks the shape of 
  "lines": [{"id": "lan", "kind": "lan", "current": false, "ready": true},
            {"id": "cloud", "kind": "cloud", "current": true, "ready": true},
            {"id": "r3f9a0c1d2e4b", "kind": "own", "name": "home", "ms": 42, "current": false, "ready": true}],
- "settings": {"rights": "full", "tunnel": "auto", "autostart": true, "update": false, "reach": true, "ask": true, "wait": "0"},
+ "settings": {"rights": "full", "tunnel": "auto", "autostart": true, "update": false, "channel": "release", "reach": true, "ask": true, "wait": "0"},
  "reach": [{"tool": "claude", "name": "Claude Code", "state": "good"}],
  "change": {"state": "", "to": "", "note": "", "left": 0}}
 ```
@@ -498,7 +644,7 @@ switches ignore repeated taps while saving; a requested refresh is queued if one
 
 `POST /api/work` `{"id": "<16 to 32 hex digits>", "action": "..."}` is held like `/api/files` and needs the `work`
 capability, which the Windows program and the Linux agent have. The three actions that begin with `chain` need
-`chains` besides; the five actions that begin with `team` need `teams`. The Windows program hears that a conversation has stopped from the tools' own hooks; the Linux
+`chains` besides; the actions that begin with `team` need `teams`. The Windows program hears that a conversation has stopped from the tools' own hooks; the Linux
 agent has none, and sees a finished turn by watching the source conversation's record grow and then stay quiet
 for a little while. The computer keeps and does all of it; the relay checks the shape of the question, passes it
 on as the operation `work_<action>` and keeps nothing.
@@ -515,39 +661,54 @@ on as the operation `work_<action>` and keeps nothing.
 | `handoff` | `from`, `to` (two different conversations; `to` is open), optional `note` (at most 1,000 characters) | `{"status": "accepted", "note": "...", "length": n}`; held for up to 85 seconds, as a message for an idle conversation is |
 | `brief` | `from` (a conversation the computer lists), optional `note` (at most 1,000 characters); needs `brief` | `{"text": "...", "tool", "dir", "title"}`: what `handoff` would say, said to nobody |
 | `teams` | none; needs `teams` | `{"teams": [...]}`: multi-AI collaboration tasks kept on this computer |
-| `team_start` | `item`: `id` (16 to 32 hex digits; repeated id returns the existing task), `mode` (`review`, `lead` or `compare`), `dir` (a workspace name), `goal` (1 to 4,000 characters), optional `discuss` (boolean for `review` / `lead`: run a read-only planning round before writing), optional `rules` (at most 1,000 characters of custom delegation preference), `tools` (2 chat-capable tools for `review`: `[writer, reviewer]`; 2 to 4 distinct chat-capable tools for `lead`: `[leader, ...members]`; 2 to 3 distinct chat-capable tools for `compare`), `rounds` (1 to 10, default 3; 1 for `compare`) | `{"team": {...}}` |
-| `team_say` | `team`: its `id`, `text` (1 to 4,000 characters), optional `target` (role or tool name, max 32 chars); needs `teams-v2` | `{"team": {...}}`: interjects while `running`, resumes with guidance while `paused`, refines candidates while `choose`, or starts a follow-up round after `done`/`stopped` (`review`/`lead`) |
+| `team_start` | `item`: `id` (16 to 32 hex digits; repeated id returns the existing task), `mode` (`review`, `lead` or `compare`), `dir` (a workspace name), `goal` (1 to 4,000 characters), optional `discuss` (boolean for `review` / `lead`: run a read-only planning round before writing), optional `rules` (at most 1,000 characters of custom delegation preference), `tools` (2 chat-capable tools for `review`: `[writer, reviewer]`; 2 to 4 distinct chat-capable tools for legacy `lead`: `[leader, ...members]`; 2 to 3 distinct chat-capable tools for `compare`), optional `roster` (for `lead` with `teams-roster`: `[{role, tool, model, effort?}]`, first entry `leader`, optional `member-1`..`member-3`; `auto_roster: true` supplies only `leader`), `rounds` (1 to 10, default 3; 1 for `compare`; `0` for `lead` leaves the number to the leader, 自由轮数, and needs `teams-flex-rounds`), optional `models` (`{tool: model}` for tools of `tools`; a non-empty model needs `teams-models`), optional `efforts` (`{tool: effort}` or `roster[*].effort`; a non-empty effort needs `teams-effort`), optional `from_terminal` (32 hex digits: promote an idle live structured chat in `dir` in-place as `leader`/`writer` for `lead`/`review` without `discuss`; needs `teams-promote`), optional `context` (at most 6,000 characters of agreed pre-collaboration background synced to members; needs `teams-promote`) | `{"team": {...}}` |
+| `team_models` | none; needs `teams-models` | `{"models": {"codex": [{"id", "label", "efforts"?, "default_effort"?, "is_default"?}], "claude": [...], "agy": [...]}}`: for each chat tool installed on the computer, the models and reasoning effort tiers it lists itself (empty lists where it lists none: only its default is offered) |
+| `team_say` | `team`: its `id`, `text` (up to 4,000 characters, may be empty when screenshots are attached), optional `target` (role or tool name, max 32 chars), optional `attachments` (1-4 reserved screenshot paths, when the computer advertises `attachments`). Requires `teams-v2`. | `{"team": {...}}`: interjects while `running`, resumes with guidance while `paused`, refines candidates while `choose`, or starts a follow-up round after `done`/`stopped` (`review`/`lead`) |
 | `team_pick` | `team`: its `id`, `tool`: winning tool name (from `CHAT_TOOLS`) or `""` to discard all; needs `teams-v2` | `{"team": {...}}`: checks and applies the chosen `compare` worktree patch to the main project folder (or discards all) and removes all temporary worktrees |
-| `team_swap` | `team`: its `id`, optional `role` (role or tool name, max 32 chars), `tool`: replacement chat-capable tool, optional `note` (max 1,000 chars); needs `teams-v2` | `{"team": {...}}`: swaps a role's AI or reassigns a member's task to another installed AI mid-run or while paused |
+| `team_swap` | `team`: its `id`, optional `role` (role or tool name, max 32 chars), `tool`: replacement chat-capable tool, optional `note` (max 1,000 chars), optional `model` (that role/tool's model from now on; needs `teams-models`), optional `effort` (that role/tool's reasoning effort tier, `""` to reset to tool default; non-empty needs `teams-effort`); needs `teams-v2` | `{"team": {...}}`: swaps a role's AI, model or reasoning effort, or reassigns an execution member's task to another installed AI mid-run or while paused |
 | `team_stop` | `team`: its `id` | `{}` |
 | `team_resume` | `team`: its `id` (must be `paused`) | `{}` |
-| `team_remove` | `team`: its `id` (must not be `running`) | `{}` |
+| `team_remove` | `team`: its `id` (must not be `running`) | `{}`: every terminal the task began (its leader's, members', and those it replaced) is closed; their conversations stay in the tools' history, listed by themselves |
+
+Claude Code receives `team_say` screenshots as native image blocks. ACP members receive image blocks when the initialize
+result advertises `agentCapabilities.promptCapabilities.image`. Codex app-server and ACP members without that capability
+receive absolute-path references. The task history keeps `附图` lines linking to the original files. When the leader receives
+several queued messages together, at most four images from the latest messages are attached. Other images remain file
+references. Queued image paths are stored with the task and checked again when the leader receives them.
 
 The tool of each conversation named is the one the computer listed it with, whatever the phone says. A conversation
 counts as open when a program on the computer has it (`live`) or one of the phone's own terminals runs it.
 
 **The numbers** (`stats`) are read from the tools' own records on the computer (Claude Code's
-`projects/*/*.jsonl`, Codex's `sessions/**/rollout-*.jsonl`), each record anew only when it has changed. Nothing that
-was said leaves the computer: numbers, dates, and the names of folders.
+`projects/*/*.jsonl`, Codex's `sessions/**/rollout-*.jsonl`, and Antigravity CLI's
+`brain/*/.system_generated/logs/transcript.jsonl`), each record anew only when it has changed, and persisted in a
+local ledger (`<dataDir>/stats-ledger.json`) so updates, restarts, and tool log cleanups do not reset historical days.
+Nothing that was said leaves the computer: numbers, dates, and the names of folders.
 
 ```json
 {"ready": true,
- "days": [{"date": "2026-10-13", "prompts": 11, "sessions": 3, "active": 2280, "in": 51200, "out": 23900, "cached": 1100000, "wait": 2.6}],
- "tools": [{"name": "claude", "prompts": 58, "active": 18000, "tokens": 310000}],
- "projects": [{"name": "web-shop", "prompts": 45, "active": 13920, "tokens": 250000}],
- "hours": [0, 0, 0, 0, 0, 0, 0, 0, 3, 9, 12, 8, 4, 6, 14, 9, 7, 5, 2, 1, 0, 0, 0, 0], "wait": 3.4, "updated": 1791892800000}
+ "days": [{"date": "2026-10-13", "prompts": 11, "sessions": 3, "active": 2280, "in": 51200, "out": 23900, "cached": 1100000, "wait": 2.6,
+           "tools": {"claude": {"prompts": 7, "active": 1620, "tokens": 48000, "cached": 920000}, "codex": {"prompts": 4, "active": 660, "tokens": 27100, "cached": 180000}}}],
+ "tools": [{"name": "claude", "prompts": 58, "active": 18000, "tokens": 310000, "cached": 6200000}],
+ "projects": [{"name": "web-shop", "prompts": 45, "active": 13920, "tokens": 250000, "cached": 4800000}],
+ "hours": [0, 0, 0, 0, 0, 0, 0, 0, 3, 9, 12, 8, 4, 6, 14, 9, 7, 5, 2, 1, 0, 0, 0, 0], "wait": 3.4,
+ "streak": 5, "best_streak": 12, "first_date": "2026-09-20", "ledger_days": 21, "sources": ["claude", "codex", "agy"],
+ "updated": 1791892800000}
 ```
 
 - `days`: one for each day, today the last, by the computer's own calendar. `prompts`: what the owner asked (not
   what a tool gave back, not a helper's own conversation). `sessions`: the conversations something was asked in.
-  `active`: seconds the tools worked on it, from each prompt to the last thing of its turn, a turn counted for
-  three hours at most (Codex notes the length of each turn itself). `in`, `out`, `cached`: tokens the tools note
-  for their answers: fresh input, output, and input read from or written to the cache. `wait`: the middle value of
+  `active`: seconds the tools worked on it, from each prompt through its active steps (each inter-step gap capped at
+  ten minutes and a turn at three hours; Codex notes turn length via `duration_ms`). `in`, `out`, `cached`: tokens
+  the tools note for their answers: fresh input, output, and cached input read/created. `wait`: the middle value of
   the seconds from a prompt to the first thing that came back (null on a day with none; an answer later than ten
-  minutes is not counted).
-- `tools`, `projects`: the same summed over the whole span, the most worked on first (at most four and six). A
-  project goes by its name where the conversation's folder is one or lies in one, else by the folder's own name.
-- `hours`: prompts by the hour of the day, over the whole span. `wait`: the middle value over the whole span.
+  minutes is not counted). `tools`: optional per-tool daily breakdown (`prompts`, `active`, `tokens`, `cached`).
+- `tools`, `projects`: the same summed over the whole span, the most worked on first (at most four and six), each
+  with `prompts`, `active`, `tokens` (`in + out`), and `cached`. A project goes by its name where the conversation's
+  folder is one or lies in one, else by the folder's own name.
+- `hours`: prompts by the hour of the day, strictly within the requested span. `wait`: the middle value over the whole span.
+- `streak`, `best_streak`, `first_date`, `ledger_days`, `sources`: continuous active-day streak, longest historical streak,
+  earliest active date in the ledger, total active days preserved in the ledger, and configured tool sources.
 
 **A question asked at a time** as it is answered: what was set, with `tool`, `title` (the conversation's, as it was
 then), `next` (milliseconds; 0 when nothing is due), `runs`, and `last` (`{"at", "ok", "note"}`, or null), the note
@@ -564,12 +725,14 @@ rules, one each way, let two conversations go back and forth until their rounds 
 
 **A conversation handed over** (`handoff`): the computer reads `from` as the conversation's window does and writes
 `to` one message, in its owner's words: what was asked first and last (800 characters each), what was answered
-last (2,000), the last eight steps (160 each), and the note.
+last (2,000), the source session ID, the last eight steps (160 characters per operation, followed by up to 160 characters
+of the output already shown in the transcript), and the note. Each excerpt stays with the operation that produced it.
+Steps with no recorded output are marked explicitly. Excerpts may be partial and do not imply that an operation succeeded.
 
 **What a hand-over says** (`brief`, Windows program and Linux agent since 1.7.16): the same
 message, given back to the phone instead of to a conversation. The phone shows it before it is given, and hands a
 conversation to a new one with it: `start` with `form: "chat"`, the tool chosen, `from`'s `dir`, and the message as
-`text` (at most 8,000 characters; the message is at most about 6,000). The new conversation is an ordinary chat;
+`text` (at most 8,000 characters). The new conversation is an ordinary chat;
 `from` is left as it was. A relay without `brief` refuses the action as unsupported, a computer without it is
 refused by the relay ("请更新电脑端").
 
@@ -594,21 +757,135 @@ for `team_resume`.
 - `review` (写审): optionally runs a read-only `discuss` round first; then the writer makes changes; when its turn ends, the computer runs `git status`/`git diff` in the
   project folder and passes the changes plus the writer's summary to a read-only reviewer, which starts its reply with
   `REVIEW: PASS` or `REVIEW: CHANGES`. Findings loop back to the writer until it passes or `rounds` are exhausted.
-- `lead` (领队): optionally gathers read-only `discuss` proposals from members first; then the leader splits the goal into `ASSIGN <tool>: <task>` lines for its members (who run in parallel in
-  their own chats) and receives their combined answers, git diff and live quotas until it answers `DONE: <summary>` or `rounds` are
-  exhausted.
+- `lead` (领队) can gather read-only `discuss` proposals from preselected members. Each round runs from the leader's assignment
+  through member execution and the leader's verification (`phase: "verify"`). The leader receives the combined answers, project
+  changes and quotas, inspects the results and runs applicable checks. A `DONE` before the first assignment opens verification
+  for work the leader completed directly. A `VERIFIED: <checks and results>` followed by `DONE: <summary>` in a verification turn
+  marks the task `done` and stores the evidence in the log under `验收`. A new assignment in verification increments `round` and
+  starts another member batch. Each round's aim is the leader's, by what it has seen (the changes, checks and members'
+  reports): a first round that meets the goal goes straight to acceptance and ends, and a later round may be a read-only
+  re-check alone. With `rounds` 0 (自由轮数, `team.rounds` stays 0, also in `teams.dat`) the workflow can run through
+  round 20 without an owner-specified cap. The last acceptance carries `team.last: true` in the detail response.
+  At the final round, further assignments or a second reply without verification evidence
+  leave the task `paused` with the rounds spent: the assignments are kept, nothing goes out, and the note says so;
+  `team_resume` (or a `team_say`, whose text goes along) adds one round and sends the kept assignments, or asks the leader
+  to go on where none were kept. A task stops instead only at 20 rounds. Earlier rounds pause after a second reply without
+  evidence. A message to a running leader is included in the next workflow turn, so a leader reply cannot advance the
+  workflow while members are still reporting.
+- A progress-only reply returns to the same member up to twice per round (logged under `继续`).
+  When a member reports a blocker with `阻塞：<reason>` or still reports progress after both reminders,
+  the agent collects the other members' replies and gives the batch to the leader with `phase: "decision"`.
+  The leader can resolve the issue or assign the remaining work in a new round. The usual round limit applies.
+  A leader's `DONE` in this phase opens a separate verification turn.
+- How the leader gives out work is part of its prompts, not of the protocol: its first turn (also when its conversation
+  is begun anew) has it settle first what the user is to get and what evidence shows it is met, and then work together
+  only as much as the work wants: a simple task goes to the one best placed (the leader itself or one member), a design
+  alone is delivered as a design, work is split only where it is large or wants different strengths (by strength,
+  quota, dependency and file ownership, one file to one member; design and building split among several have the
+  interfaces and file ownership settled before the building goes out by module), and another AI reviews read only
+  where a change is wide, risky or uncertain. The decision,
+  acceptance and owner's-supplement turns ask against that product and its evidence; acceptance may give out the next
+  step as well as fixes. A member is told to deliver what was assigned (a design, not an implementation besides) with
+  the evidence asked for. Which member gets which work stays the leader's judgement: `tests/TeamsCheck.cs` fixes what
+  each turn says and when it goes out, `tests/TeamsLive.cs` runs the choice on the real tools.
+- `review` likewise pauses with the reviewer's findings kept when the `rounds` are spent without `REVIEW: PASS`; going on
+  hands them to the writer in the round added.
 - `compare` (并行比稿, `agent-windows/Worktrees.cs`): creates one detached Git worktree per candidate under `<dataDir>/worktrees/<teamId>/<tool>` and runs 2–3 distinct AIs in parallel; when finished, the task enters `choose` with per-candidate summaries, file stats and diffs. `team_say` can refine one or all candidates before picking; `team_pick` verifies and applies the chosen candidate's binary-safe patch (`git apply --check` then `git apply`) to the main project folder (leaving the main folder untouched on conflict) and removes all temporary worktrees (or discards all when `tool: ""`).
 - `team_say` lets the owner interject mid-run, resume a paused task with guidance, refine `compare` candidates, or continue `review`/`lead` tasks into a new round after `done`/`stopped`.
+  In a running `lead` task after the optional discussion, omitting `target` queues the message for the leader's next turn.
+  A message addressed to an execution member goes directly to that member.
 - `team_swap` lets the owner switch a role's AI or reassign a member's task to another installed AI at any time (`review`/`lead`). When a member fails mid-run (e.g. quota exhausted), `lead` mode reports the failure and live quotas back to the leader to reassign automatically (and adds an available backup AI if needed), while `review` mode and failed leaders automatically switch to an available backup AI before falling back to `paused`.
 - Agents supporting `team_say`, `team_pick`, `team_swap`, `discuss` and `compare` advertise `teams-v2`; relays reject those actions with an upgrade prompt when talking to older `teams`-only agents.
 
+**Selecting members** (`teams-roster`). `team_start.item.roster` is an ordered array of `{role, tool, model, effort?}` entries for `lead` (分工协作).
+The first role is `leader` (领队). Preselected teams have one to three additional roles named `member-1`, `member-2` and `member-3` (执行成员).
+Each role has its own conversation, model and optional reasoning effort (`effort`, omitted when empty for the tool's default). Roles may share a tool and its account quota. `model` can be empty or omitted for
+the tool's default. The relay derives `tools` from the roster and includes the roster in `team` and `device.team_cards`.
+`team_say.target` and `team_swap.role` use the role name. For example, `member-2` addresses only that member. A `team_swap`
+can also change a role's model or reasoning effort while keeping the same tool. An explicit empty `model` or `effort` selects the tool's default.
+
+**Restarting a member** (重启成员). A `team_swap` whose `tool` is the role's own tool restarts that member: the computer
+ends the program of the member's chat and starts its tool again on the same conversation in the same terminal (Claude
+Code `--resume`, Codex `thread/resume`, ACP `session/load`), with `model` and `effort` where given, so that what the
+tool reads when it starts (the account signed in, a renewed quota, its settings) is read again. The chat's readers see
+a `note` and the new program's events; nothing the ended program still writes is passed on. A member whose terminal
+has ended is gone on with in a new chat of the same conversation; one whose tool never named its conversation is begun
+anew with its task. Where the task waited for that member (running, or paused with rounds left), it goes on: the member
+is told `继续完成上面的任务。`. When the phone itself ends a member's chat and goes on with the conversation (`start`
+with its `session`, `form: "chat"`), the new terminal takes the member's place in the same way (resuming a paused task
+even when the phone opened it with a message). Closing an awaited member's chat pauses the task cleanly rather than
+waiting on a closed terminal; when a later dispatch or resume finds a member's terminal closed, the task reopens that
+member's known `session` (falling back to a new conversation if the session cannot be loaded). Resuming a paused task,
+sending follow-up guidance to a paused task, quota window reset, or a member completing a turn clears stale failure
+marks so the leader can assign previously paused or quota-exhausted members again; existing roster members are not
+silently dropped for a cached quota reading once their failure mark is cleared. Sending a message directly inside a
+paused or stopped leader's chat re-engages the workflow when the leader replies with `ASSIGN` or `DONE` (stopping any
+stale sibling member turns), and sending directly inside a paused awaited member's chat resumes the task so its
+completed answer still reaches the leader.
+
+A member whose whole answer is only its tool saying that its account ran out (at most 600 characters, words such as
+`quota reached`, `usage limit reached`, `upgrade your plan`, `额度已用完`, and no `ASSIGN`, `DONE`, `VERIFIED` or
+`REVIEW` line; Antigravity CLI 1.5 ends such a turn as done) is taken as a failed turn for quota, as a tool error is.
+
+With `item.auto_roster: true` (自动组队), the request supplies only a `leader` entry (including its chosen `model` and `effort`). The agent shows the leader every installed provider's shared quota
+and offers by name, with examples built from them, only the providers that can still take work: an `ASSIGN` to one that
+failed in the task or has a spent quota window is not given out. With none left the leader is told to work alone or report the blocker.
+The leader can work directly or write `ASSIGN member-1 claude: <task>` to create a member, `ASSIGN member-1: <task>` to reuse it,
+or specify a different provider to switch it. At most three members can be allocated. The task publishes each new member's
+role and provider as it is assigned, and uses the provider's default model. Without `roster`, legacy lead tasks keep
+their `tools`, `models` and optional `efforts` maps and use `ASSIGN <tool>: <task>`. A task continues on the lines
+under its `ASSIGN` line up to the next `ASSIGN`, `DONE` or `VERIFIED` line (at most 8000 characters), so a step list
+reaches the member whole. During acceptance the leader may merge and revise members' results itself and hands larger
+fixes back with `ASSIGN`; it does not edit while members are still working.
+
+**Models and reasoning effort** (`teams-models`, `teams-effort`, `agent-windows/Models.cs`). Tasks without a roster keep one model and optional effort per tool (`team.models`, `team.efforts`, with the tool's default for an omitted choice). Roster tasks keep `model` and optional `effort` on each role (persisted in `teams.dat` and `restart.json` across restarts and subsequent rounds). The agent uses the model and effort for the
+first turn, subsequent rounds (both continuing turns on an active conversation and sessions reopened after close/restart/`team_resume`), `team_swap` or failover, `discuss` and `review` readers, and `compare` candidates. They reach the tools as:
+Claude Code `--model <id>` and `--effort <level>`; Codex `model` and `config.model_reasoning_effort` in `thread/start` / `thread/resume`, plus `model` and `effort` on every `turn/start`; an ACP server (`agy acp`) by
+`session/set_config_option` (`configId` of the session's `configOptions` entry of category `model`) or else the
+earlier `session/set_model`, and the effort by `session/set_config_option` of the entry of category `thought_level`
+(agy 1.5.13: `low`, `medium`, `high`, `xhigh`), in that order after `session/new` and before the first prompt. An ACP
+server without a `thought_level` entry runs at its own level, which the conversation notes. A model or effort the tool does not offer or
+refuses is not replaced by another: the member's turn fails with the tool's words, which the
+team treats as any failed member (failover, or `paused`). `team_models` reads the lists from the tools themselves, each
+started for a moment in `<dataDir>/models`: Claude Code's `initialize` answer (`models`: `value`, `displayName`, `supportedEffortLevels` when `supportsEffort` is not false, and `default`'s `resolvedModel` marking `is_default`), Codex's `model/list` (`id`, `displayName`, `supportedReasoningEfforts[].reasoningEffort` as `efforts`, `defaultReasoningEffort` as `default_effort`, `isDefault` as `is_default`; `hidden` ones left
+out), and an ACP server's `session/new` (the `model` config option's values, or `models.availableModels`, each with the
+values of the `thought_level` option as `efforts` and its current value as `default_effort`). A list is
+kept 10 minutes (a tool that said nothing is asked again after a minute); at most 40 models a tool and 16 effort tiers a model. Model names are
+`[A-Za-z0-9][A-Za-z0-9._:/[\]-]{0,79}` (`gpt-5.1-codex`, `sonnet[1m]`, `models/gemini-3-pro`) and effort tiers are `[a-z0-9][a-z0-9_-]{0,31}` (`low`, `medium`, `high`, `xhigh`, `max`, `ultra`): the computer and the
+relay refuse anything else, since the values go onto a command line or RPC request as-is. A team's detail (`team`) carries
+`models`, optional `efforts`, and `roster` (including each role's `effort` when set); the relay passes `models` of `team_start` and `model` of `team_swap` only to a computer with
+`teams-models`, and non-empty `effort`/`efforts` only to a computer with `teams-effort`, refusing them otherwise.
+
+**Tasks in the lists** (`teams-grouped`). `device.team_cards` (newest first, at most 10; `[]` while remote access is
+off) gives each task as `{"id", "dir", "goal" (cut to 200), "mode", "state", "phase" ("", "discuss" or "verify"),
+"note" (cut to 200), "updated" (Unix seconds of its last step), "awaited" (roles), "tools", "models"}`, with optional
+`efforts`, `roster` (carrying `effort` when set) and `auto_roster` for lead tasks, and with
+`"confirm": true` where a member whose turn it waits for asks for a confirmation. Each terminal and session carries
+`team`. A team's detail keeps `members` (role → terminal) and adds `member_sessions` (role → `{"id", "tool"}`): each
+role's conversation in its tool, learnt from the terminal that runs it and kept when the terminal is gone, so its
+history can be opened. A conversation stays listed under its task when its member was replaced or begun anew (up to 60
+a task); tasks kept from before this learn their members' conversations from the terminals the computer still lists.
+Once a task is removed nothing carries its id any more and its conversations are listed by themselves; a viewer shows a
+`team` that is not among `team_cards` (an older terminal the relay still keeps) as no task.
+
+**Older relays and computers.** A relay from before these filters `info.features` to what it knows and rebuilds each
+question field by field: it drops `organize`, `teams-models`, `teams-grouped`, `teams-roster`, `teams-effort` and `teams-flex-rounds` from `device.features`, gives no `team_cards` and
+no `team` fields, refuses `team_models` as unsupported, and passes `team_start` and `team_swap` without `models`, `model`, `efforts` or `effort`. A viewer therefore offers models, grouping, roster and reasoning effort only where `device.features` has those words (degrading unsupported reasoning effort to tool default with an upgrade note), which only a
+relay and a computer that both have them give. A computer without `teams-models` or `teams-effort` is refused non-empty model/effort choices by the relay, and one
+without `teams-flex-rounds` is refused `rounds` 0, so a team never starts silently with defaults the owner did not choose.
+
 ## Chats
+
+With the `chat-model` and `reopen` capabilities, a viewer may also send `start` with `reopen`, the original
+`dir` and `tool`, `form: "chat"`, `model` (empty for the tool default) and optional `effort`. This reopens a saved,
+idle, standalone Claude Code, Codex or Antigravity chat in its original workspace, with the same session and
+permission mode. A view switch still takes no model parameters. Team members use `team_swap` on their own role.
 
 Client delivery presentation distinguishes queueing/retry, acceptance, rejection, and unknown outcome.
 An HTTP 5xx or a lost response may retry the existing operation ID and unchanged payload; it is not a
 definitive rejection. A successful terminal-operation acknowledgment may only mean the relay queued the
 operation, not that the computer or tool received it. The UI labels this as submitted, awaiting the
-conversation. The echoed user item reconciles by `op`. When the
+conversation. The echoed user item reconciles by `op` (and `ops` when multiple queued operations were merged into one turn). When the
 retry deadline expires after an attempted send, the outcome is unknown. The UI must not invite an
 unqualified new send. Page recreation retains that uncertainty and never automatically replays stored
 messages. Acknowledgments clear only the matching draft, preserving edits made while delivery was pending.
@@ -625,7 +902,7 @@ capability `chat` (Windows program 1.7.0, Linux agent 0.7.0; the Rust agent does
 | --- | --- | --- | --- | --- |
 | Claude Code | `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --replay-user-messages --permission-prompt-tool stdio --session-id <new id>` (or `--resume <id>`), with `--permission-mode plan` or `acceptEdits` for the computer's `read` and `edit` | a `user` message on its standard input; one sent while it works is taken when it gets to it | the control request `interrupt` | a `can_use_tool` control request, answered `allow` (with the input), `allow` with one validated and displayed `updatedPermissions` suggestion for `always`, or `deny` |
 | Codex | `codex app-server`; `thread/start` with the project folder (`sandbox` for `read` and `edit`) or `thread/resume` | `turn/start`, or `turn/steer` while a turn runs | `turn/interrupt` of the running turn | `item/commandExecution/requestApproval` and `item/fileChange/requestApproval`, answered `accept`, `acceptForSession`, `decline`; `item/tool/requestUserInput` with one question and its choices |
-| Antigravity CLI | `agy acp` (Agent Client Protocol, JSON-RPC 2.0): `initialize` offering no file system and no terminal, then `session/new` with the project folder or `session/load` (its replayed history is passed over; the phone is shown the transcript instead). Its own way of working stays: `read` and `edit` are not passed | `session/prompt`; one sent while a turn runs waits for its end (ACP has no way to add to a running turn) | the notification `session/cancel`; the prompt is answered `stopReason: cancelled` | `session/request_permission`, answered with the option of kind `allow_once`, `allow_always` or `reject_once` |
+| Antigravity CLI | `agy acp` (Agent Client Protocol, JSON-RPC 2.0): `initialize` offering no file system and no terminal, then `session/new` with the project folder or `session/load` (its replayed history is passed over; the phone is shown the transcript instead). Its own way of working stays: `read` and `edit` are not passed | `session/prompt`; messages sent while a turn runs wait and are merged into one prompt when the turn ends (ACP has no way to add to a running turn) | the notification `session/cancel`; the prompt is answered `stopReason: cancelled` | `session/request_permission`, answered with the option of kind `allow_once`, `allow_always` or `reject_once` |
 
 Run on Claude Code 2.1.283, Codex 0.163.0 and Antigravity CLI 1.5.12 (`AcpChat.cs`; any other tool serving ACP
 is driven by the same class). The computer offers chats of Antigravity CLI with the capability `chat-agy` beside
@@ -639,17 +916,30 @@ commands in `system` / `background_tasks_changed` (`tasks`, the whole list each 
 `task_notification`, an empty list, and goes on by itself in a turn of its own (`result` with `origin`). Codex
 0.163.0 waits for its command within the same turn. The phone is shown every turn as it ends; a collaboration task
 (Teams.cs) takes a member's turn as over only when nothing it started still runs in the background, and passes on
-what it said at the end of the turn that follows.
+what it said at the end of the turn that follows. Entries marked `ambient` (for example, live-update watchers)
+do not hold a member's result. A subagent marked `awaited` reports to its waiting tool call and does not start
+a follow-up turn, so it does not hold the result either.
 
 On Windows (`agent-windows/Peers.cs`), a chat can consult another installed chat-capable AI in the same project
 mid-turn through a per-conversation local MCP server (`remote_ai`, tool `ask_ai(tool, question, fresh?)`) bridged by
-`RemoteCliAgent.exe --mcp <pipe> <token>` over a named pipe (`RemoteCli.peers.<hash>`). The server is attached only
+`RemoteCliAgent.exe --mcp <pipe> <token>` over a named pipe (`RemoteCli.peers.<hash>`). For standalone project chats
+not yet inside a collaboration task, `remote_ai` also exposes `start_collaboration(goal, mode?, context?, members?, reviewer?, rounds?, rules?)`
+(default `mode: "lead"`, `auto_roster: true`, `rounds: 0`): calling it displays a phone confirmation card via the chat's
+`ask` event (without `always`), and upon user approval promotes the current conversation in-place as the task's `leader`
+or `writer`, returning the collaboration prompt inside the active turn so `ASSIGN` / `DONE` takes effect when the turn
+finishes. The server is attached only
 for that session without modifying global tool settings: Claude Code receives `--mcp-config <temp.json>` (with
 `MCP_TOOL_TIMEOUT=300000`), Codex receives `-c mcp_servers.remote_ai.{command,args,tool_timeout_sec,startup_timeout_sec}`
-on `codex app-server`, and Antigravity CLI receives `mcpServers` in ACP `session/new` / `session/load`. `tools/list`
-omits the caller itself and embeds each peer's current quota and tight (>=80%) warning from `Quotas.cs`. Calls to
-`ask_ai` are auto-approved without prompting the phone and shown as `step` items (`请教 <工具>：...`). The consulted
-peer runs in `read` mode without MCP (preventing recursion), automatically denies write/command permission prompts
+on `codex app-server`, and Antigravity CLI receives `mcpServers` in ACP `session/new` / `session/load`. The stdio
+bridge accepts both newline-delimited JSON and `Content-Length` framed JSON-RPC messages. Because Antigravity CLI
+aborts MCP tool calls at 180 seconds and spills outputs above ~10 KB UTF-8 to disk, calls from `agy` enforce a 168-second
+budget on both `ask_ai` and `start_collaboration` confirmation waits, and head-tail fold replies above 8,600 UTF-8 bytes
+so responses return inline cleanly. `tools/list`
+omits the caller itself in `ask_ai` and embeds each peer's current quota and tight (>=80%) warning from `Quotas.cs`.
+CLI-level tool permission prompts for `ask_ai` and `start_collaboration` are auto-approved (the latter uses Remote AI's
+own phone confirmation card) and shown as `step` items (`请教 <工具>：...` / `发起协作 · ...`). The consulted
+peer runs in `read` mode without MCP (preventing recursion), receives a compact read-only workspace snapshot on its first
+turn, automatically denies write/command permission prompts
 (allowing only read/search inspection on ACP), reuses its read-only session for follow-ups unless `fresh: true`, and is
 disposed together with any temporary config file when the caller chat closes.
 
@@ -811,8 +1101,9 @@ An agent advertises `<tool>-desktop-open` for each tool whose desktop applicatio
 - `claude-desktop-open` when it finds the installed `Claude` Windows x64 package (2.31226.1.0 or later), the
   package declares the `claude:` scheme as its own, and its owner has not given that scheme to another program.
 
-Installing/updating a desktop app requires restarting Remote AI to discover it.
-This capability means opening a project/composer, not RPC control of running turns.
+The Windows agent discovers these two link handlers at startup. It also advertises
+`agy-desktop-open` when the local Antigravity Desktop service answers its discovery probe.
+`agy-desktop-control` identifies support for controlling a listed desktop conversation.
 It does not depend on a CLI installation. Linux and older agents do not advertise it. The relay passes
 on the names it knows (`DESKTOP_TOOLS`) and refuses `app_open` for a tool the computer did not name.
 
@@ -825,7 +1116,7 @@ Use the existing authenticated `POST /api/terminal` operation queue:
 Only these fields are allowed. `dir` is an existing Remote AI project name, not a caller-provided path.
 Both relay and computer validate it; the computer resolves its allowed absolute directory and verifies
 that it still exists. `draft` defaults to empty, accepts line breaks and tabs and is limited to 1000
-UTF-16 code units. Remote control must be enabled. No terminal is created (`terminal` is empty).
+UTF-16 code units for Codex and Claude, or 8000 for Antigravity. Remote control must be enabled. No terminal is created (`terminal` is empty).
 
 The queued operation eventually returns `state: "done"` with a `result`:
 
@@ -844,7 +1135,7 @@ one it is: a live conversation carries `opened`, the `id` of the `app_open` oper
 the first that began in that folder, in that application, after the application was opened for it (looked
 for during 30 minutes; kept in memory only). The page that handed the draft over offers to enter it.
 
-Each application is opened by a link of its own scheme, the entry it has for that itself
+Codex and Claude are opened by a link of their own scheme
 (`LinkedDesktopApp` in `DesktopAdapters.cs`; one class per application says where it is installed, what its
 link is and how the link is given). Claude's is `claude://code/new?folder=...&q=...`: a new conversation of
 Claude Code in that folder with the draft standing in its box, the link the app's own `ccd <folder>` command
@@ -1013,6 +1304,44 @@ filesystem path. Stop interrupts that turn, not the application process. Desktop
 from stop because this interface's expected-turn variant does not pause the goal. Hooks that already
 provide a permission request continue to use `session_answer`; native approvals are not implemented.
 
+### Windows desktop conversation discovery and control
+
+On the Windows installation of Codex `26.1117.4957.0`, the legacy `codex-ipc` pipe was absent.
+The Windows agent checks the pipe before connecting. Opening the composer remains a separate
+capability. An available hook can accept a follow-up or hold a stopped conversation for input.
+Otherwise the phone shows how to continue on the computer or open a copy. `codex queue` is
+reserved for the command-line route.
+
+Claude Code can publish a live owner record before writing its first transcript. The Windows
+agent uses `ClaudeSessions.LiveSessions` for both registered projects and eligible external
+folders. It uses the owner record's `name` when the transcript has no title, then falls back
+to the session start time. Reading a verified live conversation with no transcript returns
+`messages: []`, `more: false` and `stamp: "0.0"` until the transcript appears.
+
+For Antigravity Desktop, the Windows adapter discovers a local Hub from
+`~/.gemini/antigravity/daemon/hub_*.json`. The record names `pid`, `httpPort`, `httpsPort`,
+`lsVersion` and `csrfToken`. The adapter checks the recorded language-server process and probes the
+loopback ConnectRPC service with `GetStatus`. Loopback requests carry the Hub's CSRF credential.
+The phone and relay receive neither the credential nor the Hub registry record.
+An authenticated phone receives conversation capabilities and operation results.
+
+| Phone operation | Desktop service operation and result |
+| --- | --- |
+| `app_open`, `tool: "agy"` | `StartCascade` in the registered workspace. A nonblank draft also calls `SendUserCascadeMessage`. A successful receipt carries `status: "created"`, `session`, and `sent`. |
+| List and `read` | `GetAllCascadeTrajectories`, `GetCascadeTrajectory` and `GetCascadeTrajectorySteps` supply summaries, state and messages. The response includes `stamp` and the current `ask`, including on an unchanged read. An offline desktop transcript can supply history. CLI records take precedence for duplicate IDs. |
+| `say` | `SendUserCascadeMessage` targets the listed conversation, carries the operation ID as `clientMessageId`, and attaches `cascadeConfig.plannerConfig.requestedModel` (inheriting the conversation's existing `planModel`/`requestedModel` or falling back to `GetCascadeModelConfigData`). Live Antigravity Desktop conversations remain controllable even when their recorded external workspace folder is empty or no longer exists on disk. |
+| `stop` | `CancelCascadeInvocation` targets the busy conversation. The application stays open. |
+| `answer` | `HandleCascadeUserInteraction` targets the pending interaction. The agent checks the question and offered option again before dispatch. |
+
+`/api/conversation` uses `transport: "agy-desktop"` for these desktop writes. Omitting it
+uses the desktop route when the session advertises that transport. `ask` contains `id`,
+`kind`, `text` and `options`. A choice question takes one displayed option per answer,
+for example `{"action":"answer","ask":"aabbccdd","allow":true,"choice":"choice:1"}` plus
+the operation and session IDs. Indices start at zero. `allow: false` declines or cancels.
+Permission scope `always` requires that the current question offers it. A client querying
+an uncertain write repeats the original ID and arguments with `receipt: true`. The agent
+returns the saved result, or `unknown` if missing, without dispatching another operation.
+
 ### Remote approval scope (1.6.3)
 
 Hook based approval requests include a stable `ask.id` and an optional `ask.options` list. The list contains `once`
@@ -1122,3 +1451,49 @@ Between a computer's page and the app that shows it (`window.RemoteCliNative`):
 - The app opens a computer's page by links: `?tab=<name>` (that computer's part of a tab), `?project=<name>`, and `?tab=together&do=team|handoff|many|chain|schedule`, which opens that sheet of 协作 at once (`?tab=together&newchain=1` is the same as `do=chain`, from the app of 1.6.1).
 
 Windows offers optional Claude Code and Codex CLI installation on first visible startup, and from settings. Only locally accepted, selected tools are installed. It downloads the official Windows PowerShell installers from `https://claude.ai/install.ps1` and `https://chatgpt.com/codex/install.ps1` (redirecting to `downloads.claude.ai` and `releases.openai.com`, respectively), then executes a saved script without elevation. There is no remote install API. Installed tools are detected again; native executables must pass `--version`. Logs are in the computer data folder’s `tool-install` directory. Official instructions: <https://code.claude.com/docs/en/setup> and <https://learn.chatgpt.com/docs/codex/cli>.
+
+## Incremental Overview Sync, Git Review and Session Worktrees
+
+### Overview `rev` long-poll cursor
+
+- `GET /api/terminal` includes a monotonically increasing integer `rev` in every full overview snapshot.
+- Viewers may pass `?rev=<n>&wait=<seconds>` (`wait` clamped to `0..25`). When the relay's current state revision still equals `<n>`, the request is held until a device, terminal or session change increments `rev` or `wait` expires.
+- On timeout with no state change, the relay returns `{"unchanged": true, "rev": <n>, "online": <bool>}` instead of re-serializing the full overview payload.
+
+### First-class Session Worktrees
+
+- Agents advertising `worktree` in `device.features` accept optional `worktree` (`true`, a worktree id, or a branch name), `branch`, and `base_branch` fields on `POST /api/terminal` with `action: "start"`.
+- The computer creates or reuses a dedicated Git worktree for that session (isolated from the main working tree) and reports `worktree` and `branch` on the terminal metadata in overview snapshots.
+- Windows worktree removal (`SafeRemoveWorktree`) unlinks NTFS directory junctions and reparse points before recursive cleanup so shared junction targets (e.g. `node_modules`) are never traversed or deleted.
+
+### Git Review & Checkpoint API (`/api/git`)
+
+Authenticated endpoint `POST /api/git` (requires agent feature `git`) dispatches one-shot held operations (up to 25 seconds) with a caller-generated `id` (`16..32` hex characters), project `dir`, and optional `worktree` id:
+
+| `action` | Request fields | Response |
+| --- | --- | --- |
+| `git_status` | `dir`, optional `worktree` | Lightweight file list without diff bodies: `is_repo`, `branch`, `ahead`, `behind`, `staged`, `unstaged`, `untracked`, `files` (`[{path, status, staged, additions, deletions, binary}]`), `total_additions`, `total_deletions`, `worktrees` |
+| `git_file_diff` | `dir`, `path`, optional `worktree`, `staged`, `context` (`0..20`) | On-demand unified diff bounded to 256 KiB (`patch`, `truncated`, `binary`, `untracked`) |
+| `git_commit` | `dir`, `message`, optional `worktree`, `all`, `files` | Stages requested files (or all) and commits via `git commit -F -` with retry backoff on `.git/index.lock`; returns `commit`, `summary` |
+| `git_push` | `dir`, optional `worktree`, `remote`, `branch` | Pushes current or named branch; returns `output` |
+| `git_worktree_list` | `dir` | Active worktrees for the repository (`[{id, path, branch, head, main}]`) |
+| `git_worktree_apply` | `dir`, `worktree`, optional `squash` | Merges the session worktree branch into the main repository worktree |
+| `git_worktree_remove` | `dir`, `worktree`, optional `force` | Safely removes the session worktree and its branch |
+| `git_checkpoint` | `dir`, optional `worktree`, `label` | Captures the current working tree into a hidden Git ref `refs/remote-ai/checkpoints/<id>` via a scratch `GIT_INDEX_FILE` without modifying the real Git index or stash |
+| `git_branches` | `dir`, optional `worktree` | Lists local Git branches sorted by committer date (`current`, `branches: [{name, head, updated, subject, current}]`) |
+| `git_checkout` | `dir`, `branch`, optional `create`, `worktree` | Switches to an existing branch or creates a new branch (`create: true`) |
+| `git_checkpoints_list` | `dir`, optional `worktree` | Lists saved hidden-ref checkpoints (`checkpoints: [{ref, commit, at, label}]`) |
+| `git_checkpoint_restore` | `dir`, `ref`, optional `worktree` | Restores working tree files from a saved `refs/remote-ai/checkpoints/*` ref |
+| `project_scripts` | `dir`, optional `worktree` | Read-only discovery of runnable scripts from `package.json`, `Makefile`, `Cargo.toml` and `pyproject.toml` |
+
+Windows agents auto-detect installed CLI tools across `claude`, `codex`, `agy`, `gemini`, `opencode`, `cursor` (`cursor-agent` / `agent`), `qoder`, `cline`, `pi`, `kiro` (`kiro-cli` / `kiro`), `copilot`, and `shell`.
+
+### Embedded Console Framing
+
+- Both `relay/server.py` and Android `EmbeddedPages.java` set `X-Frame-Options: SAMEORIGIN` and `Content-Security-Policy: ... frame-ancestors 'self'` so the unified console (`/console/`) can embed same-origin `/terminal/?id=<id>&embed=1` frames inside its persistent LRU terminal drawer while continuing to block cross-origin framing.
+
+## Linux agent collaboration, usage limits, and `ask_ai`
+
+- **Collaboration (`teams`, `teams-v2`, `teams-grouped`, `<tool>-team`)**: `agent-linux/teams.py` and `agent-linux/worktrees.py` run `review`, `lead`, and `compare` tasks on Linux (`teams.json`, mode `0600`), report `device.team_cards` and per-terminal / per-session `team` links, refuse `reopen` for active collaboration members, and close task-owned terminals when a task is removed. Claude Code and Codex members run in structured chat mode and report turn completion directly; OpenCode, Qoder, Cline and Pi members run in PTY terminals and complete a turn when their conversation record goes quiet after growing (`45` seconds), including inside temporary `compare` worktrees. Viewers fall back to the chat trio when no `<tool>-team` flag is advertised.
+- **Usage limits (`quotas`)**: `agent-linux/quotas.py` persists readings in `quotas/<tool>.json` (mode `0600`) from Claude Code `rate_limit_event`, Codex `account/rateLimits/read` and `account/rateLimits/updated` (ignoring empty API-key updates), and `agy -p /usage --output-format json` (with `AGY_CLI_DISABLE_AUTO_UPDATE=true`), forwarding them in `info.quotas` and feeding primary-pool headroom into leader prompts and failover.
+- **Read-only peer consultation (`ask_ai`)**: `agent-linux/peers.py` offers a local `remote_ai` MCP server to structured chats (`ClaudeChat` via `--mcp-config --strict-mcp-config`, `CodexChat` via `mcp_servers.remote_ai.*` overrides) over an owner-only Unix-domain socket bridged by `python3 agent.py --mcp <socket> <token>`. Peer consultations open a read-only structured chat with no MCP server of its own, automatically allow read/search inspection while denying edits/commands, serialize follow-ups per peer, and clean up all peer chats, config files and sockets on exit.

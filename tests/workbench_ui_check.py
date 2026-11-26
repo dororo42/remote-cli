@@ -14,7 +14,8 @@ assert "RECENT = 2" in workbench, "the aggregate recent list must start with two
 assert 'getBoolean("fold-" + section, true)' in workbench, "active and recent sections must start folded"
 assert "kit.title(entry.shownTitle()" in workbench and "kit.title(project.name" in workbench, "aggregate titles must use the multi-line view"
 assert "view.setMaxLines(2)" in kit, "the title view must retain two lines before ellipsis"
-assert "shown = 2" in web and "projectFolds = { active: false, live: false, history: false, ended: false }" in web, "project pages must start compact, the ended terminals folded with the rest"
+assert "TALKS = 16" in workbench, "project drawer must show 16 conversations by default"
+assert "shown = 16" in web and "projectFolds = { active: false, live: false, history: false, ended: false }" in web, "project pages must start with 16 history entries and folded sections"
 assert 'id="p-ended"' in index_html and 'data-fold="ended"' in index_html and 'aria-expanded="false"' in index_html, "历史终端 folds away like 历史对话"
 assert "applyProjectFold('ended')" in web, "the ended fold is applied when the project page is drawn"
 assert ".section-head[data-fold].folded ~ :not(#hidden-history) { display: none; }" in css and "child.hidden = !open" not in web, "folding hides a section's body by style and leaves what draw() shows, the more buttons too, to draw()"
@@ -55,3 +56,36 @@ assert "catch (IllegalStateException" in activity, \
 assert 'if (web == null || !"web".equals(screen)) return; bars(shade);' in activity, \
     "a detached page's late chrome() must not recolour the app's own bars"
 print("Shell robustness guards passed: page health retained, missing bundle degrades, late chrome is screened")
+
+teams_js = (ROOT / "web/teams.js").read_text(encoding="utf-8")
+bridge_js = (ROOT / "web/terminal/bridge.js").read_text(encoding="utf-8")
+assert 'optJSONArray("team_cards")' in workbench and 'optString("team")' in workbench, \
+    "Workbench must parse device.team_cards and child team membership"
+assert 'activity.together(task.url, "team", entry.id)' in workbench and 'activity.together(url, "team", entry.id)' in workbench, \
+    "Workbench team cards must open existing team detail via activity.together"
+java_states = (ROOT / "android/src/io/github/kangwang42/remotecli/AggregateSessions.java").read_text(encoding="utf-8")
+assert 'AggregateSessions.label(kind)' in app_pages and 'case "team-verify": return "领队验收"' in java_states, \
+    "AppPages team rows must display verify phase through the shared 领队验收 label"
+assert "data.device.team_cards" in web and "teamCard(" in web, "Web lists must collapse team members into parent team cards"
+assert "teams-models" in teams_js and "team_models" in teams_js and "teams-effort" in teams_js and "领队验收" in teams_js and "member_sessions" in teams_js and "分工协作" in teams_js and "执行成员" in teams_js, \
+    "Teams UI must support teams-models, teams-effort, unified terminology, verify phase display and member_sessions history fallback"
+assert "do=team&item=" in bridge_js, "Member chat back button must return to the parent team detail"
+print("Collaboration parent card and model UI guards passed")
+motion = (ROOT / "android/src/io/github/kangwang42/remotecli/Motion.java").read_text(encoding="utf-8")
+quotas_java = (ROOT / "android/src/io/github/kangwang42/remotecli/QuotaLines.java").read_text(encoding="utf-8")
+chat_js = (ROOT / "web/chat/chat.js").read_text(encoding="utf-8")
+assert "areAnimatorsEnabled()" in motion and "FlowLineView" in motion, "Native motion helpers must respect animator scale and provide pipeline flow"
+assert "QuotaLines.remaining(" in app_pages and "剩余额度" in app_pages and "barShare(" in quotas_java, "Native quota UI must display remaining percentage and remaining bar share"
+assert "模型与常用参数" in app_pages and "params-btn" in chat_js and "RemoteRestart.paramsPage" in chat_js, "App and chat UI must expose visual model & parameter controls"
+skins_js = (ROOT / "web/terminal/skins.js").read_text(encoding="utf-8")
+chat_css = (ROOT / "web/chat/chat.css").read_text(encoding="utf-8")
+sheet_css = (ROOT / "web/ui/sheet.css").read_text(encoding="utf-8")
+assert "--vv-h" in skins_js and "--vv-top" in skins_js and "--kb-h" in skins_js and "--vv-h" in chat_css and "--kb-h" in sheet_css, "Soft-keyboard visualViewport sync must protect chat, sheets and modals"
+stats_cs = (ROOT / "agent-windows/Stats.cs").read_text(encoding="utf-8")
+stats_store = (ROOT / "android/src/io/github/kangwang42/remotecli/StatsStore.java").read_text(encoding="utf-8")
+stats_charts = (ROOT / "android/src/io/github/kangwang42/remotecli/StatsCharts.java").read_text(encoding="utf-8")
+me_js = (ROOT / "web/me.js").read_text(encoding="utf-8")
+assert "LedgerVersion" in stats_cs and "SaveLedger" in stats_cs and "Agy(" in stats_cs, "Stats.cs must persist continuous ledger and include Antigravity CLI"
+assert "StatsStore" in app_pages and "StatsCharts.DailyBarsView" in app_pages and "remote-ai-stats" in stats_store and "DailyBarsView" in stats_charts, "Android 我的 must cache stats continuously and render native 7-day chart"
+assert "rcli:stats:v2:" in me_js and "token-card" in me_js and "avg-line" in me_js, "Embedded me.js must cache stats and render token breakdown and stacked daily bars"
+print("Remaining quota, native motion, visual parameter, soft-keyboard viewport, and continuous stats guards passed")

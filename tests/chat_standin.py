@@ -9,12 +9,23 @@ command to the background, ends the turn, and goes on by itself when the command
     python chat_standin.py codex app-server
 """
 import json
+import os
 import sys
 import threading
 import time
 import uuid
+from pathlib import Path
 
 out_lock = threading.Lock()
+
+
+def record_standin(env_key, entry):
+    path = os.environ.get(env_key)
+    if not path:
+        return
+    with out_lock:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def put(message):
@@ -33,6 +44,7 @@ def lines():
 
 # ---- Claude Code
 def claude(args):
+    record_standin("STANDIN_MODEL_LOG", args)
     session = args[args.index("--session-id") + 1] if "--session-id" in args else args[args.index("--resume") + 1]
     answers, stop, turns, peer_turns = {}, threading.Event(), [], [0]
 
@@ -89,7 +101,12 @@ def claude(args):
         put({"type": "result", "subtype": "success", "is_error": False, "result": "测试在后台运行，跑完后汇报。", "session_id": session})
         time.sleep(0.8)
         put({"type": "system", "subtype": "task_notification", "task_id": "b1", "status": "completed", "tool_use_id": use})
-        put({"type": "system", "subtype": "background_tasks_changed", "tasks": []})
+        # A live-update watcher remains after the command. The resumed subagent
+        # reports into its waiting tool call and never creates a follow-up turn.
+        put({"type": "system", "subtype": "background_tasks_changed", "tasks": [
+            {"task_id": "watch", "task_type": "local_bash", "ambient": True},
+            {"task_id": "child", "task_type": "local_agent", "awaited": True},
+        ]})
         put({"type": "system", "subtype": "init", "session_id": session, "cwd": ".", "tools": ["Bash"]})
         put({"type": "system", "subtype": "status", "status": "requesting"})
         said("测试全部通过，改了 checkout.js。")
@@ -100,6 +117,12 @@ def claude(args):
         put({"type": "user", "message": {"role": "user", "content": text}, "session_id": session, "uuid": str(uuid.uuid4())})
         if "只读请教" in text or "继续请教" in text:
             return peer_reply(text)
+        if os.environ.get("STANDIN_TEAM_AUTO") and ("【协作任务" in text or "【用户新一轮要求" in text):
+            record_standin("STANDIN_CLAUDE_LOG", {"event": "turn", "args": args, "text": text[:160]})
+            reply = "已完成执行成员子任务并自测通过。"
+            said(reply)
+            put({"type": "result", "subtype": "success", "is_error": False, "result": reply, "session_id": session})
+            return
         if "调用请教" in text:
             return call_peer()
         if "后台" in text:
@@ -158,7 +181,15 @@ def claude(args):
             sub = message["request"].get("subtype")
             if sub == "interrupt":
                 stop.set()
-            put({"type": "control_response", "response": {"subtype": "success", "request_id": message["request_id"], "response": {}}})
+            resp = {}
+            if sub == "initialize":
+                resp = {"models": [
+                    {"value": "default", "resolvedModel": "claude-opus-5-5", "displayName": "Default", "supportsEffort": True, "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"]},
+                    {"value": "opus", "resolvedModel": "claude-opus-5-5", "displayName": "Opus 5.5", "supportsEffort": True, "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"]},
+                    {"value": "sonnet", "resolvedModel": "claude-sonnet-5-5", "displayName": "Sonnet 5.5", "supportsEffort": True, "supportedEffortLevels": ["low", "medium", "high"]},
+                    {"value": "claude-haiku-4-5", "resolvedModel": "claude-haiku-4-5", "displayName": "Haiku 4.5", "supportsEffort": False},
+                ]}
+            put({"type": "control_response", "response": {"subtype": "success", "request_id": message["request_id"], "response": resp}})
         elif kind == "control_response":
             response = message["response"]
             if response["request_id"] in answers:
@@ -166,7 +197,13 @@ def claude(args):
                 answers[response["request_id"]][0].set()
         elif kind == "user":
             content = message["message"]["content"]
-            turns.append(content if isinstance(content, str) else content[0]["text"])
+            # pictures sent with a message come as image blocks beside the words (agent-windows/Attachments.cs)
+            if not isinstance(content, str) and any(block.get("type") == "image" for block in content):
+                record_standin("STANDIN_CLAUDE_LOG", {"event": "images", "count": sum(block.get("type") == "image" for block in content)})
+                for block in content:
+                    if block.get("type") == "image" and block["source"]["media_type"] == "image/png":
+                        record_standin("STANDIN_CLAUDE_LOG", {"image_data": block["source"]["data"]})
+            turns.append(content if isinstance(content, str) else "\n".join(block["text"] for block in content if block.get("type") == "text"))
 
 
 # ---- Codex
@@ -195,6 +232,20 @@ def codex(args):
                 verdict = "已拒绝修改，" if dec == "decline" else "意外允许修改，"
             msg_id = "msg_" + uuid.uuid4().hex[:10]
             reply = f"codex只读回复（sandbox={state['sandbox']}，第 {state['peer_turns']} 轮）：{verdict}{text.splitlines()[-1]}"
+            note("item/started", item={"type": "agentMessage", "id": msg_id, "text": ""}, threadId=state["thread"], turnId=turn_id)
+            note("item/completed", item={"type": "agentMessage", "id": msg_id, "text": reply}, threadId=state["thread"], turnId=turn_id)
+            return ended("completed", None)
+        if os.environ.get("STANDIN_TEAM_AUTO") and ("【协作任务" in text or "【用户新一轮要求" in text):
+            msg_id = "msg_" + uuid.uuid4().hex[:10]
+            if "【协作任务 · 领队验收" in text:
+                reply = "VERIFIED: 运行单元与集成检查全部通过\nDONE: 验收通过并完成任务"
+            elif "【协作任务 · 领队】" in text or "【用户新一轮要求" in text:
+                if "ASSIGN member-1 codex:" in text:
+                    reply = "开始自动组队。\nASSIGN member-1 claude: 实现并自测目标改动"
+                else:
+                    reply = "开始分派。\nASSIGN member-1: 实现并自测目标改动"
+            else:
+                reply = "已完成执行成员子任务。"
             note("item/started", item={"type": "agentMessage", "id": msg_id, "text": ""}, threadId=state["thread"], turnId=turn_id)
             note("item/completed", item={"type": "agentMessage", "id": msg_id, "text": reply}, threadId=state["thread"], turnId=turn_id)
             return ended("completed", None)
@@ -259,15 +310,32 @@ def codex(args):
             continue
         if method == "initialize":
             put({"id": number, "result": {"userAgent": "stand-in", "platformOs": "windows"}})
+        elif method == "model/list":
+            put({"id": number, "result": {"data": [
+                {"id": "gpt-6.2-sol", "model": "gpt-6.2-sol", "displayName": "GPT-6.2 Sol", "hidden": False, "isDefault": True, "defaultReasoningEffort": "medium",
+                 "supportedReasoningEfforts": [{"reasoningEffort": "low"}, {"reasoningEffort": "medium"}, {"reasoningEffort": "high"}, {"reasoningEffort": "xhigh"}, {"reasoningEffort": "ultra"}]},
+                {"id": "gpt-6.2-astra", "model": "gpt-6.2-astra", "displayName": "GPT-6.2 Astra", "hidden": False, "isDefault": False, "defaultReasoningEffort": "high",
+                 "supportedReasoningEfforts": [{"reasoningEffort": "medium"}, {"reasoningEffort": "high"}, {"reasoningEffort": "xhigh"}]},
+                {"id": "gpt-5.4", "model": "gpt-5.4", "displayName": "GPT-5.4", "hidden": False, "isDefault": False, "defaultReasoningEffort": "medium",
+                 "supportedReasoningEfforts": [{"reasoningEffort": "low"}, {"reasoningEffort": "medium"}, {"reasoningEffort": "high"}]},
+                {"id": "hidden-model", "model": "hidden-model", "displayName": "Hidden", "hidden": True, "supportedReasoningEfforts": [{"reasoningEffort": "high"}]},
+            ]}})
         elif method in ("thread/start", "thread/resume"):
             state["sandbox"] = params.get("sandbox") or ""
             state["thread"] = params.get("threadId") or "0199dddd-eeee-7fff-8000-%012d" % int(time.time() * 1000 % 10 ** 12)
-            put({"id": number, "result": {"thread": {"id": state["thread"], "cwd": params.get("cwd")}}})
+            cfg = params.get("config") if isinstance(params.get("config"), dict) else {}
+            record_standin("STANDIN_CODEX_LOG", {"event": method, "model": params.get("model") or "", "config_effort": cfg.get("model_reasoning_effort") or ""})
+            put({"id": number, "result": {"thread": {"id": state["thread"], "cwd": params.get("cwd")}, "model": params.get("model") or "gpt-6.2-sol", "reasoningEffort": cfg.get("model_reasoning_effort") or "medium"}})
             note("thread/started", thread={"id": state["thread"]})
         elif method == "turn/start":
             state["turn"] = "turn-" + uuid.uuid4().hex[:8]
+            # pictures sent with a message come as image items beside the words (agent-windows/Attachments.cs)
+            words = "\n".join(item["text"] for item in params["input"] if item.get("type") == "text")
+            record_standin("STANDIN_CODEX_LOG", {"event": "turn/start", "model": params.get("model") or "", "effort": params.get("effort") or "", "text": words[:160]})
+            if any(item.get("type") != "text" for item in params["input"]):
+                record_standin("STANDIN_CODEX_LOG", {"event": "images", "count": sum(item.get("type") != "text" for item in params["input"])})
             put({"id": number, "result": {"turn": {"id": state["turn"], "status": "inProgress", "items": []}}})
-            threading.Thread(target=turn, args=(params["input"][0]["text"], params.get("clientUserMessageId")), daemon=True).start()
+            threading.Thread(target=turn, args=(words, params.get("clientUserMessageId")), daemon=True).start()
         elif method == "turn/steer":
             if params.get("expectedTurnId") != state["turn"] or not state["turn"]:
                 put({"id": number, "error": {"code": -32600, "message": "expected active turn id"}})
@@ -282,15 +350,59 @@ def codex(args):
             put({"id": number, "result": {}})
 
 
-# ---- Antigravity CLI's ACP server (`agy acp`), in the shapes recorded from agy 1.5.12
+def organize():
+    """One structured turn which the HTTP integration test releases after sending an edit."""
+    gate = Path(os.environ["STANDIN_ORGANIZE_GATE"])
+    thread = str(uuid.uuid4())
+    for message in lines():
+        number, method, params = message.get("id"), message.get("method"), message.get("params") or {}
+        if number is None:
+            continue
+        if method == "model/list":
+            result = {"data": [{"id": "gpt-6-luna", "displayName": "GPT-6 Luna"}]}
+        elif method == "config/read":
+            result = {"config": {}}
+        elif method == "thread/start":
+            assert params["ephemeral"] is True
+            result = {"thread": {"id": thread, "path": None}, "model": params["model"]}
+        elif method == "turn/start":
+            assert "follow_up" in params["outputSchema"]["required"]
+            put({"id": number, "result": {"turn": {"id": "turn-organize"}}})
+            gate.with_suffix(".started").touch()
+            deadline = time.monotonic() + 45
+            while not gate.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert gate.exists(), "integration test did not release the model"
+            text = json.dumps({"title": "Seed library", "summary": "Agree on a seed collection date.",
+                               "tags": ["seeds"], "follow_up": True})
+            put({"method": "thread/tokenUsage/updated", "params": {"threadId": thread, "turnId": "turn-organize",
+                "tokenUsage": {"total": {"totalTokens": 1234, "inputTokens": 1200, "outputTokens": 34}}}})
+            put({"method": "item/completed", "params": {"threadId": thread, "turnId": "turn-organize",
+                "item": {"type": "agentMessage", "text": text}}})
+            put({"method": "turn/completed", "params": {"threadId": thread,
+                "turn": {"id": "turn-organize", "status": "completed"}}})
+            continue
+        else:
+            result = {}
+        put({"id": number, "result": result})
+
+
+# ---- Antigravity CLI's ACP server (`agy acp`), in the shapes recorded from agy 1.5.12 (its options from 1.5.13)
 def agy(args):
     state = {"session": "", "next": 0, "peer_turns": 0, "mcp": []}
     waiting, stop = {}, threading.Event()
+    options = [{"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "gemini-4-neon",
+                "options": [{"value": "gemini-4-neon", "name": "Gemini 4 Neon"}, {"value": "gemini-4-argon", "name": "Gemini 4 Argon"}]},
+               {"id": "thought_level", "name": "Thinking Level", "category": "thought_level", "type": "select", "currentValue": "medium",
+                "options": [{"value": v, "name": v} for v in ("low", "medium", "high", "xhigh")]}]
 
     def update(**what):
         put({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": state["session"], "update": what}})
 
     def turn(number, text):
+        if os.environ.get("STANDIN_TEAM_AUTO") and ("【协作任务" in text or "【用户新一轮要求" in text):
+            update(sessionUpdate="agent_message_chunk", content={"type": "text", "text": "已完成执行成员子任务并自测通过。"})
+            return ended(number, "end_turn", None)
         if "只读请教" in text or "继续请教" in text:
             state["peer_turns"] += 1
             extra = ""
@@ -370,17 +482,35 @@ def agy(args):
             waiting[number][0].set()
             continue
         if method == "initialize":
-            put({"jsonrpc": "2.0", "id": number, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}})
+            capabilities = {"loadSession": True}
+            if os.environ.get("STANDIN_AGY_IMAGE"):
+                capabilities["promptCapabilities"] = {"image": True}
+            put({"jsonrpc": "2.0", "id": number, "result": {"protocolVersion": 1, "agentCapabilities": capabilities}})
         elif method == "session/new":
             state["mcp"] = params.get("mcpServers") or []
             state["session"] = str(uuid.uuid4())
-            put({"jsonrpc": "2.0", "id": number, "result": {"sessionId": state["session"]}})
+            result = {"sessionId": state["session"]}
+            if os.environ.get("STANDIN_AGY_OPTIONS"):        # agy 1.5.13 names its models and thinking levels as options
+                result["configOptions"] = options
+            put({"jsonrpc": "2.0", "id": number, "result": result})
+        elif method == "session/set_config_option" and any(o["id"] == params.get("configId") for o in options):
+            option = next(o for o in options if o["id"] == params["configId"])
+            if params.get("value") not in [v["value"] for v in option["options"]]:
+                put({"jsonrpc": "2.0", "id": number, "error": {"code": -32602, "message": "unknown value"}})
+                continue
+            option["currentValue"] = params["value"]
+            record_standin("STANDIN_AGY_RECORD", {"set": params["configId"], "value": params["value"]})
+            put({"jsonrpc": "2.0", "id": number, "result": {"configOptions": options}})
         elif method == "session/load":
             state["mcp"] = params.get("mcpServers") or []
             state["session"] = params["sessionId"]
             update(sessionUpdate="user_message_chunk", content={"type": "text", "text": "replayed, not shown again"})
             put({"jsonrpc": "2.0", "id": number, "result": {}})
         elif method == "session/prompt":
+            record_standin("STANDIN_AGY_RECORD", {"prompt": params["prompt"][0]["text"][:80]})
+            for block in params["prompt"]:
+                if block.get("type") == "image" and block["mimeType"] == "image/png":
+                    record_standin("STANDIN_AGY_RECORD", {"image_data": block["data"]})
             threading.Thread(target=turn, args=(number, params["prompt"][0]["text"]), daemon=True).start()
         elif method == "session/cancel":
             stop.set()
@@ -395,5 +525,7 @@ if __name__ == "__main__":
         claude(rest)
     elif tool == "agy":
         agy(rest)
+    elif tool == "organize":
+        organize()
     else:
         codex(rest)

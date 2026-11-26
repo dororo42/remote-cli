@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Pipes;
 using System.Linq;
 using System.Reflection;
 using System.Text;
@@ -24,10 +25,34 @@ public static class CodexDesktopControlCheck {
         public void Dispose() { }
     }
     static object Field(object value, string name) { return value.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic).GetValue(value); }
+    sealed class AgyHub {
+        public int Sends, Stops, Answers;
+        public bool Asking;
+        public string FolderOverride = "";
+        public AntigravityDesktopClient Client(string root) {
+            string dir = Directory.CreateDirectory(Path.Combine(root, "daemon")).FullName;
+            File.WriteAllText(Path.Combine(dir, "hub_test.json"), Json.Serialize(new { pid = 1, httpPort = 1, csrfToken = Guid.NewGuid().ToString("N") }));
+            return new AntigravityDesktopClient(root, pid => pid == 1, (endpoint, method, body, timeout) => {
+                if (method == "SendUserCascadeMessage") Sends++;
+                if (method == "CancelCascadeInvocation") Stops++;
+                if (method == "HandleCascadeUserInteraction") { Answers++; Asking = false; }
+                if (method != "GetCascadeTrajectory") return new Dictionary<string, object>();
+                string folder = FolderOverride.Length > 0 ? FolderOverride : root;
+                var step = new { type = "CORTEX_STEP_TYPE_ASK_QUESTION", status = "CORTEX_STEP_STATUS_WAITING",
+                    askQuestion = new { questions = new[] { new { id = "q", options = new[] { new { id = "a" }, new { id = "b" } } } } } };
+                return Json.Deserialize<Dictionary<string, object>>(Json.Serialize(new {
+                    status = "CASCADE_RUN_STATUS_RUNNING", trajectory = new { trajectoryId = Session,
+                        steps = Asking ? new object[] { step } : new object[0], metadata = new { workspaceUris = new[] { AntigravityDesktopClient.ToFileUri(folder) } } }
+                }));
+            });
+        }
+    }
     static void Agent(string root) {
         Directory.CreateDirectory(root);
         var conversation = new Conversation { Folder = root };
-        var agent = new TerminalAgent(root, () => conversation);
+        var hub = new AgyHub();
+        var agy = hub.Client(root);
+        var agent = new TerminalAgent(root, () => conversation, agy);
         var sessions = (List<TerminalAgent.SessionInfo>)Field(agent, "sessions");
         sessions.Add(new TerminalAgent.SessionInfo { Id = Session, Tool = "codex", Dir = "demo", ControlFolder = root, Live = true });
         var prefs = new Dictionary<string, object> { { "RemoteEnabled", true }, { "RemoteDirs", new[] { "demo=" + root } } };
@@ -49,6 +74,30 @@ public static class CodexDesktopControlCheck {
             { "dir", "demo" }, { "transport", "codex-desktop" }, { "text", "test" }, { "at", (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds }
         };
         var first = request(); Require((string)Object(run(first)["result"])["status"] == "accepted" && conversation.Sends == 1, "agent native dispatch");
+        sessions.Add(new TerminalAgent.SessionInfo { Id = Session, Tool = "agy", Dir = "demo", ControlFolder = root, Kind = Ways.AgyDesktop, Live = true });
+        var app = request(); app.Remove("transport"); app["tool"] = "agy";
+        Require("accepted".Equals(Object(run(app)["result"])["status"]) && hub.Sends == 1, "default desktop send");
+        app["receipt"] = true; app["transport"] = Ways.AgyApp;
+        Require("accepted".Equals(Object(run(app)["result"])["status"]) && hub.Sends == 1, "explicit receipt for default route");
+        app["id"] = Guid.NewGuid().ToString("N"); app["action"] = "session_stop"; app.Remove("text"); app.Remove("receipt");
+        Require("confirmed".Equals(Object(run(app)["result"])["status"]) && hub.Stops == 1, "stop targets desktop invocation");
+        hub.Asking = true;
+        app["id"] = Guid.NewGuid().ToString("N"); app["action"] = "session_answer"; app["allow"] = true;
+        app["ask"] = agy.Inspect(Session).AskId; app["choice"] = "choice:2";
+        Require(((string)run(app)["error"]).Length > 0 && hub.Answers == 0, "stale choice refused before dispatch");
+        app["id"] = Guid.NewGuid().ToString("N"); app["choice"] = "choice:1";
+        Require("accepted".Equals(Object(run(app)["result"])["status"]) && hub.Answers == 1, "agent answers current question");
+        app["receipt"] = true;
+        Require("accepted".Equals(Object(run(app)["result"])["status"]) && hub.Answers == 1, "answered question receipt after resolution");
+        // Live Antigravity Desktop conversation whose external workspace folder no longer exists on disk remains controllable.
+        string goneWorkspace = Path.Combine(root, "gone-workspace");
+        hub.FolderOverride = goneWorkspace;
+        sessions[1].Dir = ""; sessions[1].Folder = goneWorkspace; sessions[1].ControlFolder = goneWorkspace;
+        var goneSend = request(); goneSend["tool"] = "agy"; goneSend["dir"] = ""; goneSend["transport"] = Ways.AgyApp;
+        Require("accepted".Equals(Object(run(goneSend)["result"])["status"]) && hub.Sends == 2, "live Antigravity Desktop session with deleted external folder must still accept messages");
+        hub.FolderOverride = "";
+        sessions.RemoveAt(1);
+        Console.WriteLine("Antigravity agent: default send, explicit receipt, stop, choice validation, answer replay and deleted-folder send passed");
         first["receipt"] = true; run(first); Require(conversation.Sends == 1, "agent queries durable result");
         first["text"] = "changed"; Require(((string)run(first)["error"]).Length > 0 && conversation.Sends == 1, "completed id cannot mask changed payload");
         var missing = request(); missing["dir"] = "other"; Require(((string)run(missing)["error"]).Length > 0, "native project allowlist");
@@ -213,7 +262,29 @@ public static class CodexDesktopControlCheck {
         public override long Length { get { throw new NotSupportedException(); } } public override long Position { get { throw new NotSupportedException(); } set { throw new NotSupportedException(); } }
         public override void Flush() {} public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); } public override void SetLength(long length) { throw new NotSupportedException(); }
     }
+    static void RouterIdentity() {
+        const string installed = @"C:\Program Files\WindowsApps\OpenAI.Codex_26.1117.4957.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe";
+        Require(CodexDesktopControl.IsSupportedExecutable("chatgpt", installed), "current router identity");
+        Require(CodexDesktopControl.IsSupportedExecutable("ChatGPT", installed.Replace(@"C:\Program Files", "D:").Replace("26.1117.4957.0", "26.1007.2314.0")), "oldest supported router on a secondary drive");
+        foreach (string invalid in new[] { installed.Replace("26.1117.4957.0", "26.1007.2313.9"),
+            installed.Replace("26.1117.4957.0", "26.1117.4957.0.1"), installed.Replace("2p2nqsd0c76g0", "other"),
+            installed.Replace("x64", "x86"), installed.Replace("ChatGPT.exe", "helper.exe"), installed.Replace("Program Files", "Temp") })
+            Require(!CodexDesktopControl.IsSupportedExecutable("ChatGPT", invalid), "invalid router executable: " + invalid);
+        Require(!CodexDesktopControl.IsSupportedExecutable("codex", installed), "wrong router process name");
+
+        string name = "remote-ai-router-check-" + Guid.NewGuid().ToString("N"), path = @"\\.\pipe\" + name;
+        Require(CodexDesktopControl.PipeMissing(path), "missing router detected");
+        using (var server = new NamedPipeServerStream(name))
+        using (var client = new NamedPipeClientStream(".", name, PipeDirection.InOut)) {
+            Require(!CodexDesktopControl.PipeMissing(path), "idle listener exists");
+            client.Connect(1000);
+            server.WaitForConnection();
+            Require(!CodexDesktopControl.PipeMissing(path), "occupied listener is not missing");
+        }
+        Console.WriteLine("Codex router: package versions, process identity, absent and busy pipes passed");
+    }
     public static void Run(string root) {
+        RouterIdentity();
         var peer = new Peer();
         using (var control = new CodexDesktopControl(peer, 1000)) {
             var state = control.Inspect(Session); Require(CodexDesktopControl.Folder(state) == @"E:\中文项目" && CodexDesktopControl.Ready(state) && CodexDesktopControl.CompletionReady(state), "fragmented UTF8 snapshot");

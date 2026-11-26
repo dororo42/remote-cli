@@ -7,9 +7,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * How much of each tool's usage limits is used, as the computers tell it (device.quotas, docs/PROTOCOL.md): the
- * limits are the account's, not a computer's, so of what several computers tell the newest is shown for each tool.
- * The words are those of the computer's own page (web/me.js).
+ * How much of each tool's usage limits remains, calculated from what the computers report as used
+ * (device.quotas, docs/PROTOCOL.md): the limits are the account's, not a computer's, so of what several
+ * computers tell the newest is shown for each tool. The words match the computer's own page (web/me.js).
  */
 final class QuotaLines {
     static final class Window {
@@ -18,8 +18,12 @@ final class QuotaLines {
         Window(String name, double used, long resets, String group) { this.name = name; this.used = used; this.resets = resets; this.group = group == null ? "" : group.trim(); }
     }
     static final class Reading {
-        final String tool, why; final long at; final List<Window> windows;
-        Reading(String tool, long at, String why, List<Window> windows) { this.tool = tool; this.at = at; this.why = why == null ? "" : why; this.windows = windows; }
+        final String tool, why, billingType, balance; final long at; final List<Window> windows;
+        Reading(String tool, long at, String why, List<Window> windows) { this(tool, at, why, windows, "", ""); }
+        Reading(String tool, long at, String why, List<Window> windows, String billingType, String balance) {
+            this.tool = tool; this.at = at; this.why = why == null ? "" : why; this.windows = windows;
+            this.billingType = billingType; this.balance = balance;
+        }
     }
     private static final String[] ORDER = {"claude", "codex", "agy"};
 
@@ -36,7 +40,9 @@ final class QuotaLines {
             if (one == null) continue;
             List<Window> open = new ArrayList<>();
             for (Window w : one.windows) if (w.resets == 0 || w.resets > nowSeconds) open.add(w);
-            if (!open.isEmpty() || !one.why.isEmpty()) shown.add(new Reading(one.tool, one.at, one.why, Collections.unmodifiableList(open)));
+            if (!open.isEmpty() || !one.why.isEmpty() || !one.billingType.isEmpty()) {
+                shown.add(new Reading(one.tool, one.at, one.why, Collections.unmodifiableList(open), one.billingType, one.balance));
+            }
         }
         return shown;
     }
@@ -72,15 +78,36 @@ final class QuotaLines {
         return name;
     }
     static String label(String tool, Window w) { return (w.group.isEmpty() ? tool(tool) : w.group) + " · " + window(w.name); }
-    /** "38% · 2 小时后重置" */
-    static String detail(Window w, long nowSeconds) {
-        String used = Math.round(w.used) + "%";
-        if (w.resets == 0) return used;
-        long minutes = Math.round((w.resets - nowSeconds) / 60.0);
-        if (minutes <= 0) return used + " · 已重置";
-        return used + " · " + (minutes < 60 ? minutes + " 分钟" : minutes < 2880 ? Math.round(minutes / 60.0) + " 小时" : Math.round(minutes / 1440.0) + " 天") + "后重置";
+    /** Remaining quota percentage clamped to [0, 100], converted from the reported used share. */
+    static double remaining(double used) {
+        if (Double.isNaN(used)) return 0;
+        return Math.max(0.0, Math.min(100.0, 100.0 - used));
     }
-    static boolean high(Window w) { return w.used >= 90; }
+    /** Visual fill share for the remaining bar: 0 when exhausted, otherwise at least 2% so small remainders stay visible. */
+    static float barShare(double used) {
+        double left = remaining(used);
+        return left <= 0 ? 0f : (float) Math.max(2.0, Math.min(100.0, left));
+    }
+    /** "剩余 62% · 2 小时后重置" */
+    static String detail(Window w, long nowSeconds) {
+        String left = "剩余 " + Math.round(remaining(w.used)) + "%";
+        if (w.resets == 0) return left;
+        long minutes = Math.round((w.resets - nowSeconds) / 60.0);
+        if (minutes <= 0) return left + " · 已重置";
+        return left + " · " + (minutes < 60 ? minutes + " 分钟" : minutes < 2880 ? Math.round(minutes / 60.0) + " 小时" : Math.round(minutes / 1440.0) + " 天") + "后重置";
+    }
+    /** Newest reading timestamp across all displayed tools (0 if empty). */
+    static long newestAt(List<Reading> shown) {
+        long at = 0;
+        for (Reading one : shown) if (one.at > at) at = one.at;
+        return at;
+    }
+    enum Level { NORMAL, ELEVATED, HIGH }
+    static Level level(double used) {
+        if (used >= 80) return Level.HIGH;
+        return used > 50 ? Level.ELEVATED : Level.NORMAL;
+    }
+    static boolean high(Window w) { return level(w.used) == Level.HIGH; }
 
     private QuotaLines() { }
 }

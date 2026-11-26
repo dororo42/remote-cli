@@ -42,10 +42,13 @@ internal static class ToolInstaller {
             WorkingDirectory = directory
         };
         using (var process = Process.Start(start)) {
-            Task<string> output = process.StandardOutput.ReadToEndAsync(), error = process.StandardError.ReadToEndAsync();
+            var outBuf = new MemoryStream();
+            var errBuf = new MemoryStream();
+            Task copyOut = process.StandardOutput.BaseStream.CopyToAsync(outBuf), copyErr = process.StandardError.BaseStream.CopyToAsync(errBuf);
             bool ended = await Task.Run(() => process.WaitForExit(600000));
-            if (!ended) { try { process.Kill(); } catch (InvalidOperationException) { } throw new IOException("安装超过 10 分钟，请检查网络后重试"); }
-            string log = await output + Environment.NewLine + await error;
+            if (!ended) { ProcessText.KillProcessTree(process.Id, 5000); throw new IOException("安装超过 10 分钟，请检查网络后重试"); }
+            await Task.WhenAll(copyOut, copyErr);
+            string log = ProcessText.DecodeProcessOutput(outBuf.ToArray()) + Environment.NewLine + ProcessText.DecodeProcessOutput(errBuf.ToArray());
             File.WriteAllText(Path.Combine(directory, tool + "-install.log"), log, new UTF8Encoding(true));
             if (process.ExitCode != 0) throw new IOException("安装程序退出码 " + process.ExitCode + "，可打开安装记录查看原因");
         }
@@ -54,7 +57,7 @@ internal static class ToolInstaller {
         if (Path.GetExtension(found).Equals(".exe", StringComparison.OrdinalIgnoreCase)) {
             using (var check = Process.Start(new ProcessStartInfo(found, "--version") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true })) {
                 var output = check.StandardOutput.ReadToEndAsync(); var error = check.StandardError.ReadToEndAsync();
-                if (!await Task.Run(() => check.WaitForExit(15000))) { try { check.Kill(); } catch (InvalidOperationException) { } throw new IOException("工具安装后没有响应版本检查"); }
+                if (!await Task.Run(() => check.WaitForExit(15000))) { ProcessText.KillProcessTree(check.Id, 3000); throw new IOException("工具安装后没有响应版本检查"); }
                 await output; await error;
                 if (check.ExitCode != 0) throw new IOException("工具安装后未通过版本检查，请查看安装记录");
             }
@@ -63,6 +66,7 @@ internal static class ToolInstaller {
     }
     internal static void Show(Form owner, string dataDir) {
         using (var dialog = new Form { Text = "安装终端工具（可选）", Width = 510, Height = 355, StartPosition = FormStartPosition.CenterParent, MinimizeBox = false, MaximizeBox = false, FormBorderStyle = FormBorderStyle.FixedDialog }) {
+            Theme.ApplyIcon(dialog);
             var intro = new Label { Left = 20, Top = 18, Width = 450, Height = 65, Text = "可选安装 Claude Code 和 Codex 终端工具。接受后会联网下载并运行各自的官方安装程序，安装到当前用户目录。安装后需自行登录账号，使用费用由对应服务收取。" };
             var claude = new CheckBox { Left = 20, Top = 88, Width = 450, Text = "Claude Code（claude.ai）", Checked = TerminalAgent.FindTool("claude") == null };
             var codex = new CheckBox { Left = 20, Top = 118, Width = 450, Text = "Codex（chatgpt.com）", Checked = TerminalAgent.FindTool("codex") == null };

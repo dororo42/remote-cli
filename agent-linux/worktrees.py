@@ -8,7 +8,6 @@ worktree of the team is removed. The main folder is left untouched when a confli
 """
 import os
 import re
-import secrets
 import shutil
 import subprocess
 import tempfile
@@ -21,15 +20,21 @@ class OpError(Exception):
     """What the phone is told, in its own words."""
 
 
-def _run_git(folder, args, timeout=20):
-    """Runs one git command in `folder`; a list of words, so no quoting decides what a path means."""
+def _run_git_bytes(folder, args, timeout=20):
+    """Runs one git command in `folder`, returning raw stdout bytes so patches never lose data."""
     try:
         done = subprocess.run(["git", "-C", folder] + args, capture_output=True, timeout=timeout)
-        return done.returncode, done.stdout.decode("utf-8", "replace"), done.stderr.decode("utf-8", "replace").strip()
+        return done.returncode, done.stdout, done.stderr.decode("utf-8", "replace").strip()
     except FileNotFoundError:
-        return -1, "", "电脑上未找到 git 命令"
+        return -1, b"", "电脑上未找到 git 命令"
     except subprocess.TimeoutExpired:
-        return -1, "", "git 命令超时"
+        return -1, b"", "git 命令超时"
+
+
+def _run_git(folder, args, timeout=20):
+    """Runs one git command in `folder`; a list of words, so no quoting decides what a path means."""
+    code, out, err = _run_git_bytes(folder, args, timeout=timeout)
+    return code, out.decode("utf-8", "replace"), err
 
 
 def _try_delete_dir(path):
@@ -40,7 +45,15 @@ def _try_delete_dir(path):
 
 class Worktrees:
     def __init__(self, root_dir):
-        self.root_dir = root_dir
+        self.root_dir = os.path.abspath(root_dir)
+
+    def contains(self, folder):
+        """Whether `folder` lies inside this worktree root (for checking terminal working dirs)."""
+        if not folder:
+            return False
+        real_root = os.path.realpath(self.root_dir)
+        real_path = os.path.realpath(folder)
+        return real_path != real_root and real_path.startswith(real_root.rstrip(os.sep) + os.sep)
 
     def create(self, repo_dir, team_id, tool):
         """Creates an isolated detached-HEAD worktree for one candidate tool of a compare task."""
@@ -136,7 +149,7 @@ class Worktrees:
         code, _, err = _run_git(worktree_path, ["add", "-A"], timeout=30)
         if code != 0:
             raise OpError("未能整理候选工作区的改动：" + err)
-        code, patch, err = _run_git(worktree_path, ["-c", "core.quotepath=false", "diff", "--cached", "--binary", target], timeout=30)
+        code, patch, err = _run_git_bytes(worktree_path, ["-c", "core.quotepath=false", "diff", "--cached", "--binary", target], timeout=30)
         if code != 0:
             raise OpError("未能生成候选改动补丁：" + err)
         if not patch:
@@ -145,7 +158,7 @@ class Worktrees:
         os.makedirs(self.root_dir, exist_ok=True)
         handle, patch_file = tempfile.mkstemp(prefix="apply-", suffix=".patch", dir=self.root_dir)
         with os.fdopen(handle, "wb") as stream:
-            stream.write(patch.encode("utf-8"))
+            stream.write(patch)
         try:
             code, _, err = _run_git(repo_dir, ["apply", "--check", patch_file], timeout=30)
             if code != 0:
@@ -167,10 +180,10 @@ class Worktrees:
         team_folder = os.path.join(self.root_dir, team_id)
         if os.path.isdir(team_folder):
             for sub in os.listdir(team_folder):
-                sub = os.path.join(team_folder, sub)
+                sub_path = os.path.join(team_folder, sub)
                 if repo_dir and os.path.isdir(repo_dir):
-                    _run_git(repo_dir, ["worktree", "remove", "--force", sub], timeout=15)
-                _try_delete_dir(sub)
+                    _run_git(repo_dir, ["worktree", "remove", "--force", sub_path], timeout=15)
+                _try_delete_dir(sub_path)
             _try_delete_dir(team_folder)
         if repo_dir and os.path.isdir(repo_dir):
             _run_git(repo_dir, ["worktree", "prune"], timeout=10)
@@ -180,7 +193,7 @@ def changes_in(folder):
     """git status and diff in a working directory (empty string if not a repository or clean)."""
     if not folder or not os.path.isdir(folder):
         return ""
-    code, files, _ = _run_git(folder, ["status", "--porcelain", "--untracked-files=all"], timeout=15)
+    code, files, _ = _run_git(folder, ["-c", "core.quotepath=false", "status", "--porcelain", "--untracked-files=all"], timeout=15)
     if code != 0 or not files.strip():
         return ""
     code, diff, _ = _run_git(folder, ["-c", "core.quotepath=false", "diff", "HEAD", "--no-color"], timeout=15)

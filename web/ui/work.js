@@ -112,29 +112,51 @@
     }
     // Reads the computer's list once more, for a page that was opened before it changed.
     async fresh() { try { await this.o.reload(); } catch (error) { /* the last list stays */ } }
+    // The collaboration task a phone's terminal is a member of, and its role there: { team, role, tool } or null.
+    async member(terminal) {
+      const listed = ((this.data || {}).terminals || []).find(t => t.id === terminal);
+      if (!terminal || !listed || !listed.team || !this.has('teams-v2')) return null;
+      const team = ((await this.work('teams')).teams || []).find(t => t.id === listed.team);
+      const role = team && Object.keys(team.members || {}).find(r => team.members[r] === terminal);
+      if (!role || !['running', 'paused', 'done', 'stopped'].includes(team.state)) return null;
+      return { team, role, tool: listed.tool };
+    }
+    // The AIs a member's work can be handed to in its task: those advertised via `<tool>-team`, falling back to chat tools.
+    teamTools() {
+      const device = (this.data || {}).device || {};
+      const feats = device.features || [];
+      const flagged = (device.tools || []).filter(tool => feats.includes(tool + '-team'));
+      return flagged.length ? flagged : NEW_TOOLS.filter(tool => (device.tools || []).includes(tool) && this.has('chat') && (tool !== 'agy' || this.has('chat-agy')));
+    }
 
     // ================= handing a conversation over to another AI
     /* from: { id (the conversation), tool, title, dir, terminal (the phone's that runs it, if one does) } */
     handoff(sheetOrNull, from) {
       const work = this;
-      const state = { to: '', note: '', loaded: false };
+      const state = { to: '', note: '', loaded: false, member: undefined };
       const page = {
         title: '交给另一个 AI',
         build(p) {
-          if (!state.loaded) { state.loaded = true; work.fresh().then(p.refresh); }
+          if (!state.loaded) {
+            state.loaded = true;
+            work.fresh().then(() => work.member(from.terminal)).then(member => { state.member = member; }, () => { state.member = null; }).then(p.refresh);
+          }
+          // a member of a collaboration task is handed over within it: the task goes on with the AI that takes over
+          if (state.member) { work.teamHandoffPage(state.member, state).build(p); return; }
+          if (from.terminal && state.member === undefined) { p.body.append(ui.loading(), ui.loading()); return; }
           const data = work.data || { device: {} }, device = data.device || {};
           const listed = work.find(from.id);
           const takers = work.list().filter(c => c.open && c.id !== from.id && work.sayable(c));
           // a new conversation of a tool the computer has, in the same project: begun with the hand-over as its first message
           const fresh = from.dir && work.has('chat') ? NEW_TOOLS.filter(tool => (device.tools || []).includes(tool) && (tool !== 'agy' || work.has('chat-agy'))) : [];
-          // how much of its limits each tool has used, where the computer knows it (primary pool first)
-          const used = tool => {
+          // how much of its limits each tool has left, where the computer knows it (primary pool first)
+          const remaining = tool => {
             const q = (device.quotas || []).find(one => one.tool === tool);
             const all = (q && q.windows) || [], main = all.filter(w => !w.group), pool = main.length ? main : all;
-            const most = pool.length ? Math.max(...pool.map(w => w.used)) : null;
-            return most === null ? '' : ' · 额度已用 ' + Math.round(most) + '%';
+            const least = pool.length ? Math.min(...pool.map(w => Math.max(0, Math.min(100, 100 - (Number(w.used) || 0))))) : null;
+            return least === null ? '' : ' · 剩余额度 ' + Math.round(least) + '%';
           };
-          const offers = fresh.map(tool => ({ key: 'new:' + tool, tool, label: '新对话 · ' + TOOLS[tool], detail: '在 ' + from.dir + ' 中开始' + (tool === from.tool ? ' · 同一工具，重新开始' : '') + used(tool), tint: tool, icon: tool }))
+          const offers = fresh.map(tool => ({ key: 'new:' + tool, tool, label: '新对话 · ' + TOOLS[tool], detail: '在 ' + from.dir + ' 中开始' + (tool === from.tool ? ' · 同一工具，重新开始' : '') + remaining(tool), tint: tool, icon: tool }))
             .concat(takers.map(c => ({ key: c.id, c, label: c.title || TOOLS[c.tool], detail: c.where + (c.place ? ' · ' + c.place : ''), tint: tint(c.tool), icon: ['claude', 'codex', 'agy'].includes(c.tool) ? c.tool : 'chat' })));
           // another tool before the one it was in: the usual reason is that one has run out
           offers.sort((a, b) => (a.tool === from.tool) - (b.tool === from.tool));
@@ -178,6 +200,33 @@
         }
       };
       return sheetOrNull ? sheetOrNull.push(page) : window.RemoteSheet.open(page);
+    }
+    // A team member's work given to another AI in the same task (`team_swap`): it takes over with the task's record and
+    // the folder's changes, and the conversation that takes over is shown in place of this one.
+    teamHandoffPage(member, state) {
+      const work = this, { team, role } = member;
+      return { build(p) {
+        const tools = work.teamTools().filter(tool => tool !== member.tool);
+        const named = role === 'leader' ? '领队' : /^member-\d$/.test(role) ? '成员 ' + role.slice(7) : role === 'writer' ? '写手' : role === 'reviewer' ? '审查' : '成员';
+        p.body.append(ui.who({ icon: mark(member.tool), tint: tint(member.tool), title: team.goal || '协作任务', line: '协作 · ' + named + ' · ' + (TOOLS[member.tool] || member.tool) }));
+        if (!['running', 'paused'].includes(team.state)) { p.body.append(ui.summary('协作任务已结束，在协作页发新要求后再换 AI', 'bad', 'hand')); return; }
+        if (!tools.length) { p.body.append(ui.summary('电脑上没有可以接手的其它 AI', 'bad', 'hand')); return; }
+        if (!tools.includes(state.to)) state.to = tools[0];
+        p.body.append(ui.section('在协作中交给', ui.group(...tools.map(tool => ui.row({ icon: tool, tint: tint(tool), label: TOOLS[tool], checked: tool === state.to, act: () => { state.to = tool; p.refresh(); } })))));
+        const note = ui.area({ id: 'handoff-note', value: state.note, placeholder: '补充说明（可不填）', max: 1000, rows: 3, label: '补充说明' }, value => { state.note = value; });
+        p.body.append(ui.section('补充说明', note));
+        const go = ui.go('交给 ' + TOOLS[state.to] + ' 接手', async () => {
+          const payload = { team: team.id, role, tool: state.to };
+          if (state.note.trim()) payload.note = state.note.trim();
+          const done = await work.work('team_swap', payload);
+          const next = done.team && done.team.members ? done.team.members[role] || done.team.members[state.to] : '';
+          p.sheet.close(null, true);
+          work.toast('已在协作中交给 ' + TOOLS[state.to]);
+          const isChat = NEW_TOOLS.includes(state.to) && work.has('chat') && (state.to !== 'agy' || work.has('chat-agy'));
+          if (next) location.replace(work.base + (isChat ? 'chat/' : 'terminal/') + '?id=' + encodeURIComponent(next) + '&team=' + encodeURIComponent(team.id));
+        }, { busy: '正在交接…', id: 'handoff-go' });
+        p.foot.append(...go.nodes);
+      } };
     }
     // what a hand-over says, read before it is given
     briefPage(from, note) {
@@ -349,6 +398,168 @@
             }, { busy: '正在删除…', kind: 'danger', id: 'schedule-remove' });
             p.foot.append(...remove.nodes);
           }
+        }
+      };
+    }
+
+    // ================= promoting a conversation into a collaboration task
+    /* from: { id (session), tool, title, dir, terminal } */
+    promotePage(from, onStarted) {
+      const work = this;
+      const defaults = window.RemoteTeamDefaults || null;
+      const ROUNDS = [1, 2, 3, 5, 10];
+      const RULES_KEY = 'remotecli.team.rules';
+      const savedRules = () => { try { return localStorage.getItem(RULES_KEY) || ''; } catch { return ''; } };
+      const keepRules = text => { try { if (text) localStorage.setItem(RULES_KEY, text); else localStorage.removeItem(RULES_KEY); } catch { } };
+      const cleanTitle = (from.title || '').trim();
+      const genericTitle = !cleanTitle || cleanTitle === '对话' || cleanTitle === '新的对话' || cleanTitle === TOOLS[from.tool];
+      const state = {
+        id: newId(),
+        mode: 'lead',
+        autoRoster: true,
+        goal: genericTitle ? '' : cleanTitle,
+        rules: savedRules(),
+        rounds: 0,
+        lastFixedRounds: 3,
+        members: [],
+        reviewer: '',
+        loaded: false
+      };
+      return {
+        title: '转为协作',
+        build(p) {
+          if (!state.loaded) {
+            state.loaded = true;
+            work.fresh().then(p.refresh);
+          }
+          const why = work.ready('转为协作');
+          const tools = work.teamTools();
+          const device = (work.data || {}).device || {};
+          const remaining = tool => {
+            const q = (device.quotas || []).find(one => one.tool === tool);
+            const all = (q && q.windows) || [], main = all.filter(w => !w.group), pool = main.length ? main : all;
+            const least = pool.length ? Math.min(...pool.map(w => Math.max(0, Math.min(100, 100 - (Number(w.used) || 0))))) : null;
+            return least === null ? null : Math.round(least);
+          };
+          const named = tools.map(tool => { const left = remaining(tool); return [tool, (TOOLS[tool] || tool) + (left === null ? '' : ' · 剩 ' + left + '%')]; });
+
+          p.body.append(ui.who({
+            icon: mark(from.tool), tint: tint(from.tool),
+            title: from.title || TOOLS[from.tool] || '对话',
+            line: (state.mode === 'review' ? '当前对话将担任写手 · ' : '当前对话将担任领队 · ') + (TOOLS[from.tool] || from.tool) + (from.dir ? ' · ' + from.dir : '')
+          }));
+          if (why) { p.body.append(ui.summary(why, 'bad', 'spark')); return; }
+          if (!work.has('teams-promote')) { p.body.append(ui.summary('电脑端或中转版本较旧，不支持将对话转为协作，请更新后再试', 'bad', 'spark')); return; }
+          if (!from.dir) { p.body.append(ui.summary('这段对话不在项目里，无法转为协作', 'bad', 'spark')); return; }
+          if (!tools.includes(from.tool)) { p.body.append(ui.summary((TOOLS[from.tool] || from.tool) + ' 暂不支持参与协作', 'bad', 'spark')); return; }
+
+          if (!state.reviewer || !tools.includes(state.reviewer)) {
+            state.reviewer = tools.find(t => t !== from.tool) || from.tool;
+          }
+          if (!state.members.length) {
+            const first = tools.find(t => t !== from.tool) || from.tool;
+            const second = tools.find(t => t !== from.tool && t !== first) || '';
+            state.members = second ? [first, second] : [first];
+          }
+          const flexAllowed = state.mode === 'lead' && work.has('teams-flex-rounds');
+          if (!flexAllowed && state.rounds === 0) state.rounds = state.lastFixedRounds || 3;
+
+          const modeChoices = tools.length >= 2 ? [['lead', '分工协作'], ['review', '写审']] : [['lead', '分工协作']];
+          if (!modeChoices.some(([k]) => k === state.mode)) state.mode = 'lead';
+          const modeHint = state.mode === 'lead'
+            ? '当前对话担任领队，保留已有上下文；新成员会自动收到前期背景和并行分工说明'
+            : '当前对话担任写手继续完成，另一个 AI 只读审查并给出修改意见';
+          p.body.append(ui.section('方式', ui.seg(modeChoices, state.mode, value => {
+            state.mode = value;
+            if (value !== 'lead' && state.rounds === 0) state.rounds = state.lastFixedRounds || 3;
+            p.refresh();
+          }, { label: '方式', full: true }), modeHint));
+
+          const goal = ui.area({ id: 'promote-goal', value: state.goal, placeholder: '要协作完成什么（可补充要求或约束）', max: 4000, rows: 3, label: '目标' }, value => { state.goal = value; });
+          p.body.append(ui.section('目标', goal));
+
+          if (state.mode === 'lead') {
+            p.body.append(ui.section('组队方式', ui.seg([['auto', '自动组队'], ['manual', '手动选成员']], state.autoRoster ? 'auto' : 'manual', value => {
+              state.autoRoster = value === 'auto';
+              p.refresh();
+            }, { label: '组队方式', full: true }), state.autoRoster ? '领队按任务和额度按需创建 1–3 个执行成员' : '提前指定 1–3 个执行成员（默认按设置中的模型与思考深度）'));
+            if (!state.autoRoster) {
+              const memberRows = state.members.map((tool, idx) => { const left = remaining(tool); return ui.row({
+                icon: mark(tool), tint: tint(tool),
+                label: '执行成员 ' + (idx + 1) + ' · ' + (TOOLS[tool] || tool),
+                detail: left !== null ? '剩余额度 ' + left + '%' : '点击切换工具',
+                end: state.members.length > 1 ? el('button', {
+                  type: 'button', className: 'rs-mini', textContent: '移除',
+                  onclick: e => { e.stopPropagation(); state.members.splice(idx, 1); p.refresh(); }
+                }) : '',
+                act: () => {
+                  const nextIdx = (tools.indexOf(tool) + 1) % tools.length;
+                  state.members[idx] = tools[nextIdx];
+                  p.refresh();
+                }
+              }); });
+              const memberNodes = [ui.group(...memberRows)];
+              if (state.members.length < 3) {
+                memberNodes.push(ui.group(ui.row({
+                  icon: 'plus', tint: 'muted', id: 'promote-member-add',
+                  label: '添加执行成员（' + state.members.length + ' / 3）',
+                  act: () => {
+                    const nextTool = tools.find(t => t !== from.tool && !state.members.includes(t)) || tools[0];
+                    state.members.push(nextTool);
+                    p.refresh();
+                  }
+                })));
+              }
+              p.body.append(ui.section('执行成员', memberNodes, '点成员行可切换工具；同账号共用额度'));
+            }
+          } else {
+            p.body.append(ui.section('审查', ui.chips(named, { chosen: state.reviewer, label: '审查的 AI' }, value => { state.reviewer = value; }), '审查的 AI 以只读方式运行'));
+          }
+
+          const roundChoices = (flexAllowed ? [[0, '自由轮数']] : []).concat(ROUNDS.map(n => [n, n + ' 轮']));
+          p.body.append(ui.section('最多几轮', ui.seg(roundChoices, state.rounds, value => {
+            state.rounds = value;
+            if (value > 0) state.lastFixedRounds = value;
+          }, { label: '轮数', full: !flexAllowed }), state.rounds === 0 ? '由领队按进展与验收结果决定何时结束（最多 20 轮）' : '达到轮数上限仍未通过验收时会暂停，点「继续」可追加轮次'));
+
+          const rules = ui.area({ id: 'promote-rules', value: state.rules, placeholder: '选填：分工偏好或额外约束（自动记住）', max: 1000, rows: 2, label: '分工偏好' }, value => { state.rules = value; });
+          p.body.append(ui.section('分工偏好（选填）', rules));
+
+          const go = ui.go('转为协作', async () => {
+            const text = state.goal.trim();
+            if (!text) { goal.box.focus(); throw new Error('请写下要协作完成什么'); }
+            const trimmedRules = state.rules.trim();
+            keepRules(trimmedRules);
+            const savedPrefs = defaults ? defaults.readPrefs() : { models: {}, efforts: {} };
+            const defaultModel = tool => work.has('teams-models') && savedPrefs.models && savedPrefs.models[tool] ? savedPrefs.models[tool] : '';
+            const defaultEffort = tool => work.has('teams-effort') && savedPrefs.efforts && savedPrefs.efforts[tool] ? savedPrefs.efforts[tool] : '';
+            const submitRounds = state.mode === 'lead' && flexAllowed && state.rounds === 0 ? 0 : (state.rounds || state.lastFixedRounds || 3);
+            let item;
+            if (state.mode === 'lead') {
+              const roster = [{ role: 'leader', tool: from.tool, model: '' }];
+              if (!state.autoRoster) {
+                state.members.slice(0, 3).forEach((tool, idx) => {
+                  const entry = { role: 'member-' + (idx + 1), tool, model: defaultModel(tool) };
+                  const eff = defaultEffort(tool);
+                  if (eff) entry.effort = eff;
+                  roster.push(entry);
+                });
+              }
+              item = { id: state.id, mode: 'lead', dir: from.dir, goal: text, tools: roster.map(r => r.tool), roster, rounds: submitRounds, from_terminal: from.terminal };
+              if (state.autoRoster) item.auto_roster = true;
+            } else {
+              item = { id: state.id, mode: 'review', dir: from.dir, goal: text, tools: [from.tool, state.reviewer], rounds: submitRounds, from_terminal: from.terminal };
+              const rm = defaultModel(state.reviewer), re = defaultEffort(state.reviewer);
+              if (rm) item.models = { [state.reviewer]: rm };
+              if (re) item.efforts = { [state.reviewer]: re };
+            }
+            if (trimmedRules) item.rules = trimmedRules;
+            const made = await work.work('team_start', { item });
+            p.sheet.close(made.team || true, true);
+            work.toast('已转为协作任务');
+            if (onStarted) onStarted(made.team || null);
+          }, { busy: '正在开启协作…', id: 'promote-go' });
+          p.foot.append(...go.nodes);
         }
       };
     }

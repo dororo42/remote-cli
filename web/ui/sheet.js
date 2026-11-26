@@ -32,7 +32,8 @@
     refresh: '<path d="M19.500 12a7.500 7.500 0 1 1-2.200-5.300M19.500 4.500v3.800h-3.800"/>',
     pin: '<path d="M9 3.500h6l-1 6 3.500 3.500v1.500h-11V13L10 9.500zM12 14.500V21"/>',
     hide: '<path d="M3.500 12s3-6 8.500-6c1.600 0 3 .5 4.200 1.200M20.500 12s-3 6-8.500 6c-1.600 0-3-.5-4.200-1.200M4 4l16 16"/><path d="M9.900 9.900a3 3 0 0 0 4.200 4.200"/>',
-    enter: '<path d="M3.500 7.500a2 2 0 0 1 2-2h4l2 2.200h7a2 2 0 0 1 2 2v7.800a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/><path d="M10.500 11l3 2.500-3 2.500"/>'
+    enter: '<path d="M3.500 7.500a2 2 0 0 1 2-2h4l2 2.200h7a2 2 0 0 1 2 2v7.800a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/><path d="M10.500 11l3 2.500-3 2.500"/>',
+    sliders: '<path d="M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="17" r="2"/>'
   };
   const icon = (name, size) => svg(ICONS[name] || '', size);
 
@@ -69,15 +70,20 @@
     });
   }
   class Sheet {
-    constructor(label) {
+    constructor(label, options) {
       this.stack = [];
+      this.full = !!(options && options.full);
       this.result = new Promise(done => { this.answer = done; });
       this.entries = 0; this.ignoring = 0; this.gone = false;
-      this.dialog = el('dialog', { className: 'rs', ariaLabel: label || '' });
+      this.dialog = el('dialog', { className: 'rs' + (this.full ? ' rs-full' : ''), ariaLabel: label || '' });
       this.titleNode = el('h2', { id: 'rs-title-' + Math.random().toString(36).slice(2) });
+      this.subtitleNode = el('span', { className: 'rs-sub', hidden: true });
+      this.badgeNode = el('span', { className: 'rs-badge', hidden: true });
+      this.titleWrap = el('div', { className: 'rs-title-wrap' }, this.titleNode, this.subtitleNode);
       this.backButton = el('button', { type: 'button', className: 'rs-icon rs-back', ariaLabel: '返回', html: icon('back', 22), onclick: () => this.goBack() });
+      this.closeButton = el('button', { type: 'button', className: 'rs-icon rs-close', ariaLabel: '关闭', html: icon('close', 18), onclick: () => this.close(null) });
       this.top = el('div', { className: 'rs-top' }, el('span', { className: 'rs-grab', ariaHidden: 'true' }),
-        el('div', { className: 'rs-bar' }, this.backButton, this.titleNode, el('button', { type: 'button', className: 'rs-icon rs-close', ariaLabel: '关闭', html: icon('close', 18), onclick: () => this.close(null) })));
+        el('div', { className: 'rs-bar' }, this.backButton, this.full ? this.titleWrap : this.titleNode, this.full ? this.badgeNode : '', this.closeButton));
       this.body = el('div', { className: 'rs-body' });
       this.foot = el('div', { className: 'rs-foot' });
       this.card = el('div', { className: 'rs-card' }, this.top, this.body, this.foot);
@@ -92,7 +98,7 @@
         if (this.entries > 0) this.entries--;
         if (this.stack.length > 1) this.pop(); else this.finish(null, false);
       };
-      this.drag();
+      if (!this.full) this.drag();
     }
     // a pull down on the top bar takes the sheet away, as on the phone's own sheets
     drag() {
@@ -119,6 +125,23 @@
       this.top.addEventListener('pointercancel', end);
     }
     get page() { return this.stack[this.stack.length - 1] || null; }
+    setHeader({ title, subtitle, badge, tone } = {}) {
+      if (title !== undefined) {
+        if (this.page) this.page.title = title;
+        this.titleNode.textContent = title || '';
+      }
+      if (this.full) {
+        if (subtitle !== undefined) {
+          this.subtitleNode.textContent = subtitle || '';
+          this.subtitleNode.hidden = !subtitle;
+        }
+        if (badge !== undefined) {
+          this.badgeNode.textContent = badge || '';
+          this.badgeNode.className = 'rs-badge' + (tone ? ' ' + tone : '');
+          this.badgeNode.hidden = !badge || this.stack.length > 1;
+        }
+      }
+    }
     show(direction) {
       const page = this.page;
       if (!page) return;
@@ -128,13 +151,29 @@
       const p = {
         sheet: this, body: view, foot: this.foot,
         set title(text) { page.title = text; },
+        setHeader: info => { if (this.page === page) this.setHeader(info); },
         refresh: () => { if (this.page === page) { page.scroll = this.body.scrollTop; this.show('same'); } }
       };
+      this.titleNode.textContent = page.title || '';
+      if (this.full) {
+        const rootPage = this.stack.length < 2;
+        this.backButton.hidden = rootPage;
+        this.closeButton.classList.toggle('rs-close-back', rootPage);
+        this.closeButton.innerHTML = icon(rootPage ? 'back' : 'close', rootPage ? 22 : 18);
+        this.closeButton.setAttribute('aria-label', rootPage ? '返回' : '关闭');
+        if (!rootPage) {
+          this.subtitleNode.textContent = '';
+          this.subtitleNode.hidden = true;
+          this.badgeNode.textContent = '';
+          this.badgeNode.hidden = true;
+        }
+      } else {
+        this.backButton.hidden = this.stack.length < 2;
+      }
       try { page.build(p); }
       catch (error) { view.append(el('p', { className: 'rs-note bad', textContent: error.message || '没有显示出来' })); console.error(error); }
       if (direction === 'same') view.style.animation = 'none';
       this.titleNode.textContent = page.title || '';
-      this.backButton.hidden = this.stack.length < 2;
       this.body.append(view);
       this.body.scrollTop = direction === 'same' || direction === 'back' ? keep : 0;
     }
@@ -283,8 +322,12 @@
     swatches(list, changed) {
       const box = el('div', { className: 'rs-swatches', role: 'group', ariaLabel: '外观' });
       list.forEach(s => {
-        const look = s.follow ? el('span', { className: 'look', textContent: 'App' })
-          : el('span', { className: 'look', style: 'background:' + s.bg }, el('i', { style: 'background:' + s.ink }), el('i', { style: 'background:' + s.muted }), el('i', { style: 'background:' + s.muted + ';opacity:.6' }), el('b', { style: 'background:' + s.accent }));
+        const look = s.follow ? el('span', { className: 'look', textContent: s.key === 'auto' ? '系统' : 'App' })
+          : el('span', { className: 'look', style: 'background:' + s.bg },
+              el('i', { style: 'background:' + (s.bubble || s.accent) }),
+              el('i', { style: 'background:' + s.ink + ';opacity:.78' }),
+              el('i', { style: 'background:' + s.muted + ';opacity:.58' }),
+              el('b', { style: 'background:' + s.accent }));
         box.append(el('button', { type: 'button', className: 'rs-swatch' + (s.follow ? ' follow' : ''), ariaPressed: String(!!s.current), dataValue: s.key, onclick: event => {
           box.querySelectorAll('.rs-swatch').forEach(one => one.setAttribute('aria-pressed', String(one === event.currentTarget)));
           changed(s.key);
@@ -358,5 +401,5 @@
     return done;
   }
   ui.confirm = confirm;
-  window.RemoteSheet = { open: (page, label) => new Sheet(label || page.title).open(page), ui, copy, confirm: options => new Sheet(options.title).open(confirm(options)), get current() { return current; } };
+  window.RemoteSheet = { open: (page, label, options) => new Sheet(label || page.title, options || (page && page.full ? { full: true } : null)).open(page), ui, copy, confirm: options => new Sheet(options.title).open(confirm(options)), get current() { return current; } };
 })();

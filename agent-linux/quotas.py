@@ -17,8 +17,8 @@ it from there. A window whose time is over is left out — it has started anew, 
 it is used is not known.
 """
 import json
+import math
 import os
-import re
 import secrets
 import subprocess
 import threading
@@ -30,9 +30,11 @@ def _at(given, name):
 
 
 def _number(value):
+    if isinstance(value, bool):
+        return None
     try:
         number = float(value)
-        return number if number == number else None          # NaN is not a number here either
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
 
@@ -173,12 +175,14 @@ class Quotas:
 
     def __init__(self, data_folder):
         self.folder = os.path.join(data_folder, "quotas")
+        self.lock = threading.Lock()
 
     def _file_of(self, tool):
         return os.path.join(self.folder, tool + ".json")
 
     def note(self, tool, windows):
-        """What a tool told of its limits now."""
+        """What a tool told of its limits now. Empty readings (such as Codex API-key updates
+        with null limits) are ignored so they never overwrite existing readings."""
         if windows:
             self._write(tool, windows, "")
 
@@ -192,15 +196,16 @@ class Quotas:
                              "resets": int(one["resets"]),
                              **({"group": one["group"]} if one.get("group") else {})}
                             for one in windows]}
-        try:
-            os.makedirs(self.folder, exist_ok=True)
-            fresh = self._file_of(tool) + "." + secrets.token_hex(4)
-            with open(fresh, "w", encoding="utf-8") as stream:
-                json.dump(kept, stream, ensure_ascii=False)
-            os.chmod(fresh, 0o600)
-            os.replace(fresh, self._file_of(tool))
-        except OSError:
-            pass
+        with self.lock:
+            try:
+                os.makedirs(self.folder, mode=0o700, exist_ok=True)
+                fresh = self._file_of(tool) + "." + secrets.token_hex(4)
+                fd = os.open(fresh, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump(kept, stream, ensure_ascii=False)
+                os.replace(fresh, self._file_of(tool))
+            except OSError:
+                pass
 
     def _kept(self, tool):
         try:
@@ -236,8 +241,10 @@ class Quotas:
         """Runs the Antigravity CLI's usage command and keeps what it answers (at most once in
         ten minutes is the caller's job)."""
         try:
+            env = dict(os.environ)
+            env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "true"
             done = subprocess.run([launcher, "-p", "/usage", "--output-format", "json"],
-                                  capture_output=True, timeout=30)
+                                  capture_output=True, timeout=30, env=env)
             if done.returncode == 0:
                 windows = from_agy(json.loads(done.stdout.decode("utf-8", "replace")))
                 if windows:

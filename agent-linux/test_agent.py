@@ -1135,7 +1135,7 @@ class Pure(unittest.TestCase):
         one.schedules = kept
         other = "66666666-7777-8888-9999-000000000000"
         one.sessions.found = [{"id": session, "tool": "claude", "dir": "项目", "title": "甲", "live": True}, {"id": other, "tool": "codex", "dir": "", "title": "乙", "live": False}]
-        one.sessions.read = lambda *asked: {"messages": [{"role": "user", "text": "先做第一步"}, {"role": "tool", "text": "Bash：运行测试"}, {"role": "assistant", "text": "第一步做完了"},
+        one.sessions.read = lambda *asked: {"messages": [{"role": "user", "text": "先做第一步"}, {"role": "tool", "text": "Bash：运行测试", "result": "2 failed\n1 passed"}, {"role": "tool", "text": "读取版本"}, {"role": "assistant", "text": "第一步做完了"},
                                                           {"role": "user", "text": "再做第二步"}, {"role": "assistant", "text": "第二步也做完了"}]}
         with self.assertRaisesRegex(agent.OpError, "手机打开的终端"):
             one.owner_work("work_handoff", {"from": session, "from_tool": "claude", "to": other, "to_tool": "codex", "note": ""}, {})
@@ -1143,6 +1143,8 @@ class Pure(unittest.TestCase):
         answer = one.owner_work("work_handoff", {"from": other, "from_tool": "codex", "to": session, "to_tool": "claude", "note": "看一下边界情况"}, {})
         self.assertEqual((answer["status"], answer["note"]), ("accepted", "已发到手机终端"))
         said = typed.got[0]
+        self.assertIn("原对话 ID：" + other, said)
+        self.assertIn("返回摘录：2 failed\n  1 passed\n- 读取版本\n  记录中没有返回内容", said)
         self.assertTrue(said.startswith("\x1b[200~【对话交接】下面是我在另一段对话里的进展（Codex，“乙”），请接着处理。") and said.endswith("\x1b[201~\r"), said)
         for part in ("我最初的要求：\n先做第一步", "我最近的要求：\n再做第二步", "它最后的回答：\n第二步也做完了", "它最近做的操作：\n- Bash：运行测试", "我的补充：\n看一下边界情况"):
             self.assertIn(part, said)
@@ -1312,6 +1314,28 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(status, 200, result)
         return result
 
+    def test_00_sixteen_terminals_can_run_and_a_closed_slot_can_be_reused(self):
+        terminals = []
+        start = {"action": "start", "tool": "shell", "dir": "项目"}
+
+        def running():
+            return {term["id"] for term in self.overview()["terminals"] if term["state"] == "running"}
+
+        try:
+            for _ in range(16):
+                terminals.append(self.op(start)["terminal"])
+            self.poll(running, lambda ids: ids == set(terminals), seconds=40)
+            status, body = request("POST", self.base + "/api/terminal", {"id": secrets.token_hex(16), **start}, token=self.token)
+            self.assertEqual((status, body["error"]), (400, "最多同时运行 16 个终端，请先结束一个"))
+            self.op({"action": "close", "terminal": terminals[0]})
+            self.poll(running, lambda ids: ids == set(terminals[1:]))
+            terminals[0] = self.op(start)["terminal"]
+            self.poll(running, lambda ids: ids == set(terminals))
+        finally:
+            for terminal in running().intersection(terminals):
+                self.op({"action": "close", "terminal": terminal})
+            self.poll(running, lambda ids: not ids.intersection(terminals))
+
     def test_end_to_end(self):
         # 1. start a shell in the project and wait for its prompt to arrive
         started = self.op({"action": "start", "tool": "shell", "dir": "项目"})
@@ -1474,6 +1498,25 @@ class EndToEnd(unittest.TestCase):
         self.op({"action": "close", "terminal": terminal})
         self.poll(lambda: self.overview(),
                   lambda v: any(t["id"] == terminal and t["state"] == "closed" for t in v["terminals"]))
+
+    def test_a_conversation_is_reopened_the_other_way(self):
+        # the saved conversation on Claude Code's own screen, then as a chat: the screen's terminal ends first,
+        # and the chat goes on with the same conversation, which the list then shows once, as the chat
+        started = self.op({"action": "start", "tool": "claude", "dir": "项目", "session": self.saved})
+        screen = started["terminal"]
+        self.read_until(screen, "STANDIN_CLAUDE[")
+        self.poll(lambda: self.overview(), lambda v: any(t["id"] == screen and t["state"] == "running" and t.get("session") == self.saved for t in v["terminals"]))
+        reopened = self.op({"action": "start", "tool": "claude", "dir": "项目", "form": "chat", "reopen": screen})
+        chat = reopened["terminal"]
+        try:
+            view = self.poll(lambda: self.overview(), lambda v: any(t["id"] == chat and t["state"] == "running" for t in v["terminals"]))
+            listed = [t for t in view["terminals"] if t.get("session") == self.saved]
+            self.assertEqual([(t["id"], t.get("form")) for t in listed], [(chat, "chat")])
+            with self.assertRaises(AssertionError):                 # it is a chat already
+                self.op({"action": "start", "tool": "claude", "dir": "项目", "form": "chat", "reopen": chat})
+        finally:
+            self.op({"action": "close", "terminal": chat})
+        self.poll(lambda: self.overview(), lambda v: any(t["id"] == chat and t["state"] == "closed" for t in v["terminals"]))
 
     def test_close_kills_what_the_program_left_behind(self):
         # a background task that made a session of its own is past a kill of the process
@@ -1767,7 +1810,7 @@ class Chats(unittest.TestCase):
     def test_permission_suggestions(self):
         chat = object.__new__(agent.ClaudeChat)
         offered, answered = [], []
-        chat.ask = lambda *args: offered.append(args)
+        chat.ask = lambda *args, **kwargs: offered.append(args)
         chat.respond = lambda *args: answered.append(args)
         for command, valid in (("npm test *", True), ("mv *.csv backup/", False)):
             with self.subTest(command=command):
@@ -1952,6 +1995,280 @@ class EnvILocaleFallback(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TeamsQuiet(unittest.TestCase):
+    """A team member on a pty tool has no turn events of its own: its turn is over when its
+    conversation record has gone quiet after growing (agent.Agent.teams_step)."""
+
+    def _bot(self, store):
+        live = agent.Live.__new__(agent.Live)
+        live.closed, live.session, live.tool, live.dir = False, "s1", "opencode", "/tmp/demo"
+        bot = agent.Agent.__new__(agent.Agent)
+        bot.teams = store
+        bot.work = threading.RLock()
+        bot.team_seen = {}
+        bot.team_seen_lock = threading.Lock()
+        bot.terminals = {"t1": live}
+
+        class Sessions:
+            found = [{"tool": "opencode", "id": "s1", "updated": int((time.time() - 60) * 1000)}]
+
+            @staticmethod
+            def read(session, tool, dir_name, dirs):
+                return {"messages": [{"role": "assistant", "text": "第一轮完成了"}]}
+
+        bot.sessions = Sessions
+        return bot
+
+    def _team(self, store):
+        team = agent.teams.Team()
+        team.id, team.dir, team.mode, team.goal = "b" * 24, "demo", "review", "写一个加法函数"
+        team.tools = ["claude", "opencode"]
+        team.state = "running"
+        team.members = {"reviewer": "t1"}
+        team.awaited = ["reviewer"]
+        store.items = [team]
+        return team
+
+    def _store(self, said, begun):
+        return agent.teams.Teams(os.path.join(tempfile.mkdtemp(), "teams.json"), agent.teams.Hands(
+            begin_in=lambda tool, dir_name, words, read, folder=None: begun.append(
+                (tool, dir_name, read, words)) or "t%d" % (len(begun) + 1),
+            say=lambda terminal, words: said.append((terminal, words)),
+            stop=lambda terminal: None, changes=lambda dir_name: "",
+            available=lambda: ["claude", "opencode"]))
+
+    def test_a_growing_then_quiet_record_ends_the_turn_with_its_last_answer(self):
+        said, begun = [], []
+        store = self._store(said, begun)
+        team = self._team(store)
+        bot = self._bot(store)
+        now = time.time()
+        bot.sessions.found[0]["updated"] = int((now - 2) * 1000)
+        bot.teams_step({"demo": "/tmp"}, now)
+        self.assertEqual(said, [])
+        self.assertEqual(store.of(team.id).state, "running")
+
+        bot.sessions.found[0]["updated"] = int((now - 60) * 1000)
+        bot.teams_step({"demo": "/tmp"}, now)
+        self.assertEqual(said, [])
+        self.assertEqual(store.of(team.id).state, "running")
+
+        bot.teams_step({"demo": "/tmp"}, now)
+        self.assertEqual(store.of(team.id).state, "running")
+        self.assertEqual([one[0] for one in begun], ["claude"])
+        self.assertIn("审查意见", begun[0][3])
+
+    def test_fresh_dispatched_pty_member_completes_even_after_single_fast_write(self):
+        said, begun = [], []
+        store = self._store(said, begun)
+        team = self._team(store)
+        bot = self._bot(store)
+        bot.team_seen["t1"] = {"updated": 0, "armed": 0}
+        now = time.time()
+        bot.sessions.found[0]["updated"] = int((now - 60) * 1000)
+        bot.teams_step({"demo": "/tmp"}, now)
+        self.assertEqual(begun, [])
+        bot.teams_step({"demo": "/tmp"}, now)
+        self.assertEqual([one[0] for one in begun], ["claude"])
+
+    def test_a_record_still_growing_does_not_end_the_turn(self):
+        said, begun = [], []
+        store = self._store(said, begun)
+        team = self._team(store)
+        bot = self._bot(store)
+        now = time.time()
+        bot.sessions.found[0]["updated"] = int((now - 5) * 1000)
+        bot.teams_step({"demo": "/tmp"}, now)
+        bot.sessions.found[0]["updated"] = int((now - 2) * 1000)
+        bot.teams_step({"demo": "/tmp"}, now)
+        self.assertEqual(said, [])
+        self.assertEqual(begun, [])
+        self.assertEqual(store.of(team.id).state, "running")
+
+
+class AgentTeamsAndChatIntegration(unittest.TestCase):
+    """Integration checks for Agent.execute() team ops, lock re-entrancy, error propagation,
+    Chat MCP/quota wiring, streamed turn_words collection, and read-only auto_ask."""
+
+    def test_work_team_actions_route_without_deadlock_and_preserve_errors(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bot = agent.Agent.__new__(agent.Agent)
+        bot.data = tmp.name
+        bot.work = threading.RLock()
+        bot.completed = {}
+        bot.reported = set()
+        bot.terminals = {}
+        bot.team_seen = {}
+        bot.team_seen_lock = threading.Lock()
+        bot.teams_version = 0
+        bot.wakeup = threading.Event()
+        bot.last_activity = 0.0
+        bot.soon = False
+        bot.sessions = agent.Sessions()
+        bot.worktrees = agent.worktrees.Worktrees(os.path.join(tmp.name, "worktrees"))
+        opened = []
+
+        def fake_begin_in(tool, dir_name, words, read, folder_override=None):
+            with bot.work:
+                term_id = uuid.uuid4().hex
+                live = agent.Live.__new__(agent.Live)
+                live.id, live.project, live.dir, live.tool = term_id, dir_name, folder_override or "/tmp/demo", tool
+                live.session, live.status, live.closed, live.closing_at = "", "idle", False, None
+                live.created = int(time.time() * 1000)
+                live.begin_close = lambda: setattr(live, "closed", True)
+                bot.terminals[term_id] = live
+                opened.append(term_id)
+                return term_id
+
+        bot.teams = agent.teams.Teams(
+            os.path.join(tmp.name, "teams.json"),
+            agent.teams.Hands(
+                begin_in=fake_begin_in,
+                say=lambda terminal, words: None,
+                stop=lambda terminal: None,
+                close=bot.close_member,
+                changes=lambda dir_name: "",
+                available=lambda: ["claude", "opencode"]),
+            error_types=(agent.OpError, agent.teams.OpError, agent.worktrees.OpError, ValueError))
+        bot.teams.changed = bot._on_teams_changed
+
+        cfg = {"RemoteEnabled": True}
+        dirs = {"demo": "/tmp/demo"}
+        now = time.time()
+        team_id = "d" * 24
+        with bot.work:
+            bot.execute({"id": "1" * 24, "action": "work_team_start", "at": now,
+                         "item": {"id": team_id, "mode": "review", "dir": "demo",
+                                  "goal": "测试协作", "tools": ["claude", "opencode"], "rounds": 2}}, cfg, dirs)
+        ack = bot.completed["1" * 24]
+        self.assertEqual(ack["error"], "")
+        self.assertEqual(ack["result"]["team"]["id"], team_id)
+        self.assertEqual(len(opened), 1)
+        # Reopening an active team member is refused.
+        member_live = bot.terminals[opened[0]]
+        member_live.session = str(uuid.uuid4())
+        with self.assertRaises(agent.OpError):
+            bot.reopening({"reopen": opened[0], "form": "chat"}, "claude", "demo")
+        # teams.OpError propagates its own Chinese message through Agent.execute().
+        with bot.work:
+            bot.execute({"id": "2" * 24, "action": "work_team_remove", "at": now, "team": team_id}, cfg, dirs)
+        self.assertIn("请先停止", bot.completed["2" * 24]["error"])
+        # Stopping then removing succeeds and closes the member terminal.
+        with bot.work:
+            bot.execute({"id": "3" * 24, "action": "work_team_stop", "at": now, "team": team_id}, cfg, dirs)
+            bot.execute({"id": "4" * 24, "action": "work_team_remove", "at": now, "team": team_id}, cfg, dirs)
+        self.assertEqual(bot.completed["3" * 24]["error"], "")
+        self.assertEqual(bot.completed["4" * 24]["error"], "")
+        self.assertTrue(bot.terminals[opened[0]].closed)
+
+    def test_claude_chat_keeps_mcp_collects_streamed_words_quotas_and_readonly_auto_ask(self):
+        sent = []
+        heard = []
+        done = threading.Event()
+        noted = []
+
+        class StubClaude(agent.ClaudeChat):
+            def start(self, launcher, session, resume, mode):
+                self.message, self.streamed, self.blocks, self.steps, self.said_here, self.requests = "", set(), {}, {}, [], 0
+                self.status = "idle"
+
+            def send(self, message):
+                sent.append(message)
+
+        mcp = agent.peers_mod.McpServer("remote_ai", "python3", ["agent.py"], "/tmp/mcp.json")
+        chat = StubClaude("a" * 32, "demo", "/tmp/demo", "claude", "/usr/bin/claude", lambda: None, "", False, "read", mcp=mcp)
+        self.assertIs(chat.mcp, mcp)
+        chat.quotas_note = lambda tool, windows: noted.append((tool, windows))
+        chat.turned = lambda how, said: (heard.append((how, said)), done.set())
+
+        chat.received({"type": "rate_limit_event", "rate_limit_info": {
+            "unifiedWindows": {"five_hour": {"utilization": 0.35, "resetsAt": 1790000000}}}})
+        self.assertEqual(len(noted), 1)
+        self.assertEqual(noted[0][0], "claude")
+        self.assertEqual(round(noted[0][1][0]["used"]), 35)
+
+        # Built-in MCP ask_ai is auto-allowed without prompting the user.
+        chat.received({"type": "control_request", "request_id": "req-mcp",
+                       "request": {"subtype": "can_use_tool", "tool_name": "mcp__remote_ai__ask_ai",
+                                   "input": {"tool": "codex", "question": "check"}}})
+        self.assertEqual(sent[-1]["response"]["response"]["behavior"], "allow")
+
+        # Read-only auto_ask allows Read and denies Edit.
+        chat.auto_ask = True
+        chat.received({"type": "control_request", "request_id": "req-read",
+                       "request": {"subtype": "can_use_tool", "tool_name": "Read", "input": {"file_path": "a.py"}}})
+        self.assertEqual(sent[-1]["response"]["response"]["behavior"], "allow")
+        chat.received({"type": "control_request", "request_id": "req-edit",
+                       "request": {"subtype": "can_use_tool", "tool_name": "Edit", "input": {"file_path": "a.py"}}})
+        self.assertEqual(sent[-1]["response"]["response"]["behavior"], "deny")
+
+        # Streamed text deltas populate turn_words on turn_ended.
+        chat.received({"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m1"}}})
+        chat.received({"type": "stream_event", "event": {"type": "content_block_start", "index": 0,
+                                                         "content_block": {"type": "text", "text": ""}}})
+        chat.received({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                                                         "delta": {"type": "text_delta", "text": "REVIEW: PASS\n"}}})
+        chat.received({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                                                         "delta": {"type": "text_delta", "text": "没有问题"}}})
+        chat.received({"type": "result", "subtype": "success", "is_error": False})
+        self.assertTrue(done.wait(3))
+        self.assertEqual(heard[-1], ("done", "REVIEW: PASS\n没有问题"))
+
+        # Error text on failure reaches turned() so quota failover works.
+        done.clear()
+        chat.received({"type": "result", "subtype": "error_during_execution", "is_error": True,
+                       "result": "hit your limit"})
+        self.assertTrue(done.wait(3))
+        self.assertEqual(heard[-1][0], "failed")
+        self.assertIn("hit your limit", heard[-1][1])
+
+    def test_codex_chat_collects_delta_settled_words_quotas_and_readonly_commands(self):
+        sent = []
+        heard = []
+        done = threading.Event()
+        noted = []
+
+        class StubCodex(agent.CodexChat):
+            def start(self, launcher, session, resume, mode):
+                self.next, self.waiting, self.turn, self.early, self.thoughts = 0, {}, "", [], set()
+                self.status = "idle"
+
+            def send(self, message):
+                sent.append(message)
+
+        chat = StubCodex("b" * 32, "demo", "/tmp/demo", "codex", "/usr/bin/codex", lambda: None, "", False, "read")
+        chat.quotas_note = lambda tool, windows: noted.append((tool, windows))
+        chat.turned = lambda how, said: (heard.append((how, said)), done.set())
+        chat.auto_ask = True
+
+        # Read-only commandActions allowed; mutating command and fileChange denied.
+        chat.requested(1, "item/commandExecution/requestApproval",
+                       {"commandActions": [{"type": "read", "command": "cat a.py"}]})
+        self.assertEqual(sent[-1]["result"]["decision"], "accept")
+        chat.requested(2, "item/commandExecution/requestApproval",
+                       {"commandActions": [{"type": "unknown", "command": "rm -rf foo"}]})
+        self.assertEqual(sent[-1]["result"]["decision"], "decline")
+        chat.requested(3, "item/fileChange/requestApproval", {"reason": "edit"})
+        self.assertEqual(sent[-1]["result"]["decision"], "decline")
+
+        # Quota push updates quotas_note.
+        chat.received({"method": "account/rateLimits/updated", "params": {
+            "rateLimits": {"primary": {"usedPercent": 55, "windowDurationMins": 300, "resetsAt": 1790000000}}}})
+        self.assertEqual(len(noted), 1)
+        self.assertEqual(noted[0][1][0]["name"], "five_hour")
+
+        # Agent message deltas & completed settlement reach turned().
+        chat.received({"method": "turn/started", "params": {"turn": {"id": "turn-1"}}})
+        chat.received({"method": "item/started", "params": {"item": {"type": "agentMessage", "id": "a1", "text": ""}}})
+        chat.received({"method": "item/agentMessage/delta", "params": {"itemId": "a1", "delta": "ASSIGN opencode: "}})
+        chat.received({"method": "item/agentMessage/delta", "params": {"itemId": "a1", "delta": "实现功能"}})
+        chat.received({"method": "item/completed", "params": {"item": {"type": "agentMessage", "id": "a1", "text": "ASSIGN opencode: 实现功能"}}})
+        chat.received({"method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "completed"}}})
+        self.assertTrue(done.wait(3))
+        self.assertEqual(heard[-1], ("done", "ASSIGN opencode: 实现功能"))
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1966,7 +2283,9 @@ class TeamsQuiet(unittest.TestCase):
         bot = agent.Agent.__new__(agent.Agent)
         bot.teams = store
         bot.team_seen = {}
+        bot.team_seen_lock = threading.RLock()
         bot.terminals = {"t1": live}
+        bot.work = threading.RLock()
 
         class Sessions:
             found = [{"tool": "opencode", "id": "s1", "updated": int((time.time() - 60) * 1000)}]

@@ -50,7 +50,8 @@ final class ComputerManagement {
         draw();
 
         LinearLayout access = kit.settingGroup(page, "使用这台电脑");
-        kit.setting(access, R.drawable.ic_computer, kit.accentInk(), "打开工作台", "查看这台电脑上的对话、终端和项目", "", kit.MUTED, () -> activity.open(url, ""));
+        kit.setting(access, R.drawable.ic_computer, kit.accentInk(), "打开总控台", "Diff 审查、Worktree 隔离与多标签工作区", "", kit.MUTED, () -> activity.openConsole(url));
+        kit.setting(access, R.drawable.ic_shell, kit.accentInk(), "打开经典工作台", "查看这台电脑上的对话、终端和项目", "", kit.MUTED, () -> activity.open(url, ""));
         kit.setting(access, R.drawable.ic_chart, TINT_AGY, "工作统计", "查看今日与近 30 天使用趋势", "", kit.MUTED, () -> activity.computerPage(url, "me"));
         kit.setting(access, R.drawable.ic_desktop, TINT_WARN, "远程桌面", "通过 UU 远程打开桌面或小窗", "", kit.MUTED, () -> activity.desktop(url));
         kit.setting(access, R.drawable.ic_settings, kit.MUTED, "电脑设置", "连接线路、远程访问与工具", "", kit.MUTED, () -> activity.computerSettings(url));
@@ -95,7 +96,7 @@ final class ComputerManagement {
         tagLp.leftMargin = kit.dp(8);
         titleRow.addView(onlineTag, tagLp);
         meta.addView(titleRow);
-        meta.addView(kit.line(MainActivity.host(current), 12.5f, kit.heroMuted(), false), kit.below(2));
+        meta.addView(kit.line(activity.routeSummary(current) + " · " + MainActivity.host(activity.activeOrigin(current)), 12.5f, kit.heroMuted(), false), kit.below(2));
         top.addView(meta, new LinearLayout.LayoutParams(0, -2, 1));
 
         String versionLabel = state.version.isEmpty() ? "版本未知" : "v" + state.version;
@@ -141,13 +142,14 @@ final class ComputerManagement {
         stop();
         if (!activity.showing("computer")) return;
         final String url = current;
+        final String origin = activity.activeOrigin(url);
         final ComputerUpdate state = states.get(url);
         if (state == null || !loading.add(url)) return;
-        final String cookie = CookieManager.getInstance().getCookie(url);
+        final String cookie = CookieManager.getInstance().getCookie(origin);
         draw();
         activity.net.execute(() -> {
             JSONObject overview = null; String problem = "";
-            try { overview = overview(url, cookie); }
+            try { overview = overview(origin, cookie); }
             catch (IOException unreachable) { problem = "无法连接电脑，请确认电脑在线且地址可用"; }
             catch (Exception error) { problem = error.getMessage() == null ? "暂时无法连接电脑" : error.getMessage(); }
             final JSONObject data = overview; final String error = problem;
@@ -163,17 +165,17 @@ final class ComputerManagement {
                     }
                 }
                 state.expire(SystemClock.elapsedRealtime());
-                if (!activity.isDestroyed() && state.busy() && !state.accepted && state.online && state.enabled) send(url, cookie, state);
+                if (!activity.isDestroyed() && state.busy() && !state.accepted && state.online && state.enabled) send(url, origin, cookie, state);
                 else finished(url);
             });
         });
     }
 
-    private void send(String url, String cookie, ComputerUpdate state) {
+    private void send(String url, String origin, String cookie, ComputerUpdate state) {
         final String id = state.request;
         activity.net.execute(() -> {
             JSONObject result = null; String problem = ""; boolean uncertain = false;
-            try { result = bench.post(url + "/api/terminal", cookie, new JSONObject().put("action", "update").put("id", id)); }
+            try { result = bench.post(origin + "/api/terminal", cookie, new JSONObject().put("action", "update").put("id", id)); }
             catch (IOException error) { uncertain = true; }
             catch (Exception error) { problem = error.getMessage() == null ? "请求失败，请刷新后重试" : error.getMessage(); }
             final JSONObject reply = result; final String error = problem; final boolean retry = uncertain;

@@ -5,18 +5,29 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="robots" content="noindex">
   <meta name="theme-color" content="#fbfbfc">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Remote AI">
   <meta name="description" content="在手机上使用电脑里的终端、Claude Code 和 Codex。">
   <title>Remote AI</title>
-  <link rel="icon" href="data:,">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <link rel="stylesheet" href="app.css">
   <link rel="stylesheet" href="conversation.css">
   <link rel="stylesheet" href="ui/sheet.css">
+  <link rel="stylesheet" href="ui/attach.css">
   <script defer src="terminal/skins.js"></script>
   <script defer src="conversation.js"></script>
   <script defer src="ui/sheet.js"></script>
   <script defer src="ui/work.js"></script>
+  <script defer src="files/transfers.js"></script>
+  <script defer src="ui/attach.js"></script>
   <script defer src="app.js"></script>
+  <script defer src="select.js"></script>
+  <script defer src="organize.js"></script>
   <script defer src="begin.js"></script>
+  <script defer src="team-defaults.js"></script>
   <script defer src="teams.js"></script>
   <script defer src="together.js"></script>
   <script defer src="me.js"></script>
@@ -45,6 +56,7 @@
         <h1 id="heading">任务</h1>
         <p id="device" role="status" aria-live="polite"><span id="dot" aria-hidden="true"></span><span id="device-text">正在连接…</span></p>
       </div>
+      <button type="button" class="organize-entry" id="organize" hidden></button>
       <button type="button" class="icon" id="new-task" aria-label="新建对话" hidden></button>
       <button type="button" class="icon" id="settings" aria-label="设置" hidden></button>
     </header>
@@ -77,6 +89,14 @@
         <section id="needs" hidden>
           <div class="section-head"><h2>等你确认</h2><p id="needs-summary"></p></div>
           <ul class="cards" id="needs-list"></ul>
+        </section>
+        <section id="replies" hidden>
+          <div class="section-head"><h2>等你回复</h2></div>
+          <ul class="cards"></ul>
+        </section>
+        <section id="unseen" hidden>
+          <div class="section-head"><h2>刚完成 · 未看</h2></div>
+          <ul class="cards"></ul>
         </section>
         <section id="active" hidden>
           <div class="section-head"><h2>正在运行</h2><p id="active-summary"></p></div>

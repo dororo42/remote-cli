@@ -31,7 +31,7 @@
     const skin = window.RemoteCliPaint(saved('skin', 'paper'));
     Object.keys(READ).forEach(key => { const [choices, usual, name] = READ[key]; document.documentElement.style.setProperty(name, choices[saved(key, usual)] || choices[usual]); });
     document.documentElement.style.fontSize = TEXT[saved('text', 'normal')] || TEXT.normal;
-    const shade = skin.bg || skin.t.background;
+    const shade = (skin.chat && skin.chat.bg) || skin.bg || skin.t.background;
     const meta = document.querySelector('meta[name="theme-color"]');
     if (meta) meta.content = shade;
     if (native && native.chrome) native.chrome(shade);
@@ -93,12 +93,13 @@
     const pending = JSON.parse(pendingStore.get() || '[]');
     if (Array.isArray(pending)) pending.forEach(p => {
       if (p && /^[a-f0-9]{32}$/.test(p.id) && typeof p.text === 'string' && typeof p.draft === 'string' && p.draft.length <= 8000) {
-        mine.set(p.id, { id: p.id, text: p.text, draft: p.draft, state: ['accepted', 'rejected'].includes(p.state) ? p.state : 'unknown', error: p.error || '', node: null });
+        const pictures = Array.isArray(p.pictures) ? p.pictures.filter(name => RemoteAttach.NAME.test(name)).slice(0, RemoteAttach.MOST) : [];
+        mine.set(p.id, { id: p.id, text: p.text, draft: p.draft, pictures, state: ['accepted', 'rejected'].includes(p.state) ? p.state : 'unknown', error: p.error || '', node: null });
       }
     });
   } catch (error) { /* an unreadable receipt does not prevent the conversation from loading */ }
   function saveMine() {
-    const rows = Array.from(mine.values(), ({ id, text, draft, state, error }) => ({ id, text, draft, state, error }));
+    const rows = Array.from(mine.values(), ({ id, text, draft, pictures, state, error }) => ({ id, text, draft, pictures, state, error }));
     pendingStore.set(rows.length ? JSON.stringify(rows) : '');
   }
   const OUT_MOST = 200000;
@@ -107,6 +108,13 @@
     items = new Map(); asks = new Map(); rest = ''; writing = ''; lastEnd = '';
     said.replaceChildren();
     mine.forEach(p => { p.node = null; });
+  }
+  // What the user said: the words, then the pictures the computer named in lines of their own (ui/attach.js).
+  const shotsOf = names => RemoteAttach.shots(names, { base: '../', dir: terminal ? terminal.dir : '', from: 'terminal' });
+  function userNode(text) {
+    const { text: words, names } = RemoteAttach.split(text);
+    if (!names.length) return el('div', { className: 'user', textContent: text });
+    return el('div', { className: 'user with-shots' }, words ? el('span', { className: 'words', textContent: words }) : '', shotsOf(names));
   }
   // Successful steps collapse by default; explicit reading choices survive subsequent output.
   function stepNode(item) {
@@ -136,10 +144,15 @@
     let node;
     const item = { id: e.id, kind: e.kind, text: e.text || '', detail: e.detail || '', state: 'run', out: '' };
     if (e.kind === 'user') {
-      // what this page sent comes back from the tool: the bubble that waited for it is that message now
-      const waiting = e.op && mine.get(e.op);
-      if (waiting) { acknowledge(waiting); mine.delete(e.op); saveMine(); if (waiting.node) waiting.node.remove(); }
-      node = el('div', { className: 'user', textContent: item.text });
+      // what this page sent comes back from the tool: the bubble(s) that waited for it are that message now
+      const ackOps = Array.isArray(e.ops) && e.ops.length ? e.ops : (e.op ? [e.op] : []);
+      let changed = false;
+      ackOps.forEach(op => {
+        const waiting = op && mine.get(op);
+        if (waiting) { acknowledge(waiting); mine.delete(op); changed = true; if (waiting.node) waiting.node.remove(); }
+      });
+      if (changed) saveMine();
+      node = userNode(item.text);
     } else if (e.kind === 'text') {
       node = el('div', { className: 'text md' });
       setText(node, item.text, true);
@@ -185,7 +198,7 @@
     box.style.display = 'contents';
     if (more) box.append(el('p', { className: 'earlier', textContent: '更早的内容在电脑上' }));
     (messages || []).forEach(m => {
-      if (m.role === 'user') box.append(el('div', { className: 'user', textContent: m.text }));
+      if (m.role === 'user') box.append(userNode(m.text));
       else if (m.role === 'assistant') { const node = el('div', { className: 'text md' }); setText(node, m.text, false); box.append(node); }
       else if (m.role === 'thought') box.append(el('div', { className: 'thought', textContent: m.text }));
       else if (m.role === 'tool') {
@@ -256,9 +269,28 @@
     $('clock').textContent = kind === 'busy' && since ? lasted(Date.now() - since) : '';
     $('stop').hidden = !(kind === 'busy' || kind === 'confirm');
     $('again').hidden = !(ended && terminal.session);
+    const paramsBtn = $('params-btn');
+    if (paramsBtn) {
+      const canTune = !!terminal && !ended && kind !== 'busy' && kind !== 'confirm' && device.online && (work.has('teams-models') || work.has('chat-params'));
+      paramsBtn.hidden = !canTune;
+      if (canTune) {
+        const label = paramsSummary();
+        $('params-text').textContent = label || '模型与参数';
+        paramsBtn.classList.toggle('custom', !!label);
+      }
+    }
     $('write').hidden = !!ended;
-    $('go').hidden = !(kind === 'idle' && (lastEnd === 'stopped' || lastEnd === 'failed') && !$('box').value.trim());
+    $('go').hidden = !(kind === 'idle' && (lastEnd === 'stopped' || lastEnd === 'failed') && !$('box').value.trim() && !(picker && picker.count));
     $('send').disabled = kind === 'off';
+    $('send').classList.toggle('going', sendingPictures);
+  }
+  function teamUrl(teamId) {
+    const fromBench = new URLSearchParams(location.search).get('from') === 'bench';
+    return '../?tab=together&do=team&item=' + encodeURIComponent(teamId) + (fromBench ? '&from=bench' : '');
+  }
+  function openTeam(teamId) {
+    if (!teamId) return;
+    location.href = teamUrl(teamId);
   }
   function header() {
     if (!terminal) return;
@@ -267,7 +299,34 @@
     $('where-text').textContent = (TOOLS[terminal.tool] || terminal.tool) + ' · ' + (terminal.dir || base(terminal.folder));
     $('dot').className = device.online ? 'on' : 'off';
     $('files').hidden = !terminal.dir;
+    const teamBar = $('team-bar');
+    if (teamBar) {
+      teamBar.hidden = !terminal.team;
+      if (terminal.team) $('team-bar-text').textContent = '协作任务进行中 · 当前对话已加入协作';
+    }
+    canPicture();
+    ensureModelCatalog();
     if (terminal.error && terminal.error !== lastError) { lastError = terminal.error; if (drawn) toast(terminal.error); }
+  }
+  let modelCatalog = null, modelCatalogAsked = false;
+  function ensureModelCatalog() {
+    if (modelCatalogAsked || !terminal) return;
+    modelCatalogAsked = true;
+    work.ensure().then(() => {
+      stands();
+      if (window.RemoteRestart && window.RemoteRestart.models && work.has('teams-models')) {
+        return window.RemoteRestart.models(work).then(cat => { modelCatalog = cat; stands(); });
+      }
+    }, () => { modelCatalogAsked = false; });
+  }
+  function paramsSummary() {
+    if (!terminal) return '';
+    const d = window.RemoteTeamDefaults;
+    const parts = [];
+    if (terminal.model) parts.push(d ? d.modelLabel(terminal.tool, terminal.model, modelCatalog) : terminal.model);
+    if (terminal.effort) parts.push('思考 ' + (d ? d.shortEffortLabel(terminal.effort) : terminal.effort));
+    if (terminal.mode && terminal.mode !== 'full' && terminal.tool !== 'agy') parts.push(d ? d.modeLabel(terminal.mode, true) : terminal.mode);
+    return parts.join(' · ');
   }
 
   // ---- reading: the stay at the end while one is there
@@ -307,12 +366,17 @@
   box.value = draft.get();
   function bubble(p) {
     const labels = { queued: '正在送达', retrying: '连接中断，正在确认送达', accepted: '已提交，等待对话接收', unknown: '送达结果未知，请先检查对话', rejected: '没有送出：' + (p.error || '') };
-    const node = el('div', { className: 'user going' + (p.state === 'rejected' || p.state === 'unknown' ? ' failed' : ''), textContent: p.text },
+    const pictures = p.pictures || [];
+    const node = el('div', { className: 'user going' + (pictures.length ? ' with-shots' : '') + (p.state === 'rejected' || p.state === 'unknown' ? ' failed' : '') },
+      pictures.length ? (p.text ? el('span', { className: 'words', textContent: p.text }) : '') : p.text,
+      pictures.length ? shotsOf(pictures) : '',
       el('small', { textContent: labels[p.state] || labels.queued }));
     if (p.state === 'rejected' || p.state === 'unknown') node.append(el('button', { type: 'button', textContent: p.state === 'unknown' ? '检查后重新编辑' : '重新编辑', onclick: () => {
       const restore = () => {
-        if (box.value.trim() && box.value !== p.draft) return toast('输入框里还有未发送的文字，请先处理');
-        box.value = p.draft; draft.set(box.value); grow(); box.focus(); p.node.remove(); mine.delete(p.id); saveMine(); stands();
+        if ((box.value.trim() && box.value !== p.draft) || (p.pictures && p.pictures.length && picker.count)) return toast('输入框里还有未发送的内容，请先处理');
+        box.value = p.draft; draft.set(box.value); grow(); box.focus(); p.node.remove(); mine.delete(p.id); saveMine();
+        if (p.pictures && p.pictures.length) picker.restore(p.pictures);
+        stands();
       };
       if (p.state === 'unknown') RemoteSheet.confirm({ title: '重新编辑这条消息', text: '电脑可能已经收到，请先检查对话。再次发送会作为一条新消息。', label: '已检查，重新编辑', act: sheet => { sheet.close(true); restore(); } });
       else restore();
@@ -323,17 +387,22 @@
     draft.clear(p.draft);
     if (box.value === p.draft) { box.value = ''; grow(); }
   }
-  function say(text) {
-    const original = text; text = text.trim();
-    if (!text || !terminal || terminal.state === 'closed') return;
-    if (Array.from(mine.values()).some(p => p.text === text)) return toast('这条消息正在确认送达，请先查看它的状态');
-    const p = { id: newId(), text, draft: original, state: 'queued' };
+  const sameMessage = (p, text, pictures) => p.text === text && (p.pictures || []).join() === pictures.join();
+  function say(text, paths) {
+    const original = text, attachments = paths || [], pictures = attachments.map(path => path.split('/').pop());
+    text = text.trim();
+    if ((!text && !attachments.length) || !terminal || terminal.state === 'closed') return false;
+    if (Array.from(mine.values()).some(p => sameMessage(p, text, pictures))) { toast('这条消息正在确认送达，请先查看它的状态'); return false; }
+    const p = { id: newId(), text, draft: original, pictures, state: 'queued' };
     draft.set(box.value);
     mine.set(p.id, p);
     saveMine();
     said.querySelectorAll('.empty').forEach(node => node.remove());
     p.node = bubble(p); said.append(p.node); toEnd();
-    bridge().send({ id: p.id, action: 'say', text });
+    const op = { id: p.id, action: 'say', text };
+    if (attachments.length) op.attachments = attachments;
+    bridge().send(op);
+    return true;
   }
   const grow = () => {
     const prevScroll = box.scrollTop;
@@ -343,43 +412,92 @@
     stands();
   };
   box.addEventListener('input', () => { draft.set(box.value); grow(); });
+  box.addEventListener('focus', () => {
+    const keepEnd = atEnd();
+    setTimeout(() => {
+      if (document.activeElement === box && keepEnd) toEnd();
+    }, 220);
+  });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', () => {
+      if (document.activeElement === box && atEnd()) toEnd();
+    }, { passive: true });
+  }
   box.addEventListener('keydown', event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); $('write').requestSubmit(); } });
-  $('write').addEventListener('submit', event => {
+  // The picture button, shown where the computer takes pictures with a message and the conversation is in a project.
+  let sendingPictures = false, pictureAsked = false;
+  const picker = new RemoteAttach.Picker({ form: $('write'), before: $('params-btn'), base: '../', dir: () => terminal ? terminal.dir : '', toast, changed: () => stands() });
+  function canPicture() {
+    if (pictureAsked || !terminal) return;
+    pictureAsked = true;
+    work.ensure().then(data => { picker.enabled = !!(data && terminal.dir && (data.device.features || []).includes('attachments')); }, () => { pictureAsked = false; });
+  }
+  $('write').addEventListener('submit', async event => {
     event.preventDefault();
-    if (!box.value.trim()) return box.focus();
-    say(box.value); grow();
+    if (sendingPictures) return;
+    if (!box.value.trim() && !picker.count) return box.focus();
+    if (!picker.count) { say(box.value); grow(); return; }
+    if (!terminal || terminal.state === 'closed') return;
+    if (Array.from(mine.values()).some(p => sameMessage(p, box.value.trim(), picker.names))) return toast('这条消息正在确认送达，请先查看它的状态');
+    sendingPictures = true; stands();
+    const send = $('send');
+    try {
+      const paths = await picker.upload(done => { send.textContent = done + '%'; });
+      if (say(box.value, paths)) picker.clear();
+      grow();
+    } catch (error) { toast(error.message); }
+    finally { sendingPictures = false; send.textContent = '发送'; stands(); }
   });
   $('go').onclick = () => say('继续');
   $('stop').onclick = () => { $('stop').disabled = true; bridge().send({ action: 'stop' }); setTimeout(() => { $('stop').disabled = false; }, 2500); };
   $('again').onclick = () => bridge().again();
   $('back').onclick = () => bridge().close();
   $('files').onclick = () => { if (terminal && terminal.dir) location.href = '../files/?dir=' + encodeURIComponent(terminal.dir) + '&from=terminal'; };
+  if ($('params-btn')) $('params-btn').onclick = () => {
+    if (!terminal) return;
+    work.ensure();
+    RemoteSheet.open(RemoteRestart.paramsPage(work, of(), choice => reopen('chat', choice)), '模型与参数');
+  };
+  if ($('team-bar')) $('team-bar').onclick = () => { if (terminal && terminal.team) openTeam(terminal.team); };
 
-  // Into a terminal of the phone's: the conversation is closed here and gone on with there, once the computer has let it go.
-  async function inTerminal() {
-    const { tool, dir, session } = terminal;
-    bridge().send({ action: 'close' });
-    toast('正在转到终端…');
+  // The same conversation in a new terminal of the phone's: closed here, and gone on with there once the computer has
+  // let it go. `form`: 'chat' to go on with it as a conversation (restarted: its tool started anew, `more` the model,
+  // effort and permission mode it goes on with), '' in a terminal's screen.
+  async function reopen(form, more = {}) {
+    const { tool, dir, session, id: was } = terminal;
+    const tail = () => bridge().teamQuery ? bridge().teamQuery() : (new URLSearchParams(location.search).get('from') === 'bench' ? '&from=bench' : '');
+    // shown the other way as it is: the computer ends this one and goes on with it in one step (`reopen`)
+    if (!Object.keys(more).length && form !== 'chat' && session && terminal.state !== 'closed' && work.has('reopen') && (tool === 'claude' || tool === 'codex')) {
+      const { status, body } = await bridge().post({ action: 'start', id: newId(), tool, dir, reopen: was });
+      if (status !== 200) throw new Error(body.error || '没有打开');
+      location.replace('../terminal/?id=' + body.terminal + tail());
+      return;
+    }
+    if (terminal.state !== 'closed') bridge().send({ action: 'close' });
     for (let n = 0; n < 40; n++) {
       await new Promise(done => setTimeout(done, 500));
       try {
-        const list = await (await fetch('../api/terminal', { credentials: 'same-origin' })).json();
-        const listed = (list.sessions || []).find(s => s.id === session && s.tool === tool);
-        if (listed && !listed.live) break;
+        const list = await (await fetch('../api/terminal', { credentials: 'same-origin', cache: 'no-store' })).json();
+        const listed = session ? (list.sessions || []).find(s => s.id === session && s.tool === tool) : null;
+        const open = (list.terminals || []).some(t => t.id === was && (t.state === 'running' || t.state === 'starting'));
+        if (!open && (!session || !listed || !listed.live)) break;
       } catch (error) { /* asked again */ }
     }
-    try {
-      const { status, body } = await bridge().post({ action: 'start', id: newId(), tool, dir, session, history: false });
-      if (status !== 200) throw new Error(body.error || '没有打开');
-      location.replace('../terminal/?id=' + body.terminal + (new URLSearchParams(location.search).get('from') === 'bench' ? '&from=bench' : ''));
-    } catch (error) { toast(error.message); }
+    const start = Object.assign({ action: 'start', id: newId(), tool, dir, history: false }, session ? { session } : {}, form ? { form } : {}, more);
+    const { status, body } = await bridge().post(start);
+    if (status !== 200) throw new Error(body.error || '没有打开');
+    location.replace((form === 'chat' ? '?id=' : '../terminal/?id=') + body.terminal + tail());
+  }
+  async function inTerminal() {
+    toast('正在转到终端…');
+    try { await reopen(''); } catch (error) { toast(error.message); }
   }
   // ---- the menu: what the conversation is, what is done with it (handed to another AI, asked at a time), its
   // name, and how it is read. Each opens as a page of the same sheet (../ui/sheet.js, ../ui/work.js).
   const work = RemoteWork.forPage('../', toast);
   const skinList = () => {
     const cur = saved('skin', 'paper');
-    const items = Object.keys(window.RemoteCliSkins).map(key => { const k = window.RemoteCliSkins[key]; return { key, name: k.name, bg: k.bg || k.t.background, ink: k.t.foreground, muted: k.muted, accent: k.accent, current: key === cur }; });
+    const items = Object.keys(window.RemoteCliSkins).map(key => { const k = window.RemoteCliSkins[key]; return { key, name: k.name, bg: (k.chat && k.chat.bg) || k.bg || k.t.background, bubble: (k.chat && k.chat.userBg) || k.accentSoft, termBg: k.t.background, ink: k.t.foreground, muted: k.muted, accent: k.accent, current: key === cur }; });
     items.unshift({ key: 'auto', name: '跟随系统', follow: true, current: cur === 'auto' });
     return items;
   };
@@ -388,7 +506,7 @@
     readline: ['行距', [['tight', '紧凑'], ['normal', '标准'], ['loose', '宽松']], 'normal'],
     readfont: ['字体', [['sans', '默认'], ['serif', '衬线'], ['mono', '等宽']], 'sans'] };
   const STATE = { busy: ['正在执行', 'var(--busy)'], confirm: ['等你确认', 'var(--bad)'], starting: ['正在启动', 'var(--accent)'], idle: ['等你的消息', 'var(--good)'], ended: ['已结束', 'var(--muted)'] };
-  const of = () => ({ id: terminal.session || '', tool: terminal.tool, title: terminal.title || TOOLS[terminal.tool], dir: terminal.dir || '', terminal: terminal.id });
+  const of = () => ({ id: terminal.session || '', tool: terminal.tool, title: terminal.title || TOOLS[terminal.tool], dir: terminal.dir || '', terminal: terminal.id, model: terminal.model || '', effort: terminal.effort || '', mode: terminal.mode || '' });
   function menuPage() {
     const { ui } = RemoteSheet;
     return { title: '对话', build(p) {
@@ -402,8 +520,29 @@
         { id: 'menu-schedule', icon: 'clock', tint: 'time', label: '定时提问', why: noSession || (ended ? '对话已结束，先继续这段对话' : ''), say: toast, act: () => work.schedules(p.sheet, of()) },
         { id: 'menu-files', icon: 'folder', tint: 'file', label: '项目文件', why: terminal.dir ? '' : '这段对话不在项目里', say: toast, act: () => { p.sheet.close(null, true); location.href = '../files/?dir=' + encodeURIComponent(terminal.dir) + '&from=terminal'; } },
         { id: 'menu-copy', icon: 'copy', tint: 'copy', label: '复制全文', say: toast, act: async () => { p.sheet.close(null); toast(await RemoteSheet.copy(said.innerText.trim()) ? '已复制整段对话' : '没能复制，请长按选择文字'); } }]));
-      const rows = [ui.row({ icon: 'pen', tint: 'muted', label: '重命名', value: terminal.title || '', go: () => p.sheet.push(renamePage()) })];
-      if (terminal.session && terminal.dir && !ended) rows.push(ui.row({ icon: 'term', tint: 'muted', label: '在终端中打开', go: () => p.sheet.push(ui.confirm({ title: '在终端中打开', text: '这里的对话会关闭，在手机终端里继续同一段对话。', label: '在终端中打开', busy: '正在转到终端…', act: async sheet => { sheet.close(null, true); await inTerminal(); } })) }));
+      const rows = [];
+      if (terminal.team) {
+        rows.push(ui.row({ icon: 'relay', tint: 'agy', id: 'menu-team', label: '查看协作任务', value: '已加入', go: () => { p.sheet.close(null, true); openTeam(terminal.team); } }));
+      } else {
+        const promoteWhy = !terminal.dir ? '这段对话不在项目里'
+          : ended ? '对话已结束，先继续这段对话'
+          : (state === 'busy' || state === 'confirm') ? '请等本轮对话结束后再转为协作'
+          : '';
+        rows.push(ui.row({
+          icon: 'spark', tint: 'agy', id: 'menu-promote', label: '转为协作',
+          detail: promoteWhy || '保留上下文，原地升级为多 AI 协作',
+          go: () => {
+            if (promoteWhy) return toast(promoteWhy);
+            p.sheet.push(work.promotePage(of(), team => { if (team && team.id) openTeam(team.id); }));
+          }
+        }));
+      }
+      if (!ended && (work.has('teams-models') || work.has('chat-params'))) {
+        rows.push(ui.row({ icon: 'sliders', tint: 'codex', id: 'menu-params', label: '模型与参数', value: paramsSummary() || '默认', go: () => p.sheet.push(RemoteRestart.paramsPage(work, of(), choice => reopen('chat', choice))) }));
+      }
+      rows.push(ui.row({ icon: 'pen', tint: 'muted', label: '重命名', value: terminal.title || '', go: () => p.sheet.push(renamePage()) }));
+      if (terminal.session) rows.push(ui.row({ icon: 'refresh', tint: 'muted', label: '重启对话', go: () => p.sheet.push(RemoteRestart.page(work, of(), choice => reopen('chat', choice))) }));
+      if (terminal.session && terminal.dir && !ended) rows.push(ui.row({ icon: 'term', tint: 'muted', label: '在终端界面中继续', go: () => p.sheet.push(ui.confirm({ title: '在终端界面中继续', text: '同一段对话改在 ' + (TOOLS[terminal.tool] || terminal.tool) + ' 自己的终端界面里继续，之后可以再换回对话。', label: '在终端界面中继续', busy: '正在转到终端…', act: async sheet => { sheet.close(null, true); await inTerminal(); } })) }));
       if (ended && terminal.session) rows.push(ui.row({ icon: 'play', tint: 'good', label: '继续这段对话', act: () => { p.sheet.close(null, true); bridge().again(); } }));
       p.body.append(ui.section('对话', ui.group(...rows)));
       const chosenSkin = saved('skin', 'paper');

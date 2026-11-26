@@ -105,11 +105,15 @@ public final class MainActivity extends Activity {
     private Workbench bench;
     private ComputerManagement computerManagement;
     private UuRemote uuRemote;
+    RouteCoordinator routes;
     private String pairingRecord = "";
     AppPages appPages;          // (the workbench redraws the limits on 我的 when it has read them)
     private Tabs tabs;
     private String appTab = "home";                 // the tab the app's lists were left at
     private FrameLayout root;
+    private ScrollView nativeScroll;
+    /** The tabs at the foot of a list, and a bar that stands in their place for a while (多选 on 任务). */
+    private View tabsView, footBar;
     private WebView web;                        // one WebView for the whole activity: its session, bridge and scroll survive a tab change
     private View connectionBanner;              // an inline retry when a computer's pages cannot be reached
     private TextView bannerText;
@@ -119,7 +123,7 @@ public final class MainActivity extends Activity {
     private String screen = "";                 // one of the tabs ("home", "projects", "together", "me"), "add", "scan" or "web"
     private final Runnable watch = this::checkConnection;
     private boolean foreground;
-    private String currentOrigin = "";
+    private String currentOrigin = "", currentComputerUrl = "";
     private String movedFrom = "", movedTo = "";       // a computer that is turning to another line: where it was, and where its page was sent
     private ConnectionHealth connectionHealth = new ConnectionHealth();
     boolean showing(String name) { return foreground && name.equals(screen); }
@@ -202,8 +206,12 @@ public final class MainActivity extends Activity {
         }
         kit = new Kit(this);
         bench = new Workbench(this, kit);
+        if (state != null) bench.restoreState(state.getBundle("workbench"));
         computerManagement = new ComputerManagement(this, kit, bench);
         uuRemote = new UuRemote(this, kit);
+        routes = new RouteCoordinator(this, net);
+        routes.setNetworkChangeListener(() -> reprobeRoutes(true));
+        routes.startMonitoring();
         appPages = new AppPages(this, kit, bench);
         tabs = new Tabs(this, kit);
         repaint();
@@ -224,12 +232,40 @@ public final class MainActivity extends Activity {
         // Process death should reopen the tab the owner was on, not always 任务.
         out.putString("appTab", appTab);
         out.putString("origin", currentOrigin);
+        rememberWorkbenchPosition();
+        out.putBundle("workbench", bench.saveState());
     }
 
     @Override protected void onNewIntent(Intent intent) { super.onNewIntent(intent); setIntent(intent); if (!external(intent, false)) linked(intent); }
 
     JSONObject computerByUrl(String url) { JSONArray list = computers(); for (int i = 0; i < list.length(); i++) { JSONObject item = list.optJSONObject(i); if (item != null && url.equals(item.optString("url"))) return item; } return null; }
     JSONObject computerById(String id) { JSONArray list = computers(); for (int i = 0; i < list.length(); i++) { JSONObject item = list.optJSONObject(i); if (item != null && DesktopProtocol.validId(id) && id.equals(item.optString("id"))) return item; } return null; }
+    String recordIdByUrl(String url) { JSONObject c = computerByUrl(url); return c == null ? "" : c.optString("id"); }
+    String activeOrigin(String savedUrl) { return routes == null ? savedUrl : routes.activeOrigin(recordIdByUrl(savedUrl), savedUrl); }
+    String failoverOrigin(String savedUrl, String failedOrigin) {
+        if (routes == null) return savedUrl;
+        String id = recordIdByUrl(savedUrl);
+        return id.isEmpty() ? savedUrl : routes.failover(id, savedUrl, failedOrigin);
+    }
+    void reprobeRoutes(boolean refreshAfter) {
+        if (routes == null) return;
+        JSONArray list = computers();
+        java.util.List<String[]> pairs = new java.util.ArrayList<>();
+        for (int i = 0; i < list.length(); i++) {
+            JSONObject c = list.optJSONObject(i);
+            if (c != null) pairs.add(new String[]{ c.optString("id"), c.optString("url") });
+        }
+        if (pairs.isEmpty()) return;
+        routes.reprobeAll(pairs, () -> {
+            if (!refreshAfter) return;
+            runOnUiThread(() -> {
+                if (!foreground) return;
+                if (Tabs.has(screen) && bench != null) bench.refresh();
+                if ("computer".equals(screen) && computerManagement != null) computerManagement.refresh();
+            });
+        });
+    }
+    String routeSummary(String savedUrl) { return routes == null ? host(savedUrl) : routes.activeRouteSummary(recordIdByUrl(savedUrl), savedUrl); }
     void desktop(String url) { uuRemote.menu(url); }
     private boolean external(Intent intent, boolean cold) {
         Uri uri = intent == null ? null : intent.getData();
@@ -299,8 +335,10 @@ public final class MainActivity extends Activity {
         connectionHealth.retire();
         connectionBanner = null; bannerText = null;
         root.removeAllViews();
+        tabsView = null; footBar = null;
         bars(kit.BG);
         ScrollView scroll = new ScrollView(this);
+        nativeScroll = scroll;
         scroll.setFillViewport(true);
         scroll.addView(content, new ViewGroup.LayoutParams(-1, -2));
         View incoming;
@@ -308,22 +346,44 @@ public final class MainActivity extends Activity {
             // the tabs stay at the foot while the list above them is scrolled
             LinearLayout shell = kit.column();
             shell.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
-            shell.addView(tabs.build(name, this::appPage));
+            tabsView = tabs.build(name, this::appPage);
+            shell.addView(tabsView);
             root.addView(shell, new FrameLayout.LayoutParams(-1, -1));
             incoming = scroll;
         } else {
             root.addView(scroll, new FrameLayout.LayoutParams(-1, -1));
             incoming = scroll;
         }
-        if (!previous.isEmpty() && !previous.equals(name)) {
+        if (!previous.isEmpty() && !previous.equals(name) && Motion.enabled()) {
+            int fromTab = Tabs.index(previous), toTab = Tabs.index(name);
             boolean secondary = !Tabs.has(name);
             incoming.setAlpha(0f);
-            if (secondary) incoming.setTranslationX(kit.dp(18));
-            else incoming.setTranslationY(kit.dp(5));
-            incoming.animate().alpha(1f).translationX(0f).translationY(0f).setDuration(secondary ? 190 : 150)
-                .setInterpolator(new DecelerateInterpolator(2.0f)).start();
+            if (fromTab >= 0 && toTab >= 0) {
+                incoming.setTranslationX((toTab > fromTab ? 1 : -1) * kit.dp(14));
+            } else if (secondary) {
+                incoming.setTranslationX(kit.dp(22));
+            } else {
+                incoming.setTranslationX(-kit.dp(10));
+            }
+            incoming.animate().alpha(1f).translationX(0f).translationY(0f).setDuration(secondary ? 210 : 190)
+                .setInterpolator(Motion.EASE_OUT).start();
         }
         screen = name;
+        if ("home".equals(name)) bench.restorePosition(scroll);
+    }
+
+    /** Puts `bar` at the foot of the list in the tabs' place; null gives the tabs back. */
+    void foot(View bar) {
+        if (tabsView == null || !(tabsView.getParent() instanceof LinearLayout)) return;
+        LinearLayout shell = (LinearLayout) tabsView.getParent();
+        if (footBar != null) shell.removeView(footBar);
+        footBar = bar;
+        tabsView.setVisibility(bar == null ? View.VISIBLE : View.GONE);
+        if (bar != null) shell.addView(bar, new LinearLayout.LayoutParams(-1, -2));
+    }
+
+    void rememberWorkbenchPosition() {
+        if ("home".equals(screen) && nativeScroll != null) bench.rememberPosition(nativeScroll);
     }
 
     // ---- the app's own lists: back to the one that was open last, or to 任务 with what went wrong
@@ -337,6 +397,7 @@ public final class MainActivity extends Activity {
     }
     void appPage(String tab) {
         if (!Tabs.has(tab)) return;
+        rememberWorkbenchPosition();
         appTab = tab;
         if ("home".equals(tab)) { home(""); return; }
         repaint();
@@ -347,11 +408,15 @@ public final class MainActivity extends Activity {
     }
     /** One computer's own page of a tab: where what the app lists of it is seen whole and changed. */
     void computerPage(String url, String tab) { openPage(url, "", "/?tab=" + tab + ("me".equals(tab) ? "&stats=1" : "")); }
+    /** Opens a computer's settings page directly at a given section anchor (e.g. "part-team-defaults"). */
+    void computerSettings(String url, String anchor) { openPage(url, "", "/computer/" + (anchor != null && !anchor.isEmpty() ? "#" + anchor : "")); }
     /** That computer's page of 协作 with one of its sheets open: "team", "handoff", "many", "chain", "schedule" (web/together.js). */
     void together(String url, String what) { openPage(url, "", "/?tab=together&do=" + what); }
     void together(String url, String what, String item) { openPage(url, "", "/?tab=together&do=" + Uri.encode(what) + "&item=" + Uri.encode(item)); }
     boolean autoUpdate() { return updater != null && updater.automatic(); }
     void toggleAutoUpdate() { if (updater == null) return; updater.automatic(!updater.automatic()); home(""); }
+    boolean previewUpdates() { return updater != null && updater.includePrereleases(); }
+    void togglePreviewUpdates() { if (updater == null) return; updater.includePrereleases(!previewUpdates()); home(""); }
     void checkUpdate() { message.setTextColor(kit.MUTED); message.setText("正在检查新版本…"); updater.check(true); }
     void manage(String url) {
         JSONArray list = computers();
@@ -413,6 +478,7 @@ public final class MainActivity extends Activity {
             JSONObject item = now.optJSONObject(i);
             if (item == null || !url.equals(item.optString("url"))) continue;
             uuRemote.forget(item.optString("id"));
+            if (routes != null) routes.forget(item.optString("id"));
             now.remove(i);
         }
         store(now);
@@ -527,6 +593,13 @@ public final class MainActivity extends Activity {
     }
     /** The computer's page with the sheet of a new conversation: in one of its projects, in an application or in a terminal. */
     void startNew(String address) { openPage(address, "", "/?tab=tasks&new=1"); }
+    void organize(String address, String tool, String session) {
+        String target = session.isEmpty() ? "" : "&session=" + Uri.encode(session) + "&tool=" + Uri.encode(tool);
+        openPage(address, "", "/?tab=tasks&organize=1&from=bench" + target);
+    }
+    void readSession(String address, String tool, String session) {
+        openPage(address, "", "/?tab=tasks&from=bench&read=" + Uri.encode(session) + "&tool=" + Uri.encode(tool));
+    }
     // ---- reminders: off until the person turns them on
     boolean watching() { return prefs.getBoolean("watch", false); }
     String reminderStatus() {
@@ -608,6 +681,8 @@ public final class MainActivity extends Activity {
             startActivity(new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())));
         }
     }
+    /** Straight into the unified console workspace (Diff, Worktree, multi-pane chat/terminal). */
+    void openConsole(String address) { openPage(address, "", "/console/"); }
     /** Straight into one terminal; its page is told to come back here rather than to that computer's list. */
     void openTerminal(String address, String terminal) { openTerminal(address, terminal, false); }
     void openTerminal(String address, String terminal, boolean chat) {
@@ -644,20 +719,25 @@ public final class MainActivity extends Activity {
     }
 
     private void openPage(String address, String password, String path) {
+        rememberWorkbenchPosition();
+        nativeScroll = null;
         ticker.removeCallbacks(watch);
         bench.stop();
         computerManagement.stop();
-        currentOrigin = address;
+        final String savedComputerUrl = address;
+        final String targetOrigin = password.isEmpty() ? activeOrigin(address) : address;
+        currentComputerUrl = savedComputerUrl;
+        currentOrigin = targetOrigin;
         connectionHealth.retire();
         connectionHealth = new ConnectionHealth();
         final ConnectionHealth health = connectionHealth;
-        prefs.edit().putString("server", address).apply();
+        prefs.edit().putString("server", savedComputerUrl).apply();
         detachWeb();
         root.removeAllViews();
         screen = "web";
         bars(kit.BG);
         WebView view = ensureWeb();
-        final String origin = address;
+        final String origin = targetOrigin;
         final EmbeddedPages pages;
         try {
             pages = new EmbeddedPages(getAssets(), origin);
@@ -733,7 +813,7 @@ public final class MainActivity extends Activity {
         page.setAlpha(0f);
         root.addView(page, new FrameLayout.LayoutParams(-1, -1));
         page.animate().alpha(1f).setDuration(150).setInterpolator(new DecelerateInterpolator(1.8f)).start();
-        String webTarget = address + path;
+        String webTarget = origin + path;
         if (!password.isEmpty()) webTarget += "#p=" + Uri.encode(password);
         view.loadUrl(webTarget);
         if (foreground) ticker.post(watch);
@@ -780,6 +860,9 @@ public final class MainActivity extends Activity {
                 if (ok && connectionBanner != null && connectionBanner.getVisibility() == View.VISIBLE) {
                     connectionBanner.setVisibility(View.GONE);
                 }
+                if (ok && routes != null && !currentComputerUrl.isEmpty()) {
+                    routes.maybeUpgradeInBackground(recordIdByUrl(currentComputerUrl), currentComputerUrl, origin);
+                }
                 if (failed) reconnect(checked, origin, health);
                 else ticker.postDelayed(watch, 3000);
             });
@@ -787,6 +870,28 @@ public final class MainActivity extends Activity {
     }
 
     private void reconnect(WebView failed, String origin, ConnectionHealth health) {
+        final String savedUrl = currentComputerUrl.isEmpty() ? origin : currentComputerUrl;
+        final String recordId = recordIdByUrl(savedUrl);
+        if (routes != null && !recordId.isEmpty() && !origin.equals(movedTo)) {
+            net.execute(() -> {
+                String alternate = routes.failover(recordId, savedUrl, origin);
+                if (!alternate.isEmpty() && !alternate.equals(origin)) {
+                    runOnUiThread(() -> {
+                        if (!health.isActive() || web != failed || !"web".equals(screen)) return;
+                        String currentUrl = failed.getUrl();
+                        String recoverPath = currentUrl != null && currentUrl.startsWith(origin + "/") ? currentUrl.substring(origin.length()) : "/?tab=projects";
+                        openPage(savedUrl, "", recoverPath);
+                    });
+                    return;
+                }
+                showReconnectBanner(failed, origin, health);
+            });
+            return;
+        }
+        showReconnectBanner(failed, origin, health);
+    }
+
+    private void showReconnectBanner(WebView failed, String origin, ConnectionHealth health) {
         root.post(() -> {
             // The same WebView may now show another page; only its active connection may stop it.
             if (!health.isActive() || web != failed || !"web".equals(screen)) return;
@@ -825,8 +930,8 @@ public final class MainActivity extends Activity {
         if (drawn) script.append("if(was!=='").append(skin).append("'&&!(window.RemoteCliNative&&RemoteCliNative.pref)&&!location.hash)location.reload();");
         return script.append("}catch(e){}})()").toString();
     }
-    // (and, kept the same way for every computer: the kind of conversation its owner begins, "newkind")
-    private static final java.util.List<String> LOOK = java.util.Arrays.asList("skin", "termskin", "text", "font", "spacing", "cursor", "renderer", "readfont", "readsize", "readline", "newkind");
+    // (and, kept the same way for every computer: the AI its owner begins a conversation with, "newtool")
+    private static final java.util.List<String> LOOK = java.util.Arrays.asList("skin", "termskin", "text", "font", "spacing", "cursor", "renderer", "readfont", "readsize", "readline", "newtool");
     private final Saver saver = new Saver(this);
     private final FilePicker filePicker = new FilePicker(this);
     private final class Bridge {
@@ -881,6 +986,8 @@ public final class MainActivity extends Activity {
         /** Looks for a newer version of the app now; the answer comes as a short notice or a question. */
         @JavascriptInterface public boolean autoUpdate() { return updater != null && updater.automatic(); }
         @JavascriptInterface public void setAutoUpdate(boolean on) { runOnUiThread(() -> { if (updater != null) updater.automatic(on); }); }
+        @JavascriptInterface public boolean previewUpdates() { return MainActivity.this.previewUpdates(); }
+        @JavascriptInterface public void setPreviewUpdates(boolean on) { runOnUiThread(() -> { if (updater != null) updater.includePrereleases(on); }); }
         @JavascriptInterface public void update() { runOnUiThread(() -> { android.widget.Toast.makeText(MainActivity.this, "正在检查新版本…", android.widget.Toast.LENGTH_SHORT).show(); updater.check(true); }); }
         @JavascriptInterface public String version() { return versionName(); }
         /**
@@ -952,18 +1059,21 @@ public final class MainActivity extends Activity {
         /** The name this phone gave the computer whose pages are shown, for the line under the page's heading. */
         @JavascriptInterface public String computer() {
             JSONArray list = computers();
-            for (int i = 0; i < list.length(); i++) { JSONObject one = list.optJSONObject(i); if (one != null && currentOrigin.equals(one.optString("url"))) return one.optString("name"); }
-            return "";
+            for (int i = 0; i < list.length(); i++) {
+                JSONObject one = list.optJSONObject(i);
+                if (one != null && (currentComputerUrl.equals(one.optString("url")) || currentOrigin.equals(one.optString("url"))) && !one.optString("name").isEmpty()) return one.optString("name");
+            }
+            return host(currentComputerUrl.isEmpty() ? currentOrigin : currentComputerUrl);
         }
         @JavascriptInterface public void disconnect() { home(); }
         /** Removes the currently opened computer from this phone without needing its password. */
         @JavascriptInterface public void forgetCurrent() {
-            final String target = currentOrigin;
+            final String target = currentComputerUrl.isEmpty() ? currentOrigin : currentComputerUrl;
             if (target != null && !target.isEmpty()) runOnUiThread(() -> confirmRemoveComputer(target));
         }
         /** The terminal page reports the finished work it has shown, so the workbench stops listing it as new. */
         @JavascriptInterface public void seen(String terminal, String at) {
-            final String origin = currentOrigin;
+            final String origin = currentComputerUrl.isEmpty() ? currentOrigin : currentComputerUrl;
             runOnUiThread(() -> { try { bench.markSeen(origin, terminal, Long.parseLong(at)); } catch (Exception invalid) { /* not a time */ } });
         }
     }
@@ -986,6 +1096,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override public void onBackPressed() {
+        if ("home".equals(screen) && bench.back()) return;
         if ("computer".equals(screen)) { home(""); return; }
         if ("reminders".equals(screen)) { appPage("me"); return; }
         if ("scan".equals(screen) || "add".equals(screen)) { endScan(); home(""); return; }
@@ -995,6 +1106,6 @@ public final class MainActivity extends Activity {
         super.onBackPressed();
     }
     @Override protected void onPause() { super.onPause(); foreground = false; if (watching() && computers().length() > 0) Watcher.start(this); ticker.removeCallbacks(watch); bench.stop(); computerManagement.stop(); CookieManager.getInstance().flush(); if (web != null) web.onPause(); if (scanner != null) { endScan(); home(""); } }
-    @Override protected void onResume() { super.onResume(); foreground = true; if (watching()) Watcher.start(this, true); if (web != null) { web.onResume(); ticker.post(watch); } if (Tabs.has(screen)) bench.refresh(); if ("together".equals(screen) || "me".equals(screen)) appPages.refresh(screen); if ("computer".equals(screen)) computerManagement.refresh(); if ("reminders".equals(screen)) reminderSettings(); if (updater != null) updater.checkIfDue(); }
-    @Override protected void onDestroy() { foreground = false; ticker.removeCallbacks(watch); bench.stop(); computerManagement.stop(); net.shutdownNow(); if (updater != null) updater.stop(); if (web != null) { detachWeb(); web.destroy(); web = null; } super.onDestroy(); }
+    @Override protected void onResume() { super.onResume(); foreground = true; reprobeRoutes(true); if (watching()) Watcher.start(this, true); if (web != null) { web.onResume(); ticker.post(watch); } if (Tabs.has(screen)) bench.refresh(); if ("together".equals(screen) || "me".equals(screen)) appPages.refresh(screen); if ("computer".equals(screen)) computerManagement.refresh(); if ("reminders".equals(screen)) reminderSettings(); if (updater != null) updater.checkIfDue(); }
+    @Override protected void onDestroy() { foreground = false; ticker.removeCallbacks(watch); bench.stop(); computerManagement.stop(); if (routes != null) routes.stopMonitoring(); net.shutdownNow(); if (updater != null) updater.stop(); if (web != null) { detachWeb(); web.destroy(); web = null; } super.onDestroy(); }
 }

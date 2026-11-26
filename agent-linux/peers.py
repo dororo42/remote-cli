@@ -7,15 +7,15 @@ answered automatically (reads allowed, everything else denied), and all peer cha
 temporary config files are disposed when the caller chat ends.
 
 A tool reaches it through a stdio MCP bridge this agent runs as
-`agent.py --mcp <socket> <token>`: the bridge speaks the MCP protocol on its standard input
-and output and forwards the calls to the socket, one length-prefixed frame per request.
+`python3 agent.py --mcp <socket> <token>`: the bridge speaks the MCP protocol on its standard
+input and output and forwards the calls to the socket, one length-prefixed frame per request.
 """
 import hashlib
 import json
 import os
-import re
 import secrets
 import socket
+import sys
 import threading
 import time
 
@@ -74,9 +74,12 @@ def peers_label(tool, labels=None):
 
 def read_frame(stream):
     """One length-prefixed frame: a little-endian four-byte length, then the bytes."""
-    head = stream.recv(4)
-    if len(head) < 4:
-        return None
+    head = b""
+    while len(head) < 4:
+        part = stream.recv(4 - len(head))
+        if not part:
+            return None
+        head += part
     length = int.from_bytes(head, "little")
     if length < 0 or length > MAX_FRAME_BYTES:
         return None
@@ -108,10 +111,10 @@ class McpServer:
 
 
 class Peers:
-    """The seats of this machine, and the socket that serves them."""
+    """The seats of this machine, and the Unix-domain socket that serves them."""
 
     def __init__(self, sock_path, find_tool, quota_of=None, config_dir="", labels=None,
-                 open_read_only=None, chat_tools=("claude", "codex", "agy")):
+                 open_read_only=None, chat_tools=("claude", "codex"), bridge_script=None):
         self.path = sock_path
         self.find_tool = find_tool or (lambda tool: None)
         self.quota_of = quota_of or (lambda tool: [])
@@ -119,25 +122,28 @@ class Peers:
         self.labels = labels or {}
         self.open_read_only = open_read_only      # (tool, launcher, folder) -> a Chat without MCP
         self.chat_tools = tuple(chat_tools)
+        self.bridge_script = os.path.abspath(bridge_script or sys.argv[0])
         self.timeout_seconds = DEFAULT_TIMEOUT_SECONDS
         self.gate = threading.RLock()
         self.seats = {}
         self.disposed = False
-        # bound here, so a seat's MCP server can connect as soon as its offer is made
-        if os.path.exists(self.path):
-            os.remove(self.path)
-        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.listener.bind(self.path)
-        os.chmod(self.path, 0o600)
-        self.listener.listen(8)
-        threading.Thread(target=self._accept, daemon=True, name="peers").start()
+        self.listener = None
+        if self.path and hasattr(socket, "AF_UNIX"):
+            os.makedirs(os.path.dirname(os.path.abspath(self.path)), mode=0o700, exist_ok=True)
+            if os.path.exists(self.path):
+                os.remove(self.path)
+            self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.listener.bind(self.path)
+            os.chmod(self.path, 0o600)
+            self.listener.listen(8)
+            threading.Thread(target=self._accept, daemon=True, name="peers").start()
 
     def offer(self, caller_tool, folder):
         """Offers `ask_ai` to a conversation of caller_tool working in folder. None when no
-        other chat-capable tool is installed here."""
+        other read-only peer tool is installed here."""
         if self.disposed or not folder or not self.available_peers(caller_tool):
             return None
-        token = secrets_token()
+        token = secrets.token_hex(16)
         command, args = self.bridge_command(token)
         config_file = self._write_claude_config(token, command, args)
         seat = {"token": token, "caller_tool": caller_tool or "", "folder": folder,
@@ -151,18 +157,18 @@ class Peers:
                          on_dispose=lambda: self.withdraw(token))
 
     def bridge_command(self, token):
-        """What the tool launches as its MCP server for this seat: this same program, told the
-        socket and the seat's token."""
-        program = os.path.abspath(sys_argv0())
-        return program, [MCP_FLAG, self.path, token]
+        """What the tool launches as its MCP server for this seat: this Python interpreter and
+        agent script, told the socket path and the seat's token."""
+        return sys.executable, [self.bridge_script, MCP_FLAG, self.path or "", token]
 
     def _write_claude_config(self, token, command, args):
         if not self.config_dir:
             return ""
         try:
-            os.makedirs(self.config_dir, exist_ok=True)
-            file = os.path.join(self.config_dir, token + ".json")
-            with open(file, "w", encoding="utf-8") as stream:
+            os.makedirs(self.config_dir, mode=0o700, exist_ok=True)
+            file = os.path.join(self.config_dir, "mcp-" + token + ".json")
+            fd = os.open(file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 json.dump({"mcpServers": {SERVER_NAME: {"command": command, "args": args}}}, stream)
             return file
         except OSError:
@@ -203,17 +209,14 @@ class Peers:
             self.seats.clear()
         for seat in active:
             self._close_seat(seat)
-        try:
-            probe = socket.socket(socket.AF_UNIX)
-            probe.settimeout(0.1)
-            probe.connect(self.path)
-            probe.close()
-        except OSError:
-            pass
-        try:
-            os.remove(self.path)
-        except OSError:
-            pass
+        if self.listener is not None:
+            try:
+                self.listener.close()
+            except OSError:
+                pass
+            self.listener = None
+        if self.path:
+            self._delete_quietly(self.path)
 
     def available_peers(self, caller_tool):
         peers = []
@@ -279,54 +282,56 @@ class Peers:
         launcher = self.find_tool(peer_tool)
         if not launcher:
             return self._fail("电脑上没有安装 " + peers_label(peer_tool, self.labels))
+        if self.open_read_only is None:
+            return self._fail("当前环境不支持只读请教")
 
         with self.gate:
             if seat["closed"] or self.disposed:
                 return self._fail("原对话已结束")
-            consultants = seat["consultants"]
-            consultant = consultants.setdefault(peer_tool, {"chat": None, "turns": 0})
+            consultant = seat["consultants"].setdefault(
+                peer_tool, {"chat": None, "turns": 0, "lock": threading.Lock()})
 
-        with self.gate:
-            if seat["closed"] or self.disposed:
-                return self._fail("请教已取消")
-            if fresh and consultant.get("chat"):
-                try:
-                    consultant["chat"].dispose()
-                except Exception:
-                    pass
-                consultant["chat"], consultant["turns"] = None, 0
-            if consultant.get("chat") is None or consultant["chat"].closed:
-                consultant["turns"] = 0
-                try:
-                    consultant["chat"] = self.open_read_only(peer_tool, launcher, seat["folder"])
-                except Exception as ex:
-                    return self._fail("未能启动 " + peers_label(peer_tool, self.labels) + "：" + str(ex))
-                consultant["chat"].auto_ask = True      # reads allowed, everything else denied
-            chat = consultant["chat"]
-            turns = consultant["turns"]
+        with consultant["lock"]:
+            with self.gate:
+                if seat["closed"] or self.disposed:
+                    return self._fail("请教已取消")
+                if fresh and consultant.get("chat"):
+                    self._reset(consultant["chat"])
+                    consultant["chat"], consultant["turns"] = None, 0
+                if consultant.get("chat") is None or consultant["chat"].closed:
+                    consultant["turns"] = 0
+                    try:
+                        consultant["chat"] = self.open_read_only(peer_tool, launcher, seat["folder"])
+                    except Exception as ex:
+                        return self._fail("未能启动 " + peers_label(peer_tool, self.labels) + "：" + str(ex))
+                    consultant["chat"].auto_ask = True      # reads allowed, everything else denied
+                chat = consultant["chat"]
+                turns = consultant["turns"]
 
-        prompt = ("【只读请教】同一项目里的另一位 AI（" + peers_label(seat["caller_tool"], self.labels) +
-                  "）向你请教以下问题。请只读查看所需文件并直接给出简明、具体、可操作的意见；不要修改任何文件，"
-                  "不要执行会改动状态的命令，也不要等待额外确认。\n\n" + question if turns == 0 else "【继续请教】\n" + question)
-        with self.gate:
-            consultant["turns"] = turns + 1
+            prompt = ("【只读请教】同一项目里的另一位 AI（" + peers_label(seat["caller_tool"], self.labels) +
+                      "）向你请教以下问题。请只读查看所需文件并直接给出简明、具体、可操作的意见；不要修改任何文件，"
+                      "不要执行会改动状态的命令，也不要等待额外确认。\n\n" + question if turns == 0 else "【继续请教】\n" + question)
+            with self.gate:
+                consultant["turns"] = turns + 1
 
-        answer = self._wait_turn(chat, prompt, seat)
-        if answer is None:
-            return self._fail(peers_label(peer_tool, self.labels) + " 回答超时（超过 " + str(self.timeout_seconds) + " 秒）")
-        how, text = answer
-        if how != "done":
-            err = "被停止" if how == "stopped" else "执行出错"
-            if chat.closed:
+            answer = self._wait_turn(chat, prompt, seat)
+            if answer is None:
                 with self.gate:
                     consultant["chat"], consultant["turns"] = None, 0
-            return self._fail(peers_label(peer_tool, self.labels) + " 未能完成回答：" + err)
-        text = (text or "").strip()
-        if not text:
-            return self._fail(peers_label(peer_tool, self.labels) + " 没有给出文字回答")
-        if len(text) > MAX_ANSWER_CHARS:
-            text = text[:MAX_ANSWER_CHARS] + "\n…（回答过长，后文已省略）"
-        return {"ok": True, "text": text}
+                return self._fail(peers_label(peer_tool, self.labels) + " 回答超时（超过 " + str(self.timeout_seconds) + " 秒）")
+            how, text = answer
+            if how != "done":
+                err = "被停止" if how == "stopped" else (text.strip()[:200] if text and text.strip() else "执行出错")
+                if chat.closed:
+                    with self.gate:
+                        consultant["chat"], consultant["turns"] = None, 0
+                return self._fail(peers_label(peer_tool, self.labels) + " 未能完成回答：" + err)
+            text = (text or "").strip()
+            if not text:
+                return self._fail(peers_label(peer_tool, self.labels) + " 没有给出文字回答")
+            if len(text) > MAX_ANSWER_CHARS:
+                text = text[:MAX_ANSWER_CHARS] + "\n…（回答过长，后文已省略）"
+            return {"ok": True, "text": text}
 
     def _wait_turn(self, chat, prompt, seat):
         """Says the prompt and waits for the turn to end (or the seat to close, the chat to
@@ -378,9 +383,24 @@ class Peers:
     def _fail(error):
         return {"ok": False, "error": error}
 
+    def handle_request(self, req):
+        """Handles one decoded request dict; shared by the socket server and unit tests."""
+        if not isinstance(req, dict):
+            return self._fail("不支持的请求")
+        op, token = _text(req, "op"), _text(req, "token")
+        with self.gate:
+            seat = self.seats.get(token)
+        if seat is None or seat["closed"]:
+            return {"ok": True, "tools": []} if op == "list" else self._fail("当前对话已结束，无法请教其他 AI")
+        if op == "list":
+            return {"ok": True, "tools": self.tool_definitions(seat)}
+        if op == "call":
+            return self.ask(seat, _text(req, "tool"), _text(req, "question"), _at(req, "fresh") is True)
+        return self._fail("不支持的请求")
+
     # ---- the socket server: one frame in, one reply out (as the Windows pipe serves)
     def _accept(self):
-        while not self.disposed:
+        while not self.disposed and self.listener is not None:
             try:
                 conn, _ = self.listener.accept()
             except OSError:
@@ -396,18 +416,7 @@ class Peers:
                 if raw is None:
                     return
                 req = json.loads(raw.decode("utf-8"))
-                op, token = _text(req, "op"), _text(req, "token")
-                with self.gate:
-                    seat = self.seats.get(token)
-                if seat is None or seat["closed"]:
-                    reply = {"ok": True, "tools": []} if op == "list" else self._fail("当前对话已结束，无法请教其他 AI")
-                elif op == "list":
-                    reply = {"ok": True, "tools": self.tool_definitions(seat)}
-                elif op == "call":
-                    reply = self.ask(seat, _text(req, "tool"), _text(req, "question"),
-                                     _at(req, "fresh") is True)
-                else:
-                    reply = self._fail("不支持的请求")
+                reply = self.handle_request(req)
                 write_frame(conn, json.dumps(reply, ensure_ascii=False).encode("utf-8"))
             except (OSError, ValueError):
                 pass
@@ -419,24 +428,11 @@ def _when(seconds):
         else time.strftime("%m月%d日 %H:%M", moment)
 
 
-def secrets_token():
-    import secrets
-    return secrets.token_hex(16)
-
-
-def sys_argv0():
-    import sys
-    return sys.argv[0]
-
-
-def bridge(sock_path, token, input=None, output=None):
+def bridge(sock_path, token, input=None, output=None, call_handler=None):
     """A stdio MCP server for one seat: the tool launches this as
-    `agent.py --mcp <socket> <token>`, and the calls it is asked forward to the socket.
+    `python3 agent.py --mcp <socket> <token>`, and the calls it is asked forward to the socket.
     Runs until the input ends. Returns 0."""
     write_lock = threading.Lock()
-    inflight = {}
-    inflight_lock = threading.Lock()
-    import sys
     stream_in = input if input is not None else sys.stdin
     stream_out = output if output is not None else sys.stdout
 
@@ -455,15 +451,23 @@ def bridge(sock_path, token, input=None, output=None):
         return {"content": [{"type": "text", "text": text or ""}], "isError": is_error}
 
     def pipe_call(payload, timeout_ms=3000):
+        if call_handler is not None:
+            return call_handler(payload, timeout_ms)
         try:
-            client = socket.socket(socket.AF_UNIX)
-            client.settimeout(timeout_ms / 1000.0)
-            client.connect(sock_path)
-            write_frame(client, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-            raw = read_frame(client)
-            return json.loads(raw.decode("utf-8")) if raw else None
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(timeout_ms / 1000.0)
+                client.connect(sock_path)
+                write_frame(client, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+                raw = read_frame(client)
+                return json.loads(raw.decode("utf-8")) if raw else None
         except (OSError, ValueError):
             return None
+
+    def dispatch_call(request_id, payload):
+        back = pipe_call(payload, (DEFAULT_TIMEOUT_SECONDS + 30) * 1000)
+        ok = bool(back and _at(back, "ok") is True)
+        text = _text(back, "text") if ok else (_text(back, "error") or "请教失败") if back else "电脑端协作服务暂时不可用或调用已取消"
+        reply(request_id, tool_result(text, not ok))
 
     for raw in stream_in:
         raw = raw.strip()
@@ -502,13 +506,7 @@ def bridge(sock_path, token, input=None, output=None):
                        "tool": _text(arguments, "tool"),
                        "question": _text(arguments, "question"),
                        "fresh": _at(arguments, "fresh") is True}
-            thread = threading.Thread(target=lambda rid=request_id, payload=payload: (
-                (lambda back: reply(rid, tool_result(
-                    (_text(back, "text") if back and _at(back, "ok") is True else
-                     (_text(back, "error") or "请教失败") if back else "电脑端协作服务暂时不可用或调用已取消"),
-                    not (back and _at(back, "ok") is True))))(pipe_call(payload, 60000))), daemon=True).start()
-            # the answer arrives on its own thread; the loop keeps reading (a cancelled call's
-            # input ends the process, which ends the thread with it)
+            threading.Thread(target=dispatch_call, args=(request_id, payload), daemon=True).start()
         else:
             fail(request_id, -32601, "Method not found")
     return 0

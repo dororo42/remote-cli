@@ -31,7 +31,7 @@ def listening(port):
         return False
 
 
-def press(folder, name, *typed, mode="cloud", own_server="", password=None, again=None, kind="own", relays=()):
+def press(folder, name, *typed, mode="cloud", own_server="", password=None, again=None, kind="own", relays=(), broken_tunnel=False):
     """Starts the program with its own data folder, opens the tab and does what is given; returns what it wrote.
     `again` names an earlier start whose data folder is used once more, with another way of connecting chosen."""
     data = Path(folder) / (again or name)
@@ -40,6 +40,8 @@ def press(folder, name, *typed, mode="cloud", own_server="", password=None, agai
         (data / "config.json").write_text(json.dumps(dict(config, Mode=mode)), encoding="utf-8")
     else:
         data.mkdir()
+        if broken_tunnel:
+            (data / "cloudflared.exe").write_bytes(b"invalid executable")
         # "cloud" without the tunnel program: the program's own relay listens on this computer only.
         (data / "config.json").write_text(json.dumps({"Mode": mode, "Port": LOCAL, "OwnServer": own_server, "RemoteEnabled": True}), encoding="utf-8")
         subprocess.run([str(STAGE / "RemoteCliAgent.exe"), "--set-password", str(data)], input=(password or local_password).encode(), check=True)
@@ -73,6 +75,8 @@ def main():
             assert (looked["mode"], looked["tab"], looked["own_relay"], looked["saved"]) == ("cloud", "3", "running", "0"), looked
             assert looked["field"].startswith("添加") and looked["new_password_button"] == "False" and "尚未添加中转" in looked["about"], looked
             assert looked["config"]["Mode"] == "cloud" and looked["skin"] == "paper", looked
+            broken = press(folder, "broken-tunnel", broken_tunnel=True)
+            assert broken["status"].startswith("启动失败") and broken["own_relay"] == "running" and broken["code"] == "False", "a failed tunnel launch must keep the local relay alive for LAN/console while clearing its QR code"
             # a password the relay refuses: said so, nothing switched or saved, the program's own relay still there
             refused = press(folder, "refused", address, "not-the-password")
             assert (refused["mode"], refused["own_relay"], refused["saved"]) == ("cloud", "running", "0") and "密码" in refused["about"] and "未改变" in refused["about"], refused
@@ -83,12 +87,12 @@ def main():
                 assert wrong["mode"] == "cloud" and wrong["own_relay"] == "running" and word in wrong["about"], wrong
             # the right password: saved, switched to, said, and its address and password shown for the phone
             accepted = press(folder, "accepted", address, relay_password)
-            assert (accepted["mode"], accepted["tab"], accepted["own_relay"], accepted["saved"]) == ("own", "3", "stopped", "1"), accepted
+            assert (accepted["mode"], accepted["tab"], accepted["own_relay"], accepted["saved"]) == ("own", "3", "running", "1"), accepted
             assert accepted["status"].startswith("已连上中转") and accepted["address"] == address and accepted["password_shown"] == "True", accepted
             assert accepted["config"]["Mode"] == "own" and accepted["config"]["OwnServer"] == address and accepted["field"] == "127.0.0.1:%d" % OWN, accepted
             # back on another way, the tab remembers that relay, and "重新连接" with the tab open connects to it
             again = press(folder, "again", "-", "-", "again", again="accepted", mode="cloud")
-            assert (again["mode"], again["own_relay"], again["saved"]) == ("own", "stopped", "1") and again["status"].startswith("已连上中转"), again
+            assert (again["mode"], again["own_relay"], again["saved"]) == ("own", "running", "1") and again["status"].startswith("已连上中转"), again
             # started with that relay in use: the two boxes show it, and "重新连接" connects to it again
             started = press(folder, "started", "-", "-", "again", again="accepted", mode="own")
             assert (started["mode"], started["address"], started["tab"]) == ("own", address, "3") and started["status"].startswith("已连上中转"), started

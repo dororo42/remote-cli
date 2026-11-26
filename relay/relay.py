@@ -63,6 +63,9 @@ class _Operations(collections.OrderedDict):
 
 _id = re.compile(r"^[a-f0-9]{16,32}$")
 _terminal = re.compile(r"^[a-f0-9]{32}$")
+# a model and reasoning effort tier as a tool names them (agent-windows/Models.cs)
+_model = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,79}")
+_effort = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 _session = re.compile(r"^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
 _session_re = {"opencode": re.compile(r"^ses_[A-Za-z0-9]{10,40}$"),
                "cline": re.compile(r"^[0-9]{10,16}_[A-Za-z0-9]{4,10}$")}
@@ -75,10 +78,12 @@ _word = re.compile(r"^[a-z0-9_]{1,40}$")
 PROJECT_ACTIONS = ("project_add", "project_remove", "project_rename")
 DESKTOP_ACTIONS = ("app_open",)
 # the tools whose desktop application a computer can offer to open: it says so for each by "<tool>-desktop-open"
-DESKTOP_TOOLS = ("codex", "claude")
+DESKTOP_TOOLS = ("codex", "claude", "agy")
 UPDATE_ACTION = "update"      # the program on the computer looks for a newer version of itself and installs it
-MAX_TERMINALS, MAX_HISTORY, OUTPUT_LIMIT, CLOSED_LIMIT = 8, 12, 2_000_000, 300_000
-LABELS = {"claude": "Claude Code", "codex": "Codex", "agy": "Antigravity CLI", "opencode": "OpenCode", "qoder": "Qoder", "cline": "Cline", "pi": "Pi", "shell": "PowerShell"}
+MAX_TERMINALS, MAX_HISTORY, OUTPUT_LIMIT, CLOSED_LIMIT = 16, 12, 2_000_000, 300_000
+LABELS = {"claude": "Claude Code", "codex": "Codex", "agy": "Antigravity CLI", "gemini": "Gemini CLI",
+          "opencode": "OpenCode", "cursor": "Cursor Agent", "qoder": "Qoder", "cline": "Cline",
+          "pi": "Pi", "kiro": "Kiro CLI", "copilot": "Copilot CLI", "shell": "PowerShell"}
 OP_SECONDS = 120
 
 
@@ -88,11 +93,13 @@ def _name(value, limit=40):
 
 _stamp = re.compile(r"[0-9.]{1,48}")         # how the file of a conversation was when it was read, in the words of the computer
 
-def _words(text, most=8000):
-    """What a person wrote, as it may be handed on: without carriage returns, not empty, not too long, and with no
+def _words(text, most=8000, allow_empty=False):
+    """What a person wrote, as it may be handed on: without carriage returns, within the length limit, and with no
     control characters but line breaks and tabs. None where it is not that."""
-    text = text.replace("\r\n", "\n").replace("\r", "\n").strip() if isinstance(text, str) else ""
-    if not text or len(text) > most or any(ord(c) < 32 and c not in "\n\t" for c in text):
+    if not isinstance(text, str):
+        return None
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if (not text and not allow_empty) or len(text) > most or any(ord(c) < 32 and c not in "\n\t" for c in text):
         return None
     return text
 
@@ -100,7 +107,7 @@ def _words(text, most=8000):
 def _quotas(items):
     """How much of each tool's usage limits the computer's owner has used, as the computer read it from the tools
     (agent-windows/Quotas.cs): per tool, each window's share used (0..100) and when it starts anew; or why it is not
-    known. Nothing of the account itself."""
+    known. Codex may also report its billing mode and credits."""
     kept = []
     for item in items[:4] if isinstance(items, list) else []:
         if not isinstance(item, dict) or item.get("tool") not in ("claude", "codex", "agy") or type(item.get("at")) is not int:
@@ -114,8 +121,87 @@ def _quotas(items):
             if _name(w.get("group"), 32):
                 entry["group"] = w["group"].strip()
             windows.append(entry)
-        kept.append({"tool": item["tool"], "at": item["at"], "why": str(item.get("why") or "")[:80], "windows": windows})
+        reading = {"tool": item["tool"], "at": item["at"], "why": str(item.get("why") or "")[:80], "windows": windows}
+        billing = item.get("billing")
+        if item["tool"] == "codex" and isinstance(billing, dict):
+            balance = billing.get("balance")
+            if billing.get("type") == "api":
+                reading["billing"] = {"type": "api"}
+                unit = billing.get("unit")
+                if (isinstance(balance, str) and len(balance) <= 32 and re.fullmatch(r"-?[0-9]+(?:\.[0-9]+)?", balance)
+                        and isinstance(unit, str) and re.fullmatch(r"(?:[A-Z]{2,8}|%)", unit)):
+                    reading["billing"].update(balance=balance, unit=unit)
+            elif billing.get("type") == "credits":
+                if billing.get("unlimited") is True:
+                    reading["billing"] = {"type": "credits", "unlimited": True}
+                elif isinstance(balance, str) and len(balance) <= 24 and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", balance):
+                    reading["billing"] = {"type": "credits", "balance": balance}
+        kept.append(reading)
     return kept
+
+
+TEAM_STATES = ("running", "paused", "done", "stopped", "failed", "choose")
+TEAM_MEMBER_ROLES = ("member-1", "member-2", "member-3")
+
+
+def _team_roster(raw, tools, minimum=1, maximum=4):
+    if not isinstance(raw, list) or not minimum <= len(raw) <= maximum:
+        raise RemoteError("请选择一位领队和 1 至 3 位执行成员，或让领队自动组队")
+    roster = []
+    roles = set()
+    for index, member in enumerate(raw):
+        if not isinstance(member, dict):
+            raise RemoteError("协作成员无效")
+        role, tool, model, effort = member.get("role"), member.get("tool"), member.get("model", ""), member.get("effort", "")
+        if (role not in (TEAM_MEMBER_ROLES if index else ("leader",)) or role in roles or tool not in tools
+                or not isinstance(model, str) or (model.strip() and not _model.fullmatch(model.strip()))):
+            raise RemoteError("协作成员无效")
+        if not isinstance(effort, str):
+            raise RemoteError("思考深度无效")
+        clean_effort = effort.strip().lower()
+        if clean_effort and not _effort.fullmatch(clean_effort):
+            raise RemoteError("思考深度无效")
+        roles.add(role)
+        entry = {"role": role, "tool": tool, "model": model.strip()}
+        if clean_effort:
+            entry["effort"] = clean_effort
+        roster.append(entry)
+    return roster
+
+
+def _team_cards(items):
+    """The computer's collaboration tasks in short (agent-windows/Teams.cs, agent-linux/teams.py), for the lists:
+    what each is, how it stands, whom it waits for, and whether one of them asks for a confirmation."""
+    cards = []
+    for c in items[:10] if isinstance(items, list) else []:
+        if not (isinstance(c, dict) and isinstance(c.get("id"), str) and _id.fullmatch(c["id"]) and c.get("mode") in ("review", "lead", "compare")
+                and c.get("state") in TEAM_STATES and type(c.get("updated")) is int and c["updated"] >= 0):
+            continue
+        tools = [t for t in c["tools"][:4] if t in TEAM_TOOLS] if isinstance(c.get("tools"), list) else []
+        models = c.get("models") if isinstance(c.get("models"), dict) else {}
+        efforts_raw = c.get("efforts") if isinstance(c.get("efforts"), dict) else {}
+        efforts = {tool: e.strip().lower() for tool, e in efforts_raw.items() if tool in tools and isinstance(e, str) and e.strip() and _effort.fullmatch(e.strip().lower())}
+        card = {"id": c["id"], "dir": str(c.get("dir") or "")[:60], "goal": str(c.get("goal") or "")[:200], "mode": c["mode"], "state": c["state"],
+                "phase": c.get("phase") if c.get("phase") in ("discuss", "decision", "verify") else "", "note": str(c.get("note") or "")[:200], "updated": c["updated"],
+                "awaited": [a for a in c["awaited"][:8] if isinstance(a, str) and re.fullmatch(r"(?:discuss:)?(?:[a-z]{1,16}|member-[123])", a)] if isinstance(c.get("awaited"), list) else [],
+                "tools": tools, "models": {tool: m for tool, m in models.items() if tool in tools and isinstance(m, str) and _model.fullmatch(m)}}
+        if efforts:
+            card["efforts"] = efforts
+        if c.get("confirm") is True:
+            card["confirm"] = True
+        if c["mode"] == "lead" and "roster" in c:
+            try:
+                card["roster"] = _team_roster(c["roster"], TEAM_TOOLS)
+                card["auto_roster"] = c.get("auto_roster") is True
+            except RemoteError:
+                pass
+        cards.append(card)
+    return cards
+
+
+def _team(value):
+    """The collaboration task a terminal or conversation belongs to, as the computer says it; "" for none."""
+    return value if isinstance(value, str) and _id.fullmatch(value) else ""
 
 
 def _folders(items, limit):
@@ -125,7 +211,7 @@ def _folders(items, limit):
         if isinstance(item, dict) and _name(item.get("name"), 60) and _name(item.get("path"), 260):
             out.append({"name": item["name"], "path": item["path"], "fixed": item.get("fixed") is True, "exists": item.get("exists") is not False,
                         "updated": item["updated"] if type(item.get("updated")) is int else 0, "live": item.get("live") is True,
-                        "tools": [t for t in str(item.get("tools", "")).split() if t in ("claude", "codex", "agy", "opencode", "qoder", "cline", "pi")],
+                        "tools": [t for t in str(item.get("tools", "")).split() if t in ("claude", "codex", "agy", "gemini", "opencode", "cursor", "qoder", "cline", "pi", "kiro", "copilot")],
                         # by what the folder is used on the computer, in the computer's words: a desktop app, an editor, a terminal
                         "kinds": [k[:20] for k in item.get("kinds", []) if isinstance(k, str) and k.strip()][:4] if isinstance(item.get("kinds"), list) else []})
     return out
@@ -333,27 +419,81 @@ UPLOAD_ACTIONS = ("file_upload_start", "file_upload_chunk", "file_upload_finish"
 FILE_ACTIONS = ("file_list", "file_read") + UPLOAD_ACTIONS
 FILE_SECONDS = 25
 WAKE_SECONDS = 85       # a message that is handed to a conversation where it sits idle takes a short run of its tool on the computer
+_ROUTE_URL = re.compile(r"^https?://[^/\s]+(?:/c/[a-f0-9]{20})?$")
+ROUTE_KINDS = ("lan", "tailscale", "tunnel", "own", "public")
+
+
+def _routes(items):
+    """Direct and fallback routes the computer advertises for multi-route selection."""
+    kept, seen = [], set()
+    for item in (items if isinstance(items, list) else [])[:12]:
+        if not isinstance(item, dict):
+            continue
+        kind, url = item.get("kind"), item.get("url")
+        priority = item.get("priority")
+        if kind not in ROUTE_KINDS or not isinstance(url, str) or len(url) > 260 or not _ROUTE_URL.fullmatch(url):
+            continue
+        if type(priority) is not int or not 0 <= priority <= 1000:
+            priority = {"lan": 10, "tailscale": 20, "tunnel": 30, "own": 40, "public": 50}[kind]
+        if url in seen:
+            continue
+        seen.add(url)
+        entry = {"kind": kind, "url": url, "priority": priority}
+        if item.get("local_auth") is True:
+            entry["local_auth"] = True
+        kept.append(entry)
+        if len(kept) >= 8:
+            break
+    kept.sort(key=lambda r: (r["priority"], r["url"]))
+    return kept
+
+
 # What the program on the computer is asked about itself: a few of its settings, and the line it is reached by.
-COMPUTER_ACTIONS = ("settings_read", "settings_change", "line_switch", "line_take", "line_keep")
+COMPUTER_ACTIONS = ("settings_read", "settings_change", "line_switch", "line_take", "line_keep", "routes_read")
+# Workspace Git review, diff, commit/push, worktree management and turn checkpoints (agent-windows/GitReview.cs).
+GIT_ACTIONS = ("git_status", "git_file_diff", "git_commit", "git_push", "git_worktree_list", "git_worktree_apply", "git_worktree_remove", "git_checkpoint", "git_branches", "git_checkout", "git_checkpoints_list", "git_checkpoint_restore", "project_scripts")
+_GIT_REF = re.compile(r"^[A-Za-z0-9._/-]{1,120}$")
+_GIT_PATH = re.compile(r"^[^\x00-\x1f]{1,260}$")
 # What the phone asks about its owner's work on the computer (the computer needs the feature "work"): the numbers of
 # it, the questions set to be asked at a time, and one conversation handed over to another.
 WORK_ACTIONS = ("stats", "schedules", "schedule_set", "schedule_remove", "handoff", "brief", "chains", "chain_set", "chain_remove",
-                "teams", "team_start", "team_stop", "team_resume", "team_remove", "team_say", "team_pick", "team_swap")
+                "teams", "team_start", "team_stop", "team_resume", "team_remove", "team_say", "team_pick", "team_swap", "team_models")
 # What the phone can do to a conversation that a program on the computer has open, where its tool lets it be reached.
 REACH = ("say", "answer", "stop")
 # What is done to a terminal that runs a conversation through its tool's structured mode (form "chat"; docs/PROTOCOL.md,
 # "Chats"): what is said, a stop, an answer to what it asks, ending it. It has no screen to type into or size.
 CHAT_TOOLS = ("claude", "codex", "agy")
+# Tools that can participate as collaboration members (chat-capable tools, plus Linux PTY tools when advertised via `<tool>-team`).
+TEAM_TOOLS = ("claude", "codex", "agy", "opencode", "qoder", "cline", "pi")
 # a tool beyond the first two runs as a conversation only where the computer says it can (Antigravity CLI: by ACP)
 CHAT_FEATURES = {"agy": "chat-agy"}
 CHAT_ACTIONS = ("say", "stop", "answer", "close", "rename")
 CHAT_DECISIONS = re.compile(r"^(allow|always|deny|choice:[0-9]{1,2})$")
+ATTACHMENT_PATH = re.compile(r"^\.remote-ai/attachments/[0-9]{8}-[0-9]{6}-[0-9a-f]{6}\.(?:png|jpg|jpeg|webp|gif)$")
+
+
+def _attachments(payload):
+    """Checks the reserved screenshot paths before handing a chat request to a computer."""
+    if "attachments" not in payload:
+        return None
+    attachments = payload.get("attachments")
+    if not isinstance(attachments, list) or not 1 <= len(attachments) <= 4:
+        raise RemoteError("\u9644\u56fe\u6700\u591a 4 \u5f20")
+    if any(not isinstance(path, str) or not ATTACHMENT_PATH.fullmatch(path) for path in attachments):
+        raise RemoteError("\u9644\u56fe\u4e0d\u5b58\u5728\u6216\u5df2\u88ab\u5220\u9664")
+    return attachments
+# Conversation organization is a computer-side queue. The relay validates the
+# request and keeps the result only while the held request is waiting.
+ORGANIZE_VERBS = ("status", "settings", "list", "count", "start", "retry", "edit")
+ORGANIZE_SOURCES = ("off", "tool", "api")
+ORGANIZE_TOOLS = ("claude", "codex", "agy")
 # By which way the computer does each thing to a conversation that a program there has open (docs/PROTOCOL.md):
 # its application's own channel, its tool's hooks, its tool's own way to one that sits idle; ending closes its program.
-WAYS = {"say": ("codex-desktop", "hook", "wake"), "stop": ("codex-desktop", "hook"), "answer": ("hook",), "end": ("process",)}
+WAYS = {"say": ("codex-desktop", "agy-desktop", "hook", "wake"), "stop": ("codex-desktop", "agy-desktop", "hook"), "answer": ("hook", "agy-desktop"), "end": ("process",)}
+_choice = re.compile(r"choice:(?:0|[1-9][0-9]{0,2})")
 # What the owner has said of a conversation, kept by the computer: it stands first in the lists, or is left out of them.
 MARKS = ("pinned", "hidden")
-ANSWERED = FILE_ACTIONS + ("session_read", "session_say", "session_withdraw", "session_release", "session_stop", "session_answer", "session_mark", "session_delete", "session_end") + COMPUTER_ACTIONS + DESKTOP_ACTIONS + tuple("work_" + name for name in WORK_ACTIONS)     # operations whose acknowledgment carries an answer
+ANSWERED = FILE_ACTIONS + ("session_read", "session_say", "session_withdraw", "session_release", "session_stop", "session_answer", "session_mark", "session_delete", "session_end", "session_organize") + COMPUTER_ACTIONS + GIT_ACTIONS + DESKTOP_ACTIONS + tuple("work_" + name for name in WORK_ACTIONS)     # operations whose acknowledgment carries an answer
 _ask = re.compile(r"^[a-f0-9]{8,32}$")
 
 
@@ -377,21 +517,26 @@ def _reached(session):
     if not isinstance(session.get("reach"), list):
         return {"reach": None, "ask": None, "last": "", "wake": False, "ways": ways and dict(ways, say="", stop="", answer=""), "why": why, "queued": _queued(session)}
     ask = session.get("ask")
+    agy = session.get("tool") == "agy" and session.get("transport") == "agy-desktop" and session.get("live") is True
+    kind = ask.get("kind") if agy and isinstance(ask, dict) else None
     options = ask.get("options") if isinstance(ask, dict) else None
     ask = {"id": ask["id"], "text": ask["text"][:600]} if (session.get("status") == "confirm" and isinstance(ask, dict) and isinstance(ask.get("id"), str)
                                                               and _ask.fullmatch(ask["id"]) and isinstance(ask.get("text"), str)) else None
+    if ask is not None and kind in ("question", "permission", "command", "file", "mcp", "approval"):
+        ask["kind"] = kind
     if ask is not None and isinstance(options, list):
         ask["options"] = [{"id": o["id"], "label": o["label"][:40], "detail": o.get("detail", "")[:600]}
-                          for o in options[:4] if isinstance(o, dict) and o.get("id") in ("once", "always")
+                          for o in options[:64 if agy else 4] if isinstance(o, dict) and isinstance(o.get("id"), str)
+                          and (o["id"] in ("once", "always") or agy and (o["id"] == "deny" or kind == "question" and _choice.fullmatch(o["id"])))
                           and isinstance(o.get("label"), str) and isinstance(o.get("detail", ""), str)]
     # wake: it sits idle, and a message is handed to it where it is (that takes some seconds), instead of being left for its next stop
     native = session.get("tool") == "codex" and session.get("transport") == "codex-desktop" and session.get("live") is True
     # told to stop through its tool's hooks, before its next step (Claude Code): no turn is named for that
     hook = session.get("transport") == "hook" and session.get("live") is True
     turn = session.get("turn") if isinstance(session.get("turn"), str) and re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", session["turn"]) else ""
-    reach = [way for way in REACH if way in session["reach"] and (way != "answer" or ask) and (way != "stop" or (native and turn) or hook)]
+    reach = [way for way in REACH if way in session["reach"] and (way != "answer" or ask) and (way != "stop" or (native and turn) or hook or agy)]
     return {"reach": reach, "ask": ask, "last": str(session.get("last") or "")[:300],
-            "transport": "codex-desktop" if native else "hook" if hook else "", "turn": turn if native else "",
+            "transport": "codex-desktop" if native else "agy-desktop" if agy else "hook" if hook else "", "turn": turn if native else "",
             "wake": session.get("wake") is True and "say" in session["reach"],
             # (a way is said only for what the list above lets through)
             "ways": ways and {thing: way if thing not in REACH or thing in reach else "" for thing, way in ways.items()}, "why": why, "queued": _queued(session)}
@@ -408,6 +553,27 @@ def _placed(session):
     return {"dir": "", "folder": session["folder"]} if _name(session.get("folder"), 260) else None
 
 
+def _organize(value):
+    """The computer's saved organization metadata, kept separate from its old session title."""
+    if not isinstance(value, dict):
+        return None
+    shown = {}
+    for key, limit in (("title", 80), ("original_title", 80), ("manual_title", 80), ("summary", 2000), ("error", 300), ("model", 80)):
+        item = value.get(key)
+        if isinstance(item, str):
+            shown[key] = item.strip()[:limit]
+    tags = value.get("tags")
+    if isinstance(tags, list):
+        shown["tags"] = [tag.strip()[:40] for tag in tags[:16] if isinstance(tag, str) and tag.strip()][:16]
+    if type(value.get("follow_up")) is bool:
+        shown["follow_up"] = value["follow_up"]
+    if value.get("state") in ("pending", "queued", "running", "done", "failed"):
+        shown["state"] = value["state"]
+    if type(value.get("updated")) is int and value["updated"] >= 0:
+        shown["updated"] = value["updated"]
+    return shown
+
+
 class Relay:
     """The terminals of one computer, as a relay knows them: what the computer last reported, the operations on their
     way to it, and each terminal's recent output. A relay for one computer has one of these; a relay for everyone has
@@ -422,14 +588,40 @@ class Relay:
         self._lock = threading.Lock()
         self._changed = threading.Condition(self._lock)       # new terminal output or state: waiting stream/overview readers wake
         self._ops_changed = threading.Condition(self._lock)   # new queued operations or RPC answers: pull() and _held() wake
-        self._tick = [0]            # counts terminal output/state wake-ups, so a waiter can tell one happened between look and wait
+        self._tick = [1]            # counts terminal output/state wake-ups, so a waiter can tell one happened between look and wait
+        self._list_rev = [1]        # counts list-level metadata changes only (isolates overview pollers from raw PTY output bursts)
         self._kept = None           # the list of terminals, once it has been read
         self._unsaved = None        # the time of the oldest output not yet written to disk
         self._logged = {}           # terminal -> [seq of the last piece in its file, characters in the file]
         self._pending = _Operations()
-        self._device = {"seen": 0, "instance": "", "enabled": False, "workspaces": [], "tools": [], "projects": [], "candidates": []}
+        self._env_path = os.path.join(os.path.dirname(os.path.abspath(path)), "environment.json")
+        self._device = {"seen": 0, "instance": "", "environment_id": self._load_environment_id(), "enabled": False, "workspaces": [], "tools": [], "projects": [], "candidates": [], "team_cards": [], "routes": []}
         self._sessions = []         # conversations saved on the computer, as its last report listed them
         self._screens = {}          # terminal -> (instance, Screen): rebuilt from the kept output when it is missing
+
+    def _load_environment_id(self):
+        try:
+            with open(self._env_path, encoding="utf-8") as stream:
+                saved = json.load(stream).get("environment_id", "")
+            return saved if isinstance(saved, str) and _terminal.fullmatch(saved) else ""
+        except (OSError, ValueError, AttributeError):
+            return ""
+
+    def _save_environment_id(self, environment_id):
+        try:
+            os.makedirs(os.path.dirname(self._env_path), exist_ok=True)
+            tmp = self._env_path + ".tmp"
+            _write(tmp, json.dumps({"environment_id": environment_id}))
+            _replace(tmp, self._env_path)
+        except OSError:
+            pass
+
+    def discovery(self, now=None):
+        """Unauthenticated identity probe for multi-route selection (/.well-known/remote-ai)."""
+        now = time.time() if now is None else now
+        with self._lock:
+            return {"service": "remote-ai", "environment_id": self._device.get("environment_id", ""),
+                    "online": now - self._device["seen"] < 15, "capabilities": ["routes", "ws"]}
 
     def _load(self):
         try:
@@ -512,7 +704,7 @@ class Relay:
         return self._kept
 
     def _view(self, now):
-        return {**self._device, "online": now - self._device["seen"] < 15}
+        return {**self._device, "online": now - self._device["seen"] < 25}
 
     def _adopt(self, state, item, instance):
         """A terminal the computer has and this relay does not know: the computer was using another relay when it was
@@ -525,7 +717,7 @@ class Relay:
         if not isinstance(key, str) or not _terminal.fullmatch(key) or tool not in LABELS or not (_name(folder, 60) or apart) \
                 or type(created) is not int or created <= 0 or item.get("state") not in ("running", "closed"):
             return None
-        session = session if isinstance(session, str) and _session.fullmatch(session) else ""
+        session = session if isinstance(session, str) and session_id_ok(tool, session) else ""
         threads = state["threads"]
         if item["state"] == "closed":
             if session and any(t["tool"] == tool and t.get("session") == session for t in threads.values()):
@@ -597,8 +789,32 @@ class Relay:
             lines.pop(0)
         return lines
 
+    def _reopened(self, state, payload, tool, folder, chat):
+        """Find the original terminal for a view switch or an in-place chat model change."""
+        if "reopen" not in self._device.get("features", []):
+            raise RemoteError("电脑端版本不支持切换视图，请更新电脑端")
+        tune = "model" in payload and "chat-model" in self._device.get("features", [])
+        allowed = {"id", "action", "tool", "dir", "form", "reopen"}
+        if tune:
+            allowed.update(("model", "effort"))
+        if set(payload) - allowed or tool not in (CHAT_TOOLS if tune else ("claude", "codex")):
+            raise RemoteError("切换视图的选项无效")
+        source = state["threads"].get(payload["reopen"]) if isinstance(payload["reopen"], str) else None
+        if not source or source["state"] not in ("starting", "running") or source["tool"] != tool or source["dir"] != folder:
+            raise RemoteError("原对话已结束，请刷新后重试")
+        if tune and (not chat or source.get("form") != "chat" or source.get("phase") in ("busy", "confirm", "starting")):
+            raise RemoteError("请等对话空闲后再切换模型")
+        if not tune and (source.get("form") == "chat") == chat:
+            raise RemoteError("这段对话已经是这种视图")
+        if not source.get("session"):
+            raise RemoteError(f"{LABELS[tool]} 还没有给这段对话编号，发一条消息后再切换")
+        if source.get("team"):
+            raise RemoteError("协作任务中的对话不能切换视图")
+        return source
+
     def _public(self, term):
         shown = {k: v for k, v in term.items() if k not in ("output", "instance", "size", "out_at", "touched", "calm_until", "modes", "modes_rest", "asking", "_asks_cache")}
+        shown["team"] = term.get("team", "")
         # Until the owner names a terminal, it carries the name of the conversation it has open.
         if not term.get("renamed"):
             shown["title"] = next((s["title"] for s in self._sessions if s["id"] == term.get("session")), term["title"])
@@ -618,12 +834,23 @@ class Relay:
         while self._pending and now - next(iter(self._pending.values()))["at"] > 600:
             self._pending.queued.pop(self._pending.popitem(last=False)[0], None)
 
-    def overview(self, terminal="", after=0, now=None, wait=0):
+    def overview(self, terminal="", after=0, now=None, wait=0, rev=0):
         """The list, or one terminal's output after `after`. With `wait`, an answer that has nothing new is held back
-        until there is output or the terminal changed, at most that many seconds."""
+        until there is output or state changed, at most that many seconds. When `rev` matches the current list revision,
+        an unchanged overview returns a tiny sentinel instead of resending full lists."""
         deadline = time.monotonic() + min(max(wait, 0), 25)
         first = None
         while True:
+            if not terminal and rev > 0:
+                with self._lock:
+                    current_rev = self._list_rev[0]
+                    online = (time.time() if now is None else now) - self._device["seen"] < 15
+                if current_rev == rev:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return {"unchanged": True, "rev": current_rev, "online": online}
+                    self._wait_list(current_rev, remaining)
+                    continue
             result = self._overview(terminal, after, time.time() if now is None else now)
             if not terminal:
                 return result
@@ -644,8 +871,16 @@ class Relay:
             if self._tick[0] == seen:
                 self._changed.wait(min(seconds, 5))
 
-    def _wake(self):
+    def _wait_list(self, seen, seconds):
+        """Sleeps until list-level metadata changes, ignoring raw PTY output bursts on individual terminals."""
+        with self._changed:
+            if self._list_rev[0] == seen:
+                self._changed.wait(min(seconds, 5))
+
+    def _wake(self, list_changed=True):
         self._tick[0] += 1
+        if list_changed:
+            self._list_rev[0] += 1
         self._changed.notify_all()
 
     def _wake_ops(self):
@@ -679,7 +914,7 @@ class Relay:
                 attached = {t.get("session"): t["id"] for t in state["threads"].values() if t["state"] in ("starting", "running")}
                 for gone in [key for key in self._screens if key not in state["threads"]]:
                     del self._screens[gone]
-                return {"device": self._view(now), "terminals": sorted(
+                return {"rev": self._list_rev[0], "device": self._view(now), "terminals": sorted(
                     [dict(self._public(t), said=self._said(t) if t["state"] == "running" else "",
                           asks=self._question(t) if t["state"] == "running" and t.get("phase") == "confirm" else [])
                      for t in state["threads"].values()], key=lambda t: -t["created"]),
@@ -740,8 +975,9 @@ class Relay:
                 if payload.get("dir") not in self._device["workspaces"]:
                     raise RemoteError("电脑没有报告这个项目")
                 draft = payload.get("draft", "")
-                if not isinstance(draft, str) or len(draft.encode("utf-16-le", errors="surrogatepass")) > 2000 or any(ord(c) < 32 and c not in "\n\r\t" for c in draft):
-                    raise RemoteError("草稿需在 1000 字以内，且不能含控制字符")
+                limit = 8000 if payload["tool"] == "agy" else 1000
+                if not isinstance(draft, str) or len(draft.encode("utf-16-le", errors="surrogatepass")) > 2 * limit or any(ord(c) < 32 and c not in "\n\r\t" for c in draft):
+                    raise RemoteError(f"草稿需在 {limit} 字以内，且不能含控制字符")
                 if set(payload) - {"id", "action", "tool", "dir", "draft"}:
                     raise RemoteError("桌面操作参数无效")
             elif action in PROJECT_ACTIONS:
@@ -771,11 +1007,28 @@ class Relay:
                 previous = payload.get("previous", "")
                 if previous and (not isinstance(previous, str) or not _id.fullmatch(previous)):
                     raise RemoteError("历史对话编号无效")
-                if any(type(payload.get(k, False)) is not bool for k in ("history", "takeover", "fork")):
+                if any(type(payload.get(k, False)) is not bool for k in ("history", "takeover", "fork", "worktree")):
                     raise RemoteError("历史选项无效")
+                if payload.get("worktree", False):
+                    if apart or "worktree" not in self._device.get("features", []):
+                        raise RemoteError("电脑端暂不支持在此处创建独立 Worktree")
+                    for ref_key in ("branch", "base_branch"):
+                        ref = payload.get(ref_key, "")
+                        if ref and (not isinstance(ref, str) or not _GIT_REF.fullmatch(ref.strip()) or ".." in ref or ref.startswith("-") or ref.startswith("/")):
+                            raise RemoteError("分支名称无效")
                 chat = payload.get("form", "") == "chat"
                 if payload.get("form", "") not in ("", "chat") or "text" in payload and not chat:
                     raise RemoteError("终端选项无效")
+                if "model" in payload:
+                    raw_model = payload.get("model")
+                    if not isinstance(raw_model, str) or (raw_model.strip() and not _model.fullmatch(raw_model.strip())):
+                        raise RemoteError("模型名称无效")
+                if "effort" in payload:
+                    raw_effort = payload.get("effort")
+                    if not isinstance(raw_effort, str) or (raw_effort.strip() and not _effort.fullmatch(raw_effort.strip().lower())):
+                        raise RemoteError("思考深度无效")
+                if "mode" in payload and payload.get("mode") not in ("", "full", "edit", "read"):
+                    raise RemoteError("权限模式无效")
                 if chat:
                     features = self._device.get("features", [])
                     if tool not in CHAT_TOOLS or "chat" not in features or CHAT_FEATURES.get(tool, "chat") not in features:
@@ -784,7 +1037,9 @@ class Relay:
                         raise RemoteError("对话选项无效")
                     if "text" in payload and _words(payload["text"]) is None:
                         raise RemoteError("内容为空、超过 8000 字或含有控制字符")
-                session = payload.get("session", "")
+                # Reuse the source session and workspace on both view switches and chat model changes.
+                source = self._reopened(state, payload, tool, folder, chat) if "reopen" in payload else None
+                session = source["session"] if source else payload.get("session", "")
                 if tool == "agy" and (payload.get("history") or (payload.get("takeover") and not session)):
                     raise RemoteError("请在项目中选择具体的 Antigravity 对话，或新建终端")
                 if payload.get("history") and not session and not previous:
@@ -793,7 +1048,9 @@ class Relay:
                 fork = payload.get("fork", False)
                 if fork and (tool != "codex" or not session or payload.get("takeover") or "codex-fork" not in self._device.get("features", [])):
                     raise RemoteError("电脑端不支持这个副本选项，请更新电脑后台")
-                if session:
+                if source:
+                    where, called = source.get("folder", ""), self._public(source)["title"]
+                elif session:
                     saved = next((s for s in self._sessions if s["id"] == session and s["tool"] == tool and s["dir"] == folder), None)                     if isinstance(session, str) and session_id_ok(tool, session) else None
                     if not saved:
                         raise RemoteError("电脑上没有找到这个对话，请刷新后重试")
@@ -811,19 +1068,28 @@ class Relay:
                     raise RemoteError("电脑没有报告这个工具或目录")
                 if apart:
                     asked, payload = payload, dict(payload, folder=where)       # what the viewer sent is kept, to know the same request again
-                if sum(t["state"] in ("starting", "running") for t in state["threads"].values()) >= MAX_TERMINALS:
-                    raise RemoteError("最多同时运行 8 个终端，请先结束一个")
+                # (the terminal a reopened conversation leaves is ended by the computer before the new one starts)
+                if sum(t["state"] in ("starting", "running") for t in state["threads"].values()) - (1 if source else 0) >= MAX_TERMINALS:
+                    raise RemoteError(f"最多同时运行 {MAX_TERMINALS} 个终端，请先结束一个")
                 terminal = uuid.uuid4().hex
                 if chat and not called and payload.get("text"):
                     # a new conversation is called by what it was first told, until its tool names it
                     called = " ".join(_words(payload["text"]).split())[:40]
+                given = source or payload
+                if source and "model" in payload:
+                    given = dict(source, model=payload["model"], effort=payload.get("effort", ""))
                 term = {"id": terminal, "tool": tool, "dir": folder, "folder": where,
                         # one outside every project is called what its conversation is: the computer lists that conversation only while it is open
-                        "title": (called[:60] if (apart or chat) and called else self._device.get("shell") or LABELS[tool] if tool == "shell" else LABELS[tool]) + (" · 副本" if fork else ""), "session": "" if fork else session, "status": "",
+                        "title": (called[:60] if (apart or chat or source) and called else self._device.get("shell") or LABELS[tool] if tool == "shell" else LABELS[tool]) + (" · 副本" if fork else ""), "session": "" if fork else session, "status": "",
+                        "model": (given.get("model") or "").strip() if isinstance(given.get("model"), str) else "",
+                        "effort": (given.get("effort") or "").strip().lower() if isinstance(given.get("effort"), str) else "",
+                        "mode": given.get("mode") if given.get("mode") in ("full", "edit", "read") else "",
                         "created": int(now * 1000), "state": "starting", "error": "", "seq": 0, "output": [], "size": 0, "cols": 80, "rows": 24,
                         "instance": self._device["instance"], "previous": previous, "history": bool(payload.get("history")), "touched": False}
                 if chat:
                     term.update(form="chat", touched=True)
+                if source and source.get("renamed"):
+                    term.update(title=source["title"], renamed=True)
                 state["threads"][terminal] = term
                 _room(state)
             else:
@@ -844,10 +1110,15 @@ class Relay:
                     if action not in CHAT_ACTIONS:
                         raise RemoteError("这段对话不支持此操作")
                     if action == "say":
-                        text = _words(payload.get("text"))
+                        attachments = _attachments(payload)
+                        text = _words(payload.get("text"), allow_empty=bool(attachments))
                         if text is None:
                             raise RemoteError("内容为空、超过 8000 字或含有控制字符")
+                        if attachments is not None and "attachments" not in self._device.get("features", []):
+                            raise RemoteError("\u8bf7\u5148\u66f4\u65b0\u7535\u8111\u7aef")
                         asked, payload = payload, {"id": op_id, "action": "say", "terminal": terminal, "text": text}
+                        if attachments is not None:
+                            payload["attachments"] = attachments
                     elif action == "stop" and term.get("phase") not in ("busy", "confirm"):
                         raise RemoteError("它现在没有在执行")
                     elif action == "answer":
@@ -1009,13 +1280,9 @@ class Relay:
                 more = {"since": payload["since"]}
         else:
             raise RemoteError("不支持此操作")
-        native = payload.get("transport") == "codex-desktop" and action in ("say", "stop")
+        transport = payload.get("transport")
         if "receipt" in payload and type(payload["receipt"]) is not bool:
             raise RemoteError("回执查询无效")
-        if action == "stop" and not native and payload.get("transport") != "hook":
-            raise RemoteError("此对话没有可用的停止接口")
-        if native:
-            more.update(transport="codex-desktop", receipt=payload.get("receipt") is True)
         with self._changed:
             self._expire(now)
             if op_id in self._pending:
@@ -1031,11 +1298,29 @@ class Relay:
             saved = next((s for s in self._sessions if s["id"] == session), None)
             if not saved:
                 raise RemoteError("电脑上没有找到这个对话，请刷新后重试")
-            if native:
-                if saved["tool"] != "codex" or "codex-desktop-control" not in self._device.get("features", []):
-                    raise RemoteError("电脑端没有可用的 Codex 原应用控制接口")
-                if not more["receipt"] and saved.get("transport") != "codex-desktop":
+            if saved.get("transport") == "agy-desktop" and action in ("say", "stop", "answer"):
+                if transport not in (None, "agy-desktop"):
                     raise RemoteError("原应用连接已变化，请刷新后重试")
+                transport = "agy-desktop"
+            native = (transport == "codex-desktop" and action in ("say", "stop")
+                      or transport == "agy-desktop" and action in ("say", "stop", "answer"))
+            if (transport == "agy-desktop" or payload.get("receipt") is True) and not native:
+                raise RemoteError("此操作没有可用的桌面回执")
+            if action == "stop" and not native and transport != "hook":
+                raise RemoteError("此对话没有可用的停止接口")
+            if native:
+                more.update(transport=transport, receipt=payload.get("receipt") is True)
+                if saved["tool"] + "-desktop" != transport or transport + "-control" not in self._device.get("features", []):
+                    raise RemoteError("电脑端没有可用的原应用控制接口")
+                if not more["receipt"] and saved.get("transport") != transport:
+                    raise RemoteError("原应用连接已变化，请刷新后重试")
+            if "choice" in payload:
+                choice = payload["choice"]
+                if (action != "answer" or transport != "agy-desktop" or not isinstance(choice, str)
+                        or not (_choice.fullmatch(choice) or choice == "deny")
+                        or (choice == "deny") == more["allow"] or more.get("scope", "once") != "once"):
+                    raise RemoteError("回答选项无效")
+                more["choice"] = choice
             if action == "delete":
                 # A saved conversation is put away by the computer (nothing is destroyed: its tool's archive, or the
                 # recycle bin). Not one a program has open, nor one a terminal here runs. It leaves the list at once.
@@ -1071,11 +1356,207 @@ class Relay:
                     raise RemoteError("这个确认请求已经处理过了，或只能在电脑上回答" if action == "answer" else "这段对话现在没有在执行，请刷新后重试" if action == "stop" else "这段对话现在不能从手机发消息，请刷新后重试")
                 if action == "stop" and not native and saved.get("transport") != "hook":
                     raise RemoteError("这段对话的停止方式已变化，请刷新后重试")
-                if action == "answer" and saved["ask"]["id"] != more["ask"]:
-                    raise RemoteError("这个确认请求已经处理过了")
+                if action == "answer" and not more.get("receipt"):
+                    ask = saved.get("ask") or {}
+                    if ask.get("id") != more["ask"]:
+                        raise RemoteError("这个确认请求已经处理过了")
+                    if transport == "agy-desktop":
+                        options = {o["id"] for o in ask.get("options", [])}
+                        selected = more.get("choice") or (more.get("scope", "once") if more["allow"] else "deny")
+                        if selected not in options and not (selected == "deny" and ask.get("kind") == "question"):
+                            raise RemoteError("回答选项已变化，请刷新后重试")
                 if action == "say" and saved.get("wake") and wait == FILE_SECONDS:
                     wait = WAKE_SECONDS
             return self._held({"id": op_id, "action": "session_" + action, "session": session, "tool": saved["tool"], "dir": saved["dir"], **more}, now, wait)
+
+    def organize(self, payload, now=None, wait=FILE_SECONDS):
+        """Passes a conversation organization request to the computer.
+
+        The computer owns the catalog, queue, model selection and generated metadata.
+        The relay only validates the target and bounded paging/settings fields.
+        """
+        now = time.time() if now is None else now
+        if not isinstance(payload, dict):
+            raise RemoteError("请求格式无效")
+        op_id, verb = payload.get("id"), payload.get("verb")
+        if not isinstance(op_id, str) or not _id.fullmatch(op_id):
+            raise RemoteError("操作编号无效")
+        if verb not in ORGANIZE_VERBS:
+            raise RemoteError("整理操作无效")
+        question = {"id": op_id, "action": "session_organize", "verb": verb}
+        has_tool, has_session = "tool" in payload, "session" in payload
+        if has_tool != has_session:
+            raise RemoteError("对话标识无效")
+        if has_tool:
+            tool, session = payload.get("tool"), payload.get("session")
+            if tool not in ORGANIZE_TOOLS or not isinstance(session, str) or not session_id_ok(tool, session):
+                raise RemoteError("对话标识无效")
+            question.update(tool=tool, session=session)
+        if verb == "settings":
+            if "model" in payload:
+                model = payload.get("model")
+                if not isinstance(model, str) or not _model.fullmatch(model):
+                    raise RemoteError("模型名称无效")
+                question["model"] = model
+            if "auto" in payload:
+                if type(payload.get("auto")) is not bool:
+                    raise RemoteError("自动整理设置无效")
+                question["auto"] = payload["auto"]
+            if "auto_follow_up" in payload:
+                if type(payload.get("auto_follow_up")) is not bool:
+                    raise RemoteError("自动待跟进设置无效")
+                question["auto_follow_up"] = payload["auto_follow_up"]
+            if "source" in payload:
+                if payload["source"] not in ORGANIZE_SOURCES:
+                    raise RemoteError("整理来源无效")
+                question["source"] = payload["source"]
+            if "source_tool" in payload:
+                if payload["source_tool"] not in ORGANIZE_TOOLS:
+                    raise RemoteError("整理工具无效")
+                question["source_tool"] = payload["source_tool"]
+            if "api_url" in payload:
+                url = payload["api_url"]
+                if not isinstance(url, str) or len(url) > 300 or (url and not re.fullmatch(r"https?://[^\s?#]+", url.strip())):
+                    raise RemoteError("API 地址无效")
+                question["api_url"] = url.strip()
+            if "api_key" in payload:
+                key = payload["api_key"]
+                if not isinstance(key, str) or len(key) > 400 or any(c.isspace() or ord(c) < 32 for c in key.strip()):
+                    raise RemoteError("API 密钥格式无效")
+                question["api_key"] = key.strip()
+        elif verb == "list":
+            offset, limit = payload.get("offset", 0), payload.get("limit", 50)
+            if type(offset) is not int or offset < 0:
+                raise RemoteError("分页位置无效")
+            if type(limit) is not int or not 1 <= limit <= 120:
+                raise RemoteError("分页大小无效")
+            question.update(offset=offset, limit=limit)
+        elif verb == "count":
+            if has_tool or payload.get("scope") != "all":
+                raise RemoteError("整理范围无效")
+            question["scope"] = "all"
+        elif verb in ("start", "retry"):
+            scope = payload.get("scope", "")
+            if scope not in ("", "all") or (not has_tool and scope != "all"):
+                raise RemoteError("整理范围无效")
+            if scope:
+                question["scope"] = scope
+        elif verb == "edit":
+            scope = payload.get("scope", "")
+            if scope == "all":
+                if has_tool or "title" in payload or payload.get("follow_up") is not False:
+                    raise RemoteError("批量清除待跟进参数无效")
+                question.update(scope="all", follow_up=False)
+            else:
+                if scope or not has_tool or ("title" not in payload and "follow_up" not in payload):
+                    raise RemoteError("请选择对话，并填写名称或设置待跟进标记")
+                if "title" in payload:
+                    title = payload["title"]
+                    if not isinstance(title, str) or not title.strip() or len(title) > 80 or any(ord(c) < 32 for c in title):
+                        raise RemoteError("整理名称无效")
+                    question["title"] = title.strip()
+                if "follow_up" in payload:
+                    if type(payload["follow_up"]) is not bool:
+                        raise RemoteError("待跟进标记无效")
+                    question["follow_up"] = payload["follow_up"]
+        with self._changed:
+            self._expire(now)
+            if op_id in self._pending:
+                raise RemoteError("操作编号已被其它操作使用")
+            if not self._view(now)["online"] or not self._device["enabled"]:
+                raise RemoteError("电脑未连接或远程已关闭，请等待电脑上线后重试")
+            if "organize" not in self._device.get("features", []):
+                raise RemoteError("电脑端版本不支持对话整理，请更新电脑端")
+            answer = self._held(question, now, wait)
+            if verb == "edit" and question.get("scope") == "all":
+                for saved in self._sessions:
+                    if isinstance(saved.get("organize"), dict):
+                        saved["organize"]["follow_up"] = False
+            elif verb == "edit" and isinstance(answer.get("item"), dict):
+                saved = next((item for item in self._sessions if item["id"] == question.get("session") and item["tool"] == question.get("tool")), None)
+                organized = _organize(answer["item"])
+                if saved is not None and organized is not None:
+                    saved["organize"] = organized
+            return answer
+
+    def git(self, payload, now=None, wait=FILE_SECONDS):
+        """Workspace Git status, on-demand per-file diff, commit/push, worktree management and checkpoints."""
+        now = time.time() if now is None else now
+        if not isinstance(payload, dict):
+            raise RemoteError("请求格式无效")
+        op_id, action, folder = payload.get("id"), payload.get("action"), payload.get("dir", "")
+        if not isinstance(op_id, str) or not _id.fullmatch(op_id):
+            raise RemoteError("操作编号无效")
+        if action not in GIT_ACTIONS:
+            raise RemoteError("不支持此 Git 操作")
+        if not isinstance(folder, str) or not folder:
+            raise RemoteError("请选择项目")
+        question = {"id": op_id, "action": action, "dir": folder}
+        wt = payload.get("worktree", "")
+        if wt:
+            if not isinstance(wt, str) or not re.fullmatch(r"[A-Za-z0-9._/-]{1,80}", wt) or ".." in wt:
+                raise RemoteError("工作区标识无效")
+            question["worktree"] = wt
+        if action == "git_file_diff":
+            path = payload.get("path", "")
+            if not isinstance(path, str) or not _GIT_PATH.fullmatch(path) or ".." in path.replace("\\", "/").split("/") or path.startswith(("/", "\\")):
+                raise RemoteError("文件路径无效")
+            scope = payload.get("scope", "working")
+            if scope not in ("working", "staged", "base"):
+                raise RemoteError("差异范围无效")
+            question.update(path=path, scope=scope)
+            base = payload.get("base", "")
+            if base:
+                if not isinstance(base, str) or not _GIT_REF.fullmatch(base) or ".." in base or base.startswith("-"):
+                    raise RemoteError("基线引用无效")
+                question["base"] = base
+        elif action == "git_commit":
+            message = _words(payload.get("message"), most=2000)
+            if message is None:
+                raise RemoteError("请输入有效的提交说明")
+            question["message"] = message
+            files = payload.get("files")
+            if files is not None:
+                if not isinstance(files, list) or len(files) > 200 or any(not isinstance(p, str) or not _GIT_PATH.fullmatch(p) or ".." in p.replace("\\", "/").split("/") or p.startswith(("/", "\\")) for p in files):
+                    raise RemoteError("提交文件列表无效")
+                question["files"] = files
+        elif action == "git_push":
+            if payload.get("set_upstream") is True:
+                question["set_upstream"] = True
+        elif action in ("git_worktree_apply", "git_worktree_remove"):
+            if not wt:
+                raise RemoteError("请指定要操作的 Worktree")
+            if payload.get("remove_after") is True:
+                question["remove_after"] = True
+        elif action == "git_checkpoint":
+            label = payload.get("label", "")
+            if label and (not isinstance(label, str) or len(label) > 80 or any(ord(c) < 32 for c in label)):
+                raise RemoteError("快照说明无效")
+            if label:
+                question["label"] = label
+        elif action == "git_checkout":
+            branch = payload.get("branch", "")
+            if not isinstance(branch, str) or not _GIT_REF.fullmatch(branch) or ".." in branch or branch.startswith("-"):
+                raise RemoteError("分支名称无效")
+            question["branch"] = branch
+            if payload.get("create") is True:
+                question["create"] = True
+        elif action == "git_checkpoint_restore":
+            ref = payload.get("ref", "")
+            if not isinstance(ref, str) or not re.fullmatch(r"refs/remote-ai/checkpoints/[A-Za-z0-9._/-]{1,80}", ref) or ".." in ref:
+                raise RemoteError("快照引用无效")
+            question["ref"] = ref
+        with self._changed:
+            self._expire(now)
+            if op_id in self._pending:
+                raise RemoteError("操作编号已被其它操作使用")
+            if not self._view(now)["online"] or not self._device["enabled"]:
+                raise RemoteError("电脑未连接或远控已关闭，请等待电脑上线后重试")
+            if "git" not in self._device.get("features", []):
+                raise RemoteError("电脑端版本不支持 Git 审阅操作，请更新电脑端")
+            if folder not in self._device["workspaces"]:
+                raise RemoteError("没有这个项目")
+            return self._held(question, now, wait)
 
     def computer(self, payload, now=None, wait=FILE_SECONDS):
         """A question to the program on the computer about itself: its settings, and the line the phone reaches it
@@ -1113,6 +1594,13 @@ class Relay:
                 raise RemoteError("电脑端版本不支持在手机上设置，请更新电脑端")
             return self._held(question, now, wait)
 
+    def _team_runs(self):
+        """Tools on this computer eligible to join a collaboration task."""
+        features = self._device.get("features", [])
+        runs = [t for t in CHAT_TOOLS if t in self._device["tools"] and "chat" in features and CHAT_FEATURES.get(t, "chat") in features]
+        runs += [t for t in self._device.get("tools", []) if t in TEAM_TOOLS and t not in runs and t + "-team" in features]
+        return runs
+
     def work(self, payload, now=None, wait=FILE_SECONDS):
         """The owner's work on the computer: its numbers by day ("stats"), the questions set to be asked at a time
         ("schedules", "schedule_set", "schedule_remove"), a conversation handed over to another ("handoff"), and what such
@@ -1144,6 +1632,8 @@ class Relay:
                 raise RemoteError("这台电脑的电脑端不支持协作任务，请更新电脑端")
             if action in ("team_say", "team_pick", "team_swap") and "teams-v2" not in self._device.get("features", []):
                 raise RemoteError("这台电脑的电脑端版本较旧，不支持此协作操作，请更新电脑端")
+            if action == "team_models" and "teams-models" not in self._device.get("features", []):
+                raise RemoteError("这台电脑的电脑端版本较旧，不支持为协作成员选择模型，请更新电脑端")
             listed = {s["id"]: s for s in self._sessions}
             # (a conversation in one of the phone's own terminals is open too: the computer types into that terminal)
             typed = {t.get("session") for t in self._state()["threads"].values() if t["state"] == "running" and t.get("session")}
@@ -1210,17 +1700,32 @@ class Relay:
                 if not isinstance(goal, str) or not 0 < len(goal.strip()) <= 4000 or "\0" in goal:
                     raise RemoteError("目标需为 1 至 4000 字")
                 features = self._device.get("features", [])
-                runs = [t for t in CHAT_TOOLS if t in self._device["tools"] and "chat" in features and CHAT_FEATURES.get(t, "chat") in features]
+                runs = self._team_runs()
+                roster = None
+                auto_roster = item.get("auto_roster", False)
+                if type(auto_roster) is not bool:
+                    raise RemoteError("自动安排成员选项无效")
+                if "roster" in item or auto_roster:
+                    if mode != "lead" or "teams-roster" not in features:
+                        raise RemoteError("当前协作方式或电脑端版本不支持按成员安排")
+                    roster = _team_roster(item.get("roster"), runs, 1 if auto_roster else 2, 1 if auto_roster else 4)
+                    if any(member["model"] for member in roster) and "teams-models" not in features:
+                        raise RemoteError("这台电脑的电脑端版本较旧，不支持为协作成员选择模型，请更新电脑端")
+                    if any(member.get("effort") for member in roster) and "teams-effort" not in features:
+                        raise RemoteError("这台电脑的电脑端版本较旧，不支持设置思考深度，请更新电脑端")
+                    tools = [member["tool"] for member in roster]
                 if not isinstance(tools, list) or any(t not in runs for t in tools):
                     raise RemoteError("这台电脑不能让这个工具参与协作")
                 if mode == "review" and len(tools) != 2:
                     raise RemoteError("写审需要一个写的 AI 和一个审查的 AI")
-                if mode == "lead" and (not 2 <= len(tools) <= 4 or len(set(tools)) != len(tools)):
+                if mode == "lead" and roster is None and (not 2 <= len(tools) <= 4 or len(set(tools)) != len(tools)):
                     raise RemoteError("领队需要一个领队和 1 至 3 个不同的成员")
                 if mode == "compare" and (not 2 <= len(tools) <= 3 or len(set(tools)) != len(tools)):
                     raise RemoteError("并行比稿需要 2 至 3 个不同的 AI")
-                if type(rounds) is not int or not 1 <= rounds <= 10:
+                if type(rounds) is not int or not (1 <= rounds <= 10 or rounds == 0 and mode == "lead"):
                     raise RemoteError("轮数需在 1 到 10 之间")
+                if rounds == 0 and "teams-flex-rounds" not in features:     # 0: the leader decides how many (自由轮数)
+                    raise RemoteError("这台电脑的电脑端版本较旧，不支持自由轮数，请更新电脑端")
                 rules = item.get("rules", "")
                 if not isinstance(rules, str) or len(rules.strip()) > 1000 or "\0" in rules:
                     raise RemoteError("分工偏好不能超过 1000 字")
@@ -1229,11 +1734,51 @@ class Relay:
                     raise RemoteError("讨论选项无效")
                 if (mode == "compare" or discuss) and "teams-v2" not in features:
                     raise RemoteError("这台电脑的电脑端版本较旧，不支持先议后写或并行比稿，请更新电脑端")
+                # the model and reasoning effort each tool's members begin with, by tool; empty or left out: the tool's own default
+                models = item.get("models", {})
+                if not isinstance(models, dict) or any(tool not in tools or not isinstance(m, str) or (m.strip() and not _model.fullmatch(m.strip())) for tool, m in models.items()):
+                    raise RemoteError("模型选择无效")
+                models = {tool: m.strip() for tool, m in models.items() if m.strip()}
+                if models and "teams-models" not in features:
+                    raise RemoteError("这台电脑的电脑端版本较旧，不支持为协作成员选择模型，请更新电脑端")
+                efforts = item.get("efforts", {})
+                if not isinstance(efforts, dict) or any(tool not in tools or not isinstance(e, str) or (e.strip() and not _effort.fullmatch(e.strip().lower())) for tool, e in efforts.items()):
+                    raise RemoteError("思考深度选择无效")
+                efforts = {tool: e.strip().lower() for tool, e in efforts.items() if e.strip()}
+                if efforts and "teams-effort" not in features:
+                    raise RemoteError("这台电脑的电脑端版本较旧，不支持设置思考深度，请更新电脑端")
+                from_terminal = item.get("from_terminal", "")
+                if from_terminal is None:
+                    from_terminal = ""
+                if not isinstance(from_terminal, str) or (from_terminal and not _id.fullmatch(from_terminal)):
+                    raise RemoteError("来源对话无效")
+                context = item.get("context", "")
+                if context is None:
+                    context = ""
+                if not isinstance(context, str) or len(context.strip()) > 6000 or "\0" in context:
+                    raise RemoteError("前期背景不能超过 6000 字")
+                if (from_terminal or context.strip()) and "teams-promote" not in features:
+                    raise RemoteError("这台电脑的电脑端版本较旧，不支持将对话转为协作，请更新电脑端")
+                if from_terminal and mode not in ("lead", "review"):
+                    raise RemoteError("对话转为协作只支持分工协作或写审")
+                if from_terminal and discuss:
+                    raise RemoteError("对话转为协作不支持先议后写")
                 question["item"] = {"id": item["id"], "mode": mode, "dir": folder, "goal": goal.strip(), "tools": tools, "rounds": rounds}
-                if discuss and mode in ("review", "lead"):
+                if models:
+                    question["item"]["models"] = models
+                if efforts:
+                    question["item"]["efforts"] = efforts
+                if roster is not None:
+                    question["item"]["roster"] = roster
+                    question["item"]["auto_roster"] = auto_roster
+                if discuss and not auto_roster and mode in ("review", "lead"):
                     question["item"]["discuss"] = True
                 if rules.strip():
                     question["item"]["rules"] = rules.strip()
+                if from_terminal:
+                    question["item"]["from_terminal"] = from_terminal
+                if context.strip():
+                    question["item"]["context"] = context.strip()
             elif action in ("team_stop", "team_resume", "team_remove"):
                 if not isinstance(payload.get("team"), str) or not _id.fullmatch(payload["team"]):
                     raise RemoteError("协作任务无效")
@@ -1242,19 +1787,25 @@ class Relay:
                 if not isinstance(payload.get("team"), str) or not _id.fullmatch(payload["team"]):
                     raise RemoteError("协作任务无效")
                 text, target = payload.get("text"), payload.get("target", "")
-                if not isinstance(text, str) or not 0 < len(text.strip()) <= 4000 or "\0" in text:
-                    raise RemoteError("消息需为 1 至 4000 字")
+                attachments = _attachments(payload)
+                if not isinstance(text, str) or len(text.strip()) > 4000 or "\0" in text or (not text.strip() and not attachments):
+                    raise RemoteError("请输入文字或添加图片，文字最多 4000 字")
                 if not isinstance(target, str) or len(target.strip()) > 32 or "\0" in target:
                     raise RemoteError("发送对象无效")
+                if attachments is not None and "attachments" not in self._device.get("features", []):
+                    raise RemoteError("\u8bf7\u5148\u66f4\u65b0\u7535\u8111\u7aef")
                 question["team"] = payload["team"]
                 question["text"] = text.strip()
+                if attachments is not None:
+                    question["attachments"] = attachments
                 if target.strip():
                     question["target"] = target.strip()
             elif action == "team_pick":
                 if not isinstance(payload.get("team"), str) or not _id.fullmatch(payload["team"]):
                     raise RemoteError("协作任务无效")
                 tool = payload.get("tool", "")
-                if not isinstance(tool, str) or (tool != "" and tool not in CHAT_TOOLS):
+                runs = self._team_runs()
+                if not isinstance(tool, str) or (tool != "" and tool not in CHAT_TOOLS and tool not in runs):
                     raise RemoteError("候选方案无效")
                 question["team"] = payload["team"]
                 question["tool"] = tool
@@ -1265,17 +1816,34 @@ class Relay:
                 if not isinstance(role, str) or len(role.strip()) > 32 or "\0" in role:
                     raise RemoteError("角色无效")
                 features = self._device.get("features", [])
-                runs = [t for t in CHAT_TOOLS if t in self._device["tools"] and "chat" in features and CHAT_FEATURES.get(t, "chat") in features]
+                runs = self._team_runs()
                 if not isinstance(tool, str) or tool not in runs:
                     raise RemoteError("这台电脑不能让这个工具参与协作")
                 if not isinstance(note, str) or len(note.strip()) > 1000 or "\0" in note:
                     raise RemoteError("补充说明不能超过 1000 字")
+                model = payload.get("model", "")
+                if not isinstance(model, str) or (model.strip() and not _model.fullmatch(model.strip())):
+                    raise RemoteError("模型名称无效")
+                if model.strip() and "teams-models" not in features:
+                    raise RemoteError("这台电脑的电脑端版本较旧，不支持为协作成员选择模型，请更新电脑端")
+                effort = payload.get("effort", "")
+                if not isinstance(effort, str):
+                    raise RemoteError("思考深度无效")
+                clean_effort = effort.strip().lower()
+                if clean_effort and not _effort.fullmatch(clean_effort):
+                    raise RemoteError("思考深度无效")
+                if clean_effort and "teams-effort" not in features:
+                    raise RemoteError("这台电脑的电脑端版本较旧，不支持设置思考深度，请更新电脑端")
                 question["team"] = payload["team"]
                 if role.strip():
                     question["role"] = role.strip()
                 question["tool"] = tool
                 if note.strip():
                     question["note"] = note.strip()
+                if "model" in payload:
+                    question["model"] = model.strip()
+                if "effort" in payload:
+                    question["effort"] = clean_effort
             elif action == "chain_remove":
                 if not isinstance(payload.get("chain"), str) or not _id.fullmatch(payload["chain"]):
                     raise RemoteError("接力无效")
@@ -1334,7 +1902,9 @@ class Relay:
             state = self._state()
             was_online = now - self._device["seen"] < 15
             was_enabled = self._device["enabled"]
-            dirty = wrote = answered = False
+            before_device = {k: v for k, v in self._device.items() if k != "seen"}
+            before_sessions = list(self._sessions) if isinstance(payload.get("sessions"), list) else None
+            dirty = wrote = answered = list_dirty = False
             if isinstance(payload.get("sessions"), list):
                 self._sessions[:] = [
                     {"id": s["id"], "tool": s["tool"], **_placed(s), "title": s["title"].strip()[:80], "updated": s["updated"],
@@ -1348,21 +1918,37 @@ class Relay:
                      # by what it is used, in the computer's words: by the program that has it open, else by what started it
                      "kind": str(s.get("kind") or "")[:20],
                      "can_takeover": s.get("can_takeover") is True, "ownership_known": s.get("ownership_known") is True,
-                     "takeover_reason": str(s.get("takeover_reason") or "")[:200]}
+                     "takeover_reason": str(s.get("takeover_reason") or "")[:200],
+                     # the collaboration task it is or was a member of, while the computer keeps that task
+                     "team": _team(s.get("team")),
+                     **({"organize": _organize(s.get("organize"))} if isinstance(s.get("organize"), dict) else {})}
                     for s in payload["sessions"][:120]
                     if isinstance(s, dict) and isinstance(s.get("id"), str) and session_id_ok(s.get("tool"), s["id"]) and s.get("tool") in ("claude", "codex", "agy", "opencode", "qoder", "cline", "pi")
                     and _placed(s) and isinstance(s.get("title"), str) and s["title"].strip() and type(s.get("updated")) is int]
+            env_id = info.get("environment_id")
+            if isinstance(env_id, str) and _terminal.fullmatch(env_id):
+                if env_id != self._device.get("environment_id"):
+                    self._device["environment_id"] = env_id
+                    self._save_environment_id(env_id)
             self._device.update(seen=now, instance=instance, enabled=info.get("enabled") is True,
                            version=str(info.get("version") or "")[:20], newer=str(info.get("newer") or "")[:20], shell=_shell(info.get("shell")),
-                           features=[x for x in info.get("features", []) if x in ("codex-fork", "codex-takeover", "terminal-exit", "files", "file-upload", "update", "peek", "settings", "reach", "marks", "delete", "projects", "end", "outbox", "work", "chains", "brief", "schedule-days", "codex-desktop-control", "chat", "chat-agy", "teams", "teams-v2", "claude-team", "codex-team", "agy-team", "opencode-team", "qoder-team", "cline-team", "pi-team") + tuple(tool + "-desktop-open" for tool in DESKTOP_TOOLS)],
+                           max_mode=info.get("max_mode") if info.get("max_mode") in ("full", "edit", "read") else "",
+                           features=[x for x in info.get("features", []) if x in ("codex-fork", "codex-takeover", "terminal-exit", "files", "file-upload", "attachments", "update", "peek", "organize", "settings", "routes", "git", "worktree", "reach", "marks", "delete", "projects", "end", "outbox", "work", "chains", "brief", "schedule-days", "codex-desktop-control", "agy-desktop-control", "chat", "chat-agy", "chat-params", "teams", "teams-v2", "teams-models", "teams-grouped", "teams-roster", "teams-effort", "teams-flex-rounds", "teams-promote", "chat-model", "reopen") + tuple(tool + "-desktop-open" for tool in DESKTOP_TOOLS) + tuple(tool + "-team" for tool in TEAM_TOOLS)],
                            tools=[x for x in info.get("tools", []) if isinstance(x, str) and x in LABELS],
                            agy_external=[x for x in info["agy_external"][:16] if type(x) is int and 0 < x < 8640000000000000]
                            if info.get("enabled") is True and isinstance(info.get("agy_external"), list) else [],
                            workspaces=[x for x in info.get("workspaces", []) if isinstance(x, str) and 0 < len(x) <= 60],
                            projects=_folders(info.get("projects"), 60), candidates=_folders(info.get("candidates"), 40),
-                           quotas=_quotas(info.get("quotas")) if info.get("enabled") is True else [])
+                           quotas=_quotas(info.get("quotas")) if info.get("enabled") is True else [],
+                           team_cards=_team_cards(info.get("team_cards")) if info.get("enabled") is True else [],
+                           routes=_routes(info.get("routes")) if info.get("enabled") is True else [])
             if not was_online or was_enabled != self._device["enabled"]:
                 wrote = True
+                list_dirty = True
+            if before_sessions is not None and self._sessions != before_sessions:
+                list_dirty = True
+            if {k: v for k, v in self._device.items() if k != "seen"} != before_device:
+                list_dirty = True
             for term in state["threads"].values():
                 if term.get("instance") != instance and term["state"] in ("starting", "running"):
                     term.update(state="closed", error="电脑后台已重启，请从历史对话恢复")
@@ -1403,9 +1989,10 @@ class Relay:
                         term.update(state="closed", status="")
                         _trim(term)
                         dirty = True
-            for item in (reported or [])[:MAX_TERMINALS + MAX_HISTORY]:
-                if not isinstance(item, dict):
-                    continue
+            # Closed terminals awaiting their last output must not displace running ones in a report.
+            listings = [item for item in (reported or [])[:200] if isinstance(item, dict)]
+            listings.sort(key=lambda item: item.get("state") != "running")
+            for item in listings[:MAX_TERMINALS + MAX_HISTORY]:
                 term = state["threads"].get(item.get("id")) if isinstance(item.get("id"), str) else None
                 if term is None and isinstance(item.get("id"), str):
                     term = self._adopt(state, item, instance)
@@ -1421,13 +2008,34 @@ class Relay:
                         term["session"] = session
                         dirty = True
                     status = item.get("status") if item.get("status") in (("idle", "busy", "confirm", "starting") if term.get("form") == "chat" else ("idle", "busy")) and term["state"] == "running" else ""
-                    wrote = wrote or status != term.get("status")
+                    if status != term.get("status"):
+                        wrote = True
+                        list_dirty = True
                     term["status"] = status
                     term["completion"] = str(item.get("completion") or "")[:200]
+                    # the collaboration task the computer lists it under; kept with the terminal for its history
+                    team = _team(item.get("team"))
+                    if team != term.get("team", ""):
+                        term["team"] = team
+                        dirty = True
+                    for k, check in (("model", lambda v: isinstance(v, str) and (not v or bool(_model.fullmatch(v)))),
+                                     ("effort", lambda v: isinstance(v, str) and (not v or bool(_effort.fullmatch(v.lower())))),
+                                     ("mode", lambda v: v in ("", "full", "edit", "read")),
+                                     ("branch", lambda v: isinstance(v, str) and len(v) <= 120),
+                                     ("worktree", lambda v: isinstance(v, str) and len(v) <= 80)):
+                        if k in item and check(item[k]):
+                            val = item[k].strip().lower() if k == "effort" else item[k].strip()
+                            if val != term.get(k, ""):
+                                term[k] = val
+                                dirty = True
                     if term.get("form") == "chat":
                         # what it said last and what it asks, in the computer's words
                         said, asking = str(item.get("said") or "")[:200], str(item.get("ask") or "")[:2000]
-                        wrote = wrote or said != term.get("said") or asking != term.get("asking")
+                        if asking != term.get("asking"):
+                            wrote = True
+                            list_dirty = True
+                        elif said != term.get("said"):
+                            wrote = True
                         term["said"], term["asking"] = said, asking
                     exit_code = item.get("exit_code")
                     if term["state"] == "closed" and type(exit_code) is int and term.get("exit_code") != exit_code:
@@ -1471,8 +2079,8 @@ class Relay:
             if dirty or (self._unsaved is not None and now - self._unsaved >= SAVE_SECONDS):
                 self._save(state)
                 self._unsaved = None
-            if dirty or wrote:
-                self._wake()
+            if dirty or wrote or list_dirty:
+                self._wake(list_changed=dirty or list_dirty)
             if answered:
                 self._wake_ops()
             for op in self._pending.queued.values():
