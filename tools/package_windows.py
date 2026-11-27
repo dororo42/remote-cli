@@ -37,7 +37,10 @@ def main():
     stage = build / "stage"
     stage.mkdir(parents=True)
     dist.mkdir(exist_ok=True)
-    subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ROOT / "agent-windows" / "build.ps1"), "-OutDir", str(stage)], check=True)
+    # powershell.exe is Windows PowerShell 5.1: same generation as the in-box
+    # .NET Framework compiler below. The bare "powershell" on a runner can be
+    # PowerShell 7, where -NoProfile leaves some cmdlets unloaded.
+    subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ROOT / "agent-windows" / "build.ps1"), "-OutDir", str(stage)], check=True)
     (stage / "relay").mkdir()
     for name in ("server.py", "relay.py", "screen.py", "websocket.py"):
         shutil.copy2(ROOT / "relay" / name, stage / "relay" / name)

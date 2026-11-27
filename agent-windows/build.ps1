@@ -1,5 +1,7 @@
 param([string]$OutDir = '')
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell auto-loads these; PowerShell 7 with -NoProfile does not.
+Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
 # Builds with the C# compiler that ships with Windows (.NET Framework 4.x); nothing needs to be installed.
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (!(Test-Path -LiteralPath $compiler)) { throw "csc.exe not found: $compiler" }
