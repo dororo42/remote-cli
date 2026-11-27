@@ -1,8 +1,8 @@
 param([string]$OutDir = '')
 $ErrorActionPreference = 'Stop'
-# Windows PowerShell auto-loads these; PowerShell 7 with -NoProfile does not.
-Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
 # Builds with the C# compiler that ships with Windows (.NET Framework 4.x); nothing needs to be installed.
+# The WebView2 download below uses .NET APIs so the script also works under a
+# PowerShell 7 runner started with -NoProfile, where cmdlets may not be loaded.
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (!(Test-Path -LiteralPath $compiler)) { throw "csc.exe not found: $compiler" }
 $icon = Join-Path $PSScriptRoot 'remote-ai.ico'
@@ -24,9 +24,13 @@ $wvLoader = Join-Path $wvDir 'WebView2Loader.dll'
 if (!(Test-Path -LiteralPath $wvCore) -or !(Test-Path -LiteralPath $wvWinForms) -or !(Test-Path -LiteralPath $wvLoader)) {
     if (!(Test-Path -LiteralPath $wvPkg)) {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -UseBasicParsing -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/$wvVer/microsoft.web.webview2.$wvVer.nupkg" -OutFile $wvPkg
+        $client = New-Object Net.WebClient
+        $client.DownloadFile("https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/$wvVer/microsoft.web.webview2.$wvVer.nupkg", $wvPkg)
+        $client.Dispose()
     }
-    $actualSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $wvPkg).Hash.ToLowerInvariant()
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $actualSha = -join ($sha.ComputeHash([IO.File]::ReadAllBytes($wvPkg)) | ForEach-Object { $_.ToString('x2') }) }
+    finally { $sha.Dispose() }
     if ($actualSha -ne $wvSha) { throw "WebView2 NuGet SHA-256 mismatch: $actualSha" }
     New-Item -ItemType Directory -Path $wvDir -Force | Out-Null
     Add-Type -AssemblyName System.IO.Compression.FileSystem
