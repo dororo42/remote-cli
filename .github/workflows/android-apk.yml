@@ -55,14 +55,14 @@ jobs:
           export REMOTECLI_SIGN_PASSWORD="$ANDROID6_KEY_PASSWORD"
           "$tools/zipalign" -f -p 4 "$build/unsigned.apk" "$build/aligned.apk"
           "$java_bin" -jar "$tools/lib/apksigner.jar" sign --ks "$build/signing.p12" --ks-key-alias remotecli \
-            --ks-pass env:REMOTECLI_SIGN_PASSWORD --out dist/RemoteCli-Android-main.apk "$build/aligned.apk"
-          "$java_bin" -jar "$tools/lib/apksigner.jar" verify dist/RemoteCli-Android-main.apk
-          "$tools/zipalign" -c 4 dist/RemoteCli-Android-main.apk
-          python3 tests/android_pages_check.py --jdk "$JAVA_HOME" --apk dist/RemoteCli-Android-main.apk --output "$build/pages-check"
+            --ks-pass env:REMOTECLI_SIGN_PASSWORD --out dist/RemoteCli-Android.apk "$build/aligned.apk"
+          "$java_bin" -jar "$tools/lib/apksigner.jar" verify dist/RemoteCli-Android.apk
+          "$tools/zipalign" -c 4 dist/RemoteCli-Android.apk
+          python3 tests/android_pages_check.py --jdk "$JAVA_HOME" --apk dist/RemoteCli-Android.apk --output "$build/pages-check"
           grep -o 'android:versionName="[^"]*"' android/AndroidManifest.xml | head -1
-          ls -l dist/RemoteCli-Android-main.apk
+          ls -l dist/RemoteCli-Android.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: RemoteCli-Android-main
-          path: dist/RemoteCli-Android-main.apk
+          name: RemoteCli-Android
+          path: dist/RemoteCli-Android.apk
           if-no-files-found: error
