@@ -646,7 +646,11 @@ switches ignore repeated taps while saving; a requested refresh is queued if one
 capability, which the Windows program and the Linux agent have. The three actions that begin with `chain` need
 `chains` besides; the actions that begin with `team` need `teams`. The Windows program hears that a conversation has stopped from the tools' own hooks; the Linux
 agent has none, and sees a finished turn by watching the source conversation's record grow and then stay quiet
-for a little while. The computer keeps and does all of it; the relay checks the shape of the question, passes it
+for a little while (45 seconds, measured against real opencode turns: 11% of in-turn record-write gaps exceed it —
+the longest a tool thought without writing its record was 24 minutes — so a chain may pass on while the source is
+still at it; the next record write re-arms the chain and it passes again. The turn-end silence itself is short,
+median 20 seconds, so real completions fire promptly. The structural fix is the leader's acceptance the Windows
+program has in its verify phase). The computer keeps and does all of it; the relay checks the shape of the question, passes it
 on as the operation `work_<action>` and keeps nothing.
 
 | `action` | Fields | Answer |

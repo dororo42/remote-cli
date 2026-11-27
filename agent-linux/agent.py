@@ -204,7 +204,14 @@ WORK_ACTIONS = ("work_stats", "work_schedules", "work_schedule_set", "work_sched
                 "work_team_remove", "work_team_say", "work_team_pick", "work_team_swap")
 CHAIN_TOOLS = ("claude", "codex", "opencode", "qoder", "cline", "pi")   # the conversations the phone can pass between
 TEAM_FEATURES = tuple(tool + "-team" for tool in CHAIN_TOOLS)
-CHAIN_QUIET = 45.0     # a turn is over once the source's record has been quiet this long after growing
+# A turn is over once the source's record has been quiet this long after growing. Measured
+# against 32 real opencode working turns (1121 in-turn record writes, 2026-11): 11% of the
+# in-turn gaps exceed 45 seconds — the longest a tool kept thinking without writing its record
+# was 24 minutes — so a chain may pass on while the source is still at it; the next write
+# re-arms and the turn is passed again, and the hand-off text carries the progress so far.
+# The turn-end silence itself is short (median 20 seconds), so real completions fire promptly.
+# The structural fix is the leader's acceptance (the Windows verify phase), not a longer wait.
+CHAIN_QUIET = 45.0
 MAX_CHAINS = 20
 LONGEST_TURN, LONGEST_WAIT = 3 * 3600, 600      # a turn is counted for no longer; a first answer later than this is none
 MAX_SCHEDULES = 30
