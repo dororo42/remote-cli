@@ -5,7 +5,9 @@ name: Windows build
 on:
   push:
     branches: [main]
-    paths: ["agent-windows/**", "tools/package_windows.py", ".github/workflows/windows-build.yml"]
+    # The installer embeds the relay and web sources too: a change to either
+    # must rebuild it, otherwise the artifact installs yesterday's pages.
+    paths: ["agent-windows/**", "relay/**", "web/**", "tools/package_windows.py", ".github/workflows/windows-build.yml"]
   workflow_dispatch:
 
 permissions:
@@ -26,6 +28,10 @@ jobs:
           grep -q "Version = \"$version\"" agent-windows/RemoteCliApp.cs
           grep -q "Version = \"$version\"" agent-windows/Setup.cs
           grep -q "VERSION = \"$version\"" relay/server.py
+          grep -q "android:versionName=\"$version\"" android/AndroidManifest.xml
+          grep -q "MARKETING_VERSION: \"$version\"" ios/project.yml
+          build=$(grep -m1 'android:versionCode=' android/AndroidManifest.xml | sed 's/.*versionCode="\([0-9]*\)".*/\1/')
+          grep -q "CURRENT_PROJECT_VERSION: \"$build\"" ios/project.yml
       - uses: actions/upload-artifact@v4
         with:
           name: RemoteCli-Windows
