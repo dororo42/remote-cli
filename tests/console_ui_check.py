@@ -61,7 +61,9 @@ def main():
         homes.codex_saved(shop, "019a0000-0000-7000-8000-000000000001", "补充单元测试", 0.1)
         homes.codex_saved(notes, "019a0000-0000-7000-8000-000000000002", "整理周报", 50)
         model_log = base / "model.jsonl"
-        environment = homes.environment(RCLI_PASSWORD=PASSWORD, STANDIN_MODEL_LOG=str(model_log))
+        prompt_log = base / "prompts.jsonl"
+        environment = homes.environment(RCLI_PASSWORD=PASSWORD, STANDIN_MODEL_LOG=str(model_log),
+                                        STANDIN_SAVE_TRANSCRIPT="1", STANDIN_PROMPT_LOG=str(prompt_log))
         (data / "quotas").mkdir()
         (data / "quotas" / "claude.json").write_text(json.dumps({
             "tool": "claude", "why": "", "at": int(time.time() * 1000),
@@ -188,11 +190,15 @@ def main():
             until("Array.from(document.querySelectorAll('.thread-head .seg button')).some(b => b.textContent === '终端' && !b.disabled)", "the turn ended: it can be shown the other way")
 
             # Switch the model from the conversation and check the actual tool invocation.
-            value("document.querySelector('.model-picker').click()")
-            until("!!document.querySelector('.dlg select option[value=\"sonnet\"]')", "the tool's model list")
-            value("(s => { s.value = 'sonnet'; s.dispatchEvent(new Event('change', {bubbles:true})); })(document.querySelector('.dlg select'))")
-            press(".dlg-foot button", "应用模型")
-            until("!document.querySelector('.dlg') && document.querySelector('.model-picker')?.textContent.includes('sonnet')", "the original chat on the new model")
+            # the button at the end of the box: AI tabs on top, and only the selected AI's models below
+            value("document.querySelector('.composer .tool-switch-btn').click()")
+            until("!!document.querySelector('.tool-switch-pop .tsp-row[data-model=\"sonnet\"]') && document.querySelectorAll('.tool-switch-pop .tsp-tool-tab').length >= 2", "the tool's model list with AI tabs")
+            tabs = value("Array.from(document.querySelectorAll('.tool-switch-pop .tsp-tool-tab')).map(n => n.dataset.tool)")
+            assert "claude" in tabs and "codex" in tabs, tabs
+            assert value("document.querySelector('.tool-switch-pop .tsp-head span').textContent") == "Claude Code"
+            browser.picture(out / "switch.png")
+            value("document.querySelector('.tool-switch-pop .tsp-row[data-model=\"sonnet\"]').click()")
+            until("!document.querySelector('.tool-switch-pop') && document.querySelector('.tool-switch-btn')?.textContent.includes('Sonnet')", "the original chat on the new model")
             until("fetch('../api/terminal').then(r=>r.json()).then(j=>j.terminals.some(t=>t.state==='running' && t.model==='sonnet' && t.session===%s))" % q(SAVED), "running model")
             def compose(text, button="发送"):
                 value("(b => { b.value = %s; b.dispatchEvent(new Event('input', {bubbles:true})); })(document.querySelector('.composer textarea'))" % q(text))
@@ -206,7 +212,10 @@ def main():
             until("!!document.querySelector('[role=timer]')", "elapsed running time")
             first = value("document.querySelector('[role=timer]').textContent")
             until("!!document.querySelector('[role=timer]') && document.querySelector('[role=timer]').textContent !== %s" % q(first), "clock ticks")
-            assert value("document.querySelector('.model-picker').disabled")
+            # at work the model is not changed: the list says why
+            value("document.querySelector('.composer .tool-switch-btn').click()")
+            until("Array.from(document.querySelectorAll('.tool-switch-pop .tsp-note')).some(n => n.textContent.includes('这一轮结束'))", "why the model waits")
+            value("document.querySelector('.composer .tool-switch-btn').click()")
             compose("随后检查第二项", "加入待发")
             compose("顺便核对第三项", "加入待发")
             compose("临时误发", "加入待发")
@@ -260,6 +269,73 @@ def main():
             assert on_top(".dlg .pick"), "the dialog is on top"
             browser.picture(out / "handoff.png")
             press(".dlg-foot button", "取消")
+
+            # ---- in-place AI switch (Claude -> Codex): same conversation, switch divider, clean user bubble, single list item
+            value("document.querySelector('.composer .tool-switch-btn').click()")
+            until("!!document.querySelector('.tool-switch-pop .tsp-tool-tab[data-tool=\"codex\"]')", "Codex tab in switcher")
+            value("document.querySelector('.tool-switch-pop .tsp-tool-tab[data-tool=\"codex\"]').click()")
+            until("document.querySelector('.tool-switch-pop .tsp-head span')?.textContent === 'Codex'", "Codex models shown")
+            value("document.querySelector('.tool-switch-pop .tsp-row[data-model=\"\"]').click()")
+            until("!document.querySelector('.tool-switch-pop') && document.querySelector('.switch-banner')?.textContent.includes('Codex')", "staged in-place switch banner")
+            compose("继续核对优惠券边界")
+            until("!!document.querySelector('.timeline-switch') && !!document.querySelector('.ask-card')", "Codex took over in-place with switch divider")
+            assert "以下由 Codex 继续" in value("document.querySelector('.timeline-switch').textContent")
+            user_bubbles = value("Array.from(document.querySelectorAll('.msg-user .msg-bubble')).map(n => n.textContent)")
+            assert "继续核对优惠券边界" in user_bubbles and not any("【对话交接】" in b for b in user_bubbles), user_bubbles
+            press(".ask-card button", "允许")
+            until("document.querySelector('.run-status')?.textContent === '等待消息'", "Codex finished handover turn")
+            until("Array.from(document.querySelectorAll('.proj .th-row .th-title')).filter(n => n.textContent === '结算页金额多一位小数').length === 1", "handed-over conversation still listed once under original title")
+            assert value("document.querySelectorAll('.proj .th-row').length") == 3, (value(titles), value("fetch('../api/terminal').then(r=>r.json()).then(j=>({terminals:j.terminals.map(t=>({id:t.id,tool:t.tool,state:t.state,session:t.session,title:t.title})),sessions:j.sessions.map(s=>({id:s.id,tool:s.tool,title:s.title,live:s.live}))}))"))
+            browser.picture(out / "handover-inline.png")
+
+            # ---- switch back in-place (Codex -> Claude): resumes SAVED Claude session with delta summary in chronological order
+            until("fetch('../api/terminal').then(r => r.json()).then(j => j.sessions.some(s => s.tool === 'codex' && s.title === '结算页金额多一位小数'))",
+                  "Codex handover session indexed in relay sessions")
+            value("document.querySelector('.composer .tool-switch-btn').click()")
+            until("!!document.querySelector('.tool-switch-pop .tsp-tool-tab[data-tool=\"claude\"]')", "Claude tab in switcher")
+            value("document.querySelector('.tool-switch-pop .tsp-tool-tab[data-tool=\"claude\"]').click()")
+            until("document.querySelector('.tool-switch-pop .tsp-head span')?.textContent === 'Claude Code'", "Claude models shown")
+            value("document.querySelector('.tool-switch-pop .tsp-row[data-model=\"\"]').click()")
+            until("!document.querySelector('.tool-switch-pop') && document.querySelector('.switch-banner')?.textContent.includes('Claude Code')", "staged switch-back banner")
+            compose("回到 Claude 汇总确认")
+            until("document.querySelectorAll('.timeline-switch').length === 2 && !!document.querySelector('.ask-card')", "Claude resumed in-place with second switch divider")
+            press(".ask-card button", "允许")
+            until("document.querySelector('.run-status')?.textContent === '等待消息'", "Claude finished round-trip handover turn")
+
+            dividers = value("Array.from(document.querySelectorAll('.timeline-switch')).map(n => n.textContent)")
+            assert len(dividers) == 2 and "以下由 Codex 继续" in dividers[0] and "以下由 Claude Code 继续" in dividers[1], dividers
+            timeline_rows = value("Array.from(document.querySelectorAll('.timeline-switch, .msg-user .msg-bubble')).map(n => n.textContent)")
+            idx_early = next(i for i, t in enumerate(timeline_rows) if "再检查一下优惠券" in t)
+            idx_div_codex = next(i for i, t in enumerate(timeline_rows) if "以下由 Codex 继续" in t)
+            idx_codex = next(i for i, t in enumerate(timeline_rows) if "继续核对优惠券边界" in t)
+            idx_div_claude = next(i for i, t in enumerate(timeline_rows) if "以下由 Claude Code 继续" in t)
+            idx_claude = next(i for i, t in enumerate(timeline_rows) if "回到 Claude 汇总确认" in t)
+            assert idx_early < idx_div_codex < idx_codex < idx_div_claude < idx_claude, timeline_rows
+            user_bubbles_2 = value("Array.from(document.querySelectorAll('.msg-user .msg-bubble')).map(n => n.textContent)")
+            assert "继续核对优惠券边界" in user_bubbles_2 and "回到 Claude 汇总确认" in user_bubbles_2 and not any("【对话交接】" in b for b in user_bubbles_2), user_bubbles_2
+            assert value("document.querySelectorAll('.proj .th-row').length") == 3
+            assert value("Array.from(document.querySelectorAll('.proj .th-row .th-title')).filter(n => n.textContent === '结算页金额多一位小数').length") == 1
+            until("fetch('../api/terminal').then(r => r.json()).then(j => j.terminals.some(t => t.state === 'running' && t.tool === 'claude' && t.session === %s) && j.sessions.some(s => s.tool === 'claude' && s.id === %s && s.title === '结算页金额多一位小数'))" % (q(SAVED), q(SAVED)),
+                  "resumed Claude terminal running with SAVED session and original title")
+            browser.picture(out / "handover-roundtrip.png")
+
+            disk_read = value("fetch('../api/conversation', { method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ id: '9'.repeat(32), session: %s }) }).then(r => r.json())" % q(SAVED))
+            disk_roles = [(m.get("role"), m.get("tool")) for m in disk_read.get("messages", [])]
+            assert [m for m in disk_roles if m[0] == "switch"] == [("switch", "codex"), ("switch", "claude")], disk_roles
+
+            value("Array.from(document.querySelectorAll('.proj .th-row')).find(n => n.textContent.includes('补充单元测试')).click()")
+            until("document.querySelector('.head-title')?.textContent === '补充单元测试'", "switched to another thread")
+            value("Array.from(document.querySelectorAll('.proj .th-row')).find(n => n.textContent.includes('结算页')).click()")
+            until("document.querySelector('.head-title')?.textContent === '结算页金额多一位小数' && document.querySelectorAll('.timeline-switch').length === 2", "returning still shows both chronological dividers")
+
+            prompts = [json.loads(line) for line in prompt_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+            claude_prompts = [p for p in prompts if p.get("tool") == "claude"]
+            assert claude_prompts, prompts
+            last_claude = claude_prompts[-1]
+            assert "--resume" in last_claude["args"] and last_claude["args"][last_claude["args"].index("--resume") + 1] == SAVED, last_claude["args"]
+            assert last_claude["text"].startswith("【对话交接】上面你暂停之后，我切到 Codex"), last_claude["text"]
+            assert "继续核对优惠券边界" in last_claude["text"] and "【现在的要求】\n回到 Claude 汇总确认" in last_claude["text"], last_claude["text"]
+            assert "下面是我在另一段对话里的进展" not in last_claude["text"], last_claude["text"]
 
             # ---- a new conversation: the project picker opens over the page and chooses
             value("document.querySelector('.new-btn').click()")

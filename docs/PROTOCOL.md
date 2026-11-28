@@ -196,7 +196,7 @@ and `why` (see "The ways into a conversation, and stopping one"): by which way e
 computer's words for what cannot be done. `activity` is `active` for a conversation in a
 command-line window of its own or one with `reach`, `locked` for another that a program holds, `history` otherwise.
 
-Agents may advertise `info.features`: `codex-fork`, `codex-takeover`, `terminal-exit`, `files`, `file-upload`, `attachments`, `update`, `peek`, `organize`, `settings`, `work`, `chains`, `brief`, `schedule-days`, `chat`, `chat-agy`, `chat-params`, `teams`, `teams-v2`, `teams-models`, `teams-grouped`, `teams-roster`, `teams-effort`, `teams-flex-rounds`, `teams-promote`, `reopen`, `<tool>-team` (one per tool that can join a collaboration task on this computer, such as `opencode-team`, `qoder-team`, `cline-team`, `pi-team`), and `<tool>-desktop-open` for desktop hand-off. Agents with `chat-params` also report `info.max_mode` (`full`, `edit`, or `read`) and each terminal's effective `model`, `effort`, and `mode`.
+Agents may advertise `info.features`: `codex-fork`, `codex-takeover`, `terminal-exit`, `files`, `file-upload`, `attachments`, `update`, `peek`, `organize`, `settings`, `work`, `chains`, `brief`, `schedule-days`, `chat`, `chat-agy`, `chat-params`, `teams`, `teams-v2`, `teams-models`, `teams-grouped`, `teams-roster`, `teams-effort`, `teams-flex-rounds`, `teams-promote`, `chat-model`, `handover`, `reopen`, `<tool>-team` (one per tool that can join a collaboration task on this computer, such as `opencode-team`, `qoder-team`, `cline-team`, `pi-team`), and `<tool>-desktop-open` for desktop hand-off. Agents with `chat-params` also report `info.max_mode` (`full`, `edit`, or `read`) and each terminal's effective `model`, `effort`, and `mode`.
 (the work capabilities are described in "The owner's work", below; `organize` is described in "Conversation organization"). These are forwarded
 under `device.features`. Sessions may include `can_takeover`, `ownership_known`, and `takeover_reason`.
 Every session and every terminal carries `team`: the id of the collaboration task it is or was a member of, `""` for
@@ -885,6 +885,26 @@ With the `chat-model` and `reopen` capabilities, a viewer may also send `start` 
 idle, standalone Claude Code, Codex or Antigravity chat in its original workspace, with the same session and
 permission mode. A view switch still takes no model parameters. Team members use `team_swap` on their own role.
 
+With the `handover` capability, a viewer may switch a standalone project conversation to another chat AI in place by
+sending `start` with `form: "chat"`, the target `tool`, the same `dir`, `from_tool`, `from` (source session id),
+required `text` (the owner's next message), and optional `model`/`effort`/`mode` (without `session`, `reopen`,
+`history`, `fork`, `takeover`, or `worktree`). The relay checks the source in its listed sessions (same tool and
+project, not a collaboration member) and, if a phone terminal is running it, refuses while `busy` or `confirm` and
+counts that terminal's slot as freed for `MAX_TERMINALS`. The computer looks up `<data>/handovers.json`: if `tool`
+already participated earlier in the same handover thread and its most recent session still exists in the workspace,
+is not running in another terminal, and is not held externally, the computer resumes that prior session instead of
+opening a new one (otherwise starting a fresh session). The computer reads the source/thread turns, closes any idle
+phone terminal running the source, starts or resumes the target tool, emits one `history` event containing the full
+handover timeline in chronological order separated by `{role: "switch", tool, text}` rows and ending with a `switch`
+row for the new tool (`more: true` if the earliest visit was truncated), and sends a delta summary covering only
+the intermediate turns since `tool` paused (`ResumeBrief` / `resume_handover`) when resuming an earlier participant—or
+`Brief(source)` when joining fresh—followed by `"\n\n【现在的要求】\n" + text` (clients display only the owner's text after
+`【现在的要求】`). `<data>/handovers.json` stores `{threads: [{title, turns: [{tool, session}, ...]}]}` (up to 500
+threads and 50 turns per thread, automatically migrating v1 `links` entries on load). Reading or recalling a thread
+with repeated sessions splits transcripts at `【对话交接】...【现在的要求】\n` markers (`SplitVisits`) to preserve
+chronological order across all switches; session listings hide superseded turns (`GoneOn`, any turn before the active
+tail) and title the active session with the first turn's title.
+
 Client delivery presentation distinguishes queueing/retry, acceptance, rejection, and unknown outcome.
 An HTTP 5xx or a lost response may retry the existing operation ID and unchanged payload; it is not a
 definitive rejection. A successful terminal-operation acknowledgment may only mean the relay queued the
@@ -967,7 +987,7 @@ The events (`t` names the kind; `at` is the computer's time in milliseconds):
 | --- | --- | --- |
 | `state` | `state`: `starting`, `busy`, `confirm`, `idle`, `ended`; `at` | how it stands; `busy` from what was said until the turn ends |
 | `session` | `session` | the conversation's id in its tool, once known |
-| `history` | `messages` (as `/api/conversation` gives them: `role`, `text`, `detail`, `result`), `more` | what was said before, where a saved conversation is gone on with; it comes before what follows |
+| `history` | `messages` (as `/api/conversation` gives them: `role` including `switch` with `tool` and label `text`, plus `detail`, `result`), `more` | what was said before, where a saved or handed-over conversation is gone on with; it comes before what follows |
 | `item` | `id`, `kind` (`user`, `text`, `thought`, `step`, `note`), `text`, `at`; a `user` item may have `op` (the phone's operation id it came of); a `step` has `name`, `detail` (the command, or the file), `state: "run"` | something said or done begins |
 | `more` | `id`, `text` | more of a text or thought, as it is written |
 | `set` | `id`, `text` | the whole text, once its tool says it; replaces what came in pieces |
